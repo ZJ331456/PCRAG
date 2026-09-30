@@ -132,8 +132,12 @@ def check_run(rows: list[dict[str, Any]], request_stats: dict[str, int]):
             result = row[stage]
             if result is None:
                 problems.append(f"{chunk_id}: missing {stage} result")
-            elif result["metadata"].get("error"):
-                problems.append(f"{chunk_id}: {stage}: {result['metadata']['error']}")
+            else:
+                metadata = result["metadata"]
+                if metadata.get("error"):
+                    problems.append(f"{chunk_id}: {stage}: {metadata['error']}")
+                if metadata.get("finish_reason") == "length":
+                    problems.append(f"{chunk_id}: {stage} ended with finish_reason=length")
         ner = row["ner"]
         if ner is not None and ner["metadata"].get("ner_max_tokens_used") == 1024:
             parse_retries += 1
@@ -222,6 +226,14 @@ def run(args: argparse.Namespace) -> int:
     rows = collect_rows(selected, extractor)
     request_stats = llm.get_request_stats()
     problems, parse_retries = check_run(rows, request_stats)
+    stage_metadata = [row[stage]["metadata"] for row in rows for stage in ("ner", "triple")
+                      if row[stage] is not None]
+    length_retry_requests = sum(meta.get("length_retry_count", 0) for meta in stage_metadata)
+    length_recovered_stages = sum(
+        bool(meta.get("length_observed_count")) and
+        meta.get("finish_reason") != "length" and not meta.get("error")
+        for meta in stage_metadata
+    )
     if exception is not None:
         problems.append(exception)
     if request_stats["http_attempts"] == 0:
@@ -268,6 +280,8 @@ def run(args: argparse.Namespace) -> int:
         "documents_per_second": len(rows) / elapsed if elapsed > 0 else None,
         "request_stats": request_stats,
         "ner_parse_retries_to_1024": parse_retries,
+        "length_retry_requests": length_retry_requests,
+        "length_recovered_stages": length_recovered_stages,
         "parsed_output_sha256": parsed_sha256,
         "problems": problems,
         "complete": not problems,

@@ -57,6 +57,18 @@ class BenchmarkDriverTests(unittest.TestCase):
         self.assertTrue(any("HTTP/network retry" in problem for problem in problems))
         self.assertTrue(any("terminal request failure" in problem for problem in problems))
 
+    def test_parseable_final_length_is_never_reported_complete(self):
+        rows = [{
+            "chunk_id": "a",
+            "ner": {"metadata": {"finish_reason": "stop"}},
+            "triple": {"metadata": {"finish_reason": "length"},
+                       "triples": [["partial", "r", "x"]]},
+        }]
+        problems, _ = bench.check_run(rows, {
+            "cache_hits": 0, "retries": 0, "failures": 0,
+        })
+        self.assertTrue(any("triple ended with finish_reason=length" in item for item in problems))
+
     def test_driver_writes_complete_case_without_calling_model(self):
         class FakeLLM:
             llm_config = SimpleNamespace(generate_params={

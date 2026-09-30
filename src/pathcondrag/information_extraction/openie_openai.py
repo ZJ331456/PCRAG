@@ -7,11 +7,12 @@ from tqdm import tqdm
 
 from ..prompts import PromptTemplateManager
 from ..utils.logging_utils import get_logger
-from ..utils.llm_utils import fix_broken_generated_json, filter_invalid_triples
+from ..utils.llm_utils import filter_invalid_triples
 from ..utils.misc_utils import TripleRawOutput, NerRawOutput
 from ..llm.openai_gpt import CacheOpenAI
 
 logger = get_logger(__name__)
+_MAX_LENGTH_RETRIES = 2
 
 
 def _safe_env_int(name: str, default: int | None = None) -> int | None:
@@ -62,6 +63,18 @@ def _extract_ner_from_response(real_response):
     return _extract_json_list_field(real_response, "named_entities")
 
 
+def _length_retry_seed(llm_model: CacheOpenAI, retry_number: int) -> int:
+    """Use a distinct, deterministic cache key for each truncated-response retry."""
+    config = getattr(llm_model, "llm_config", None)
+    params = getattr(config, "generate_params", {}) or {}
+    base_seed = params.get("seed")
+    if base_seed is None:
+        base_seed = 0
+    if not isinstance(base_seed, int) or isinstance(base_seed, bool):
+        raise ValueError(f"OpenIE retry requires an integer or null seed, got {base_seed!r}")
+    return base_seed + retry_number
+
+
 class OpenIE:
     def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8):
         if max_workers < 1:
@@ -75,32 +88,62 @@ class OpenIE:
         ner_input_message = self.prompt_template_manager.render(name='ner', passage=passage)
         raw_response = ""
         metadata = {}
-        # Align with HippoRAG: default 512, retry once at 1024 if parse fails / length truncates.
+        # Align with HippoRAG: default 512, escalate to 1024 on parse failure or truncation.
         ner_max_tokens = _safe_env_int('HIPPO_OPENIE_NER_MAX_TOKENS', 512)
         token_budgets = [ner_max_tokens]
         if ner_max_tokens < 1024:
             token_budgets.append(1024)
+        final_budget = token_budgets[-1]
+        attempts = [(budget, None) for budget in token_budgets]
+        attempts.extend(
+            (final_budget, retry_number)
+            for retry_number in range(1, _MAX_LENGTH_RETRIES + 1)
+        )
+        length_observed_count = 0
+        length_retry_count = 0
+        previous_was_length = False
+        attempt_count = 0
         try:
-            last_error = None
             unique_entities = []
-            for attempt, max_new_tokens in enumerate(token_budgets):
-                raw_response, metadata, cache_hit = self.llm_model.infer(
-                    messages=ner_input_message,
-                    max_completion_tokens=max_new_tokens,
-                )
-                metadata['cache_hit'] = cache_hit
-                metadata['ner_max_tokens_used'] = max_new_tokens
+            for attempt, (max_new_tokens, retry_number) in enumerate(attempts):
+                # Seeded attempts are reached only after the final budget was truncated.
+                kwargs = {"messages": ner_input_message, "max_completion_tokens": max_new_tokens}
+                if retry_number is not None:
+                    kwargs["seed"] = _length_retry_seed(self.llm_model, retry_number)
+                if previous_was_length:
+                    length_retry_count += 1
+                attempt_count += 1
+                raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
+                metadata = dict(response_metadata)
+                metadata.update({
+                    'cache_hit': cache_hit,
+                    'ner_max_tokens_used': max_new_tokens,
+                    'openie_attempt_count': attempt_count,
+                    'length_retry_count': length_retry_count,
+                    'length_observed_count': length_observed_count,
+                })
+                if retry_number is not None:
+                    metadata['length_retry_seed'] = kwargs['seed']
                 if metadata.get('finish_reason') == 'length':
-                    real_response = fix_broken_generated_json(raw_response)
-                else:
-                    real_response = raw_response
+                    length_observed_count += 1
+                    metadata['length_observed_count'] = length_observed_count
+                    previous_was_length = True
+                    if attempt + 1 == len(attempts):
+                        raise RuntimeError(
+                            f"NER chunk {chunk_key} remains truncated (finish_reason=length) "
+                            f"after {attempt + 1} attempts"
+                        )
+                    logger.warning(
+                        "NER response truncated for %s at max_new_tokens=%s; retrying",
+                        chunk_key, max_new_tokens,
+                    )
+                    continue
+                previous_was_length = False
                 try:
-                    extracted_entities = _extract_ner_from_response(real_response)
+                    extracted_entities = _extract_ner_from_response(raw_response)
                     unique_entities = list(dict.fromkeys(extracted_entities))
-                    last_error = None
                     break
                 except Exception as parse_error:
-                    last_error = parse_error
                     if attempt + 1 < len(token_budgets):
                         logger.warning(
                             "NER parse failed for %s with max_new_tokens=%s (%s); retrying with %s",
@@ -111,13 +154,16 @@ class OpenIE:
                         )
                         continue
                     raise
-            if last_error is not None:
-                raise last_error
 
         except Exception as e:
             # For any other unexpected exceptions, log them and return with the error message
             logger.warning(e)
-            metadata.update({'error': f'{type(e).__name__}: {e}'})
+            metadata.update({
+                'error': f'{type(e).__name__}: {e}',
+                'openie_attempt_count': attempt_count,
+                'length_retry_count': length_retry_count,
+                'length_observed_count': length_observed_count,
+            })
             return NerRawOutput(
                 chunk_id=chunk_key,
                 response=raw_response,  # Store the error message in metadata
@@ -147,23 +193,50 @@ class OpenIE:
         metadata = {}
         # Align with HippoRAG openie_triple_max_tokens default=2048
         triple_max_tokens = _safe_env_int('HIPPO_OPENIE_TRIPLE_MAX_TOKENS', 2048)
+        length_observed_count = 0
+        length_retry_count = 0
+        attempt_count = 0
         try:
             # LLM INFERENCE
-            raw_response, metadata, cache_hit = self.llm_model.infer(
-                messages=messages,
-                max_completion_tokens=triple_max_tokens,
-            )
-            metadata['cache_hit'] = cache_hit
-            if metadata['finish_reason'] == 'length':
-                real_response = fix_broken_generated_json(raw_response)
-            else:
-                real_response = raw_response
-            extracted_triples = _extract_triples_from_response(real_response)
+            for attempt in range(_MAX_LENGTH_RETRIES + 1):
+                kwargs = {"messages": messages, "max_completion_tokens": triple_max_tokens}
+                if attempt:
+                    kwargs['seed'] = _length_retry_seed(self.llm_model, attempt)
+                if attempt:
+                    length_retry_count += 1
+                attempt_count += 1
+                raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
+                metadata = dict(response_metadata)
+                metadata.update({
+                    'cache_hit': cache_hit,
+                    'openie_attempt_count': attempt_count,
+                    'length_retry_count': length_retry_count,
+                    'length_observed_count': length_observed_count,
+                })
+                if attempt:
+                    metadata['length_retry_seed'] = kwargs['seed']
+                if metadata.get('finish_reason') != 'length':
+                    break
+                length_observed_count += 1
+                metadata['length_observed_count'] = length_observed_count
+                if attempt == _MAX_LENGTH_RETRIES:
+                    raise RuntimeError(
+                        f"Triple extraction chunk {chunk_key} remains truncated "
+                        f"(finish_reason=length) after {attempt + 1} attempts"
+                    )
+                logger.warning("Triple response truncated for %s; retrying at max_new_tokens=%s",
+                               chunk_key, triple_max_tokens)
+            extracted_triples = _extract_triples_from_response(raw_response)
             triplets = filter_invalid_triples(triples=extracted_triples)
 
         except Exception as e:
             logger.warning(f"Exception for chunk {chunk_key}: {e}")
-            metadata.update({'error': f'{type(e).__name__}: {e}'})
+            metadata.update({
+                'error': f'{type(e).__name__}: {e}',
+                'openie_attempt_count': attempt_count,
+                'length_retry_count': length_retry_count,
+                'length_observed_count': length_observed_count,
+            })
             return TripleRawOutput(
                 chunk_id=chunk_key,
                 response=raw_response,

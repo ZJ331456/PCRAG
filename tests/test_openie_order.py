@@ -112,6 +112,118 @@ class OpenIEOrderTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "NER failed for 1 chunk"):
                 extractor.batch_openie({"a": {"content": "first"}})
 
+    def test_ner_discards_parseable_length_at_both_budgets(self):
+        class FakeLLM:
+            llm_config = SimpleNamespace(generate_params={"seed": None})
+
+            def __init__(self):
+                self.calls = []
+                self.responses = iter([
+                    ('{"named_entities":["partial-512"]}', "length", True),
+                    ('{"named_entities":["partial-1024"]}', "length", False),
+                    ('{"named_entities":["complete","complete"]}', "stop", False),
+                ])
+
+            def infer(self, **kwargs):
+                self.calls.append(kwargs)
+                text, finish_reason, cache_hit = next(self.responses)
+                return text, {"finish_reason": finish_reason}, cache_hit
+
+        llm = FakeLLM()
+        result = openie_openai.OpenIE(llm, max_workers=1).ner("a", "passage")
+
+        self.assertEqual(result.unique_entities, ["complete"])
+        self.assertEqual([call["max_completion_tokens"] for call in llm.calls], [512, 1024, 1024])
+        self.assertNotIn("seed", llm.calls[0])
+        self.assertNotIn("seed", llm.calls[1])
+        self.assertEqual(llm.calls[2]["seed"], 1)
+        self.assertEqual(result.metadata["finish_reason"], "stop")
+        self.assertEqual(result.metadata["ner_max_tokens_used"], 1024)
+        self.assertEqual(result.metadata["length_observed_count"], 2)
+        self.assertEqual(result.metadata["length_retry_count"], 2)
+        self.assertEqual(result.metadata["openie_attempt_count"], 3)
+
+    def test_triples_discard_parseable_length_and_retry_at_same_cap(self):
+        class FakeLLM:
+            llm_config = SimpleNamespace(generate_params={"seed": None})
+
+            def __init__(self):
+                self.calls = []
+                self.responses = iter([
+                    ('{"triples":[["partial","r","x"]]}', "length", True),
+                    ('{"triples":[["complete","r","y"],["other","r","z"]]}', "stop", False),
+                ])
+
+            def infer(self, **kwargs):
+                self.calls.append(kwargs)
+                text, finish_reason, cache_hit = next(self.responses)
+                return text, {"finish_reason": finish_reason}, cache_hit
+
+        llm = FakeLLM()
+        result = openie_openai.OpenIE(llm, max_workers=1).triple_extraction("a", "passage", ["x"])
+
+        self.assertEqual(result.triples, [["complete", "r", "y"], ["other", "r", "z"]])
+        self.assertEqual([call["max_completion_tokens"] for call in llm.calls], [2048, 2048])
+        self.assertNotIn("seed", llm.calls[0])
+        self.assertEqual(llm.calls[1]["seed"], 1)
+        self.assertEqual(result.metadata["finish_reason"], "stop")
+        self.assertEqual(result.metadata["length_observed_count"], 1)
+        self.assertEqual(result.metadata["length_retry_count"], 1)
+        self.assertEqual(result.metadata["openie_attempt_count"], 2)
+
+    def test_ner_that_remains_truncated_fails_the_batch(self):
+        class AlwaysLengthLLM:
+            llm_config = SimpleNamespace(generate_params={"seed": None})
+
+            def __init__(self):
+                self.calls = []
+
+            def infer(self, **kwargs):
+                self.calls.append(kwargs)
+                return '{"named_entities":["partial"]}', {"finish_reason": "length"}, False
+
+        llm = AlwaysLengthLLM()
+        extractor = openie_openai.OpenIE(llm, max_workers=1)
+        result = extractor.ner("a", "passage")
+        self.assertEqual(result.unique_entities, [])
+        self.assertEqual(result.metadata["finish_reason"], "length")
+        self.assertIn("finish_reason=length", result.metadata["error"])
+        self.assertEqual(result.metadata["length_observed_count"], 4)
+        self.assertEqual(result.metadata["length_retry_count"], 3)
+        self.assertEqual([call["max_completion_tokens"] for call in llm.calls],
+                         [512, 1024, 1024, 1024])
+        self.assertEqual([call.get("seed") for call in llm.calls], [None, None, 1, 2])
+
+        with patch.object(openie_openai, "tqdm", QuietProgress):
+            with self.assertRaisesRegex(RuntimeError, "NER failed for 1 chunk"):
+                extractor.batch_openie({"a": {"content": "passage"}})
+
+    def test_triples_that_remain_truncated_fail_the_batch(self):
+        class AlwaysLengthLLM:
+            llm_config = SimpleNamespace(generate_params={"seed": 7})
+
+            def __init__(self):
+                self.calls = []
+
+            def infer(self, **kwargs):
+                self.calls.append(kwargs)
+                return '{"triples":[["partial","r","x"]]}', {"finish_reason": "length"}, False
+
+        llm = AlwaysLengthLLM()
+        extractor = openie_openai.OpenIE(llm, max_workers=1)
+        result = extractor.triple_extraction("a", "passage", ["x"])
+        self.assertEqual(result.triples, [])
+        self.assertEqual(result.metadata["finish_reason"], "length")
+        self.assertIn("finish_reason=length", result.metadata["error"])
+        self.assertEqual(result.metadata["length_observed_count"], 3)
+        self.assertEqual(result.metadata["length_retry_count"], 2)
+        self.assertEqual([call.get("seed") for call in llm.calls], [None, 8, 9])
+
+        extractor.ner = lambda chunk_key, passage: NerRawOutput(chunk_key, "{}", ["x"], {})
+        with patch.object(openie_openai, "tqdm", QuietProgress):
+            with self.assertRaisesRegex(RuntimeError, "Triple extraction failed for 1 chunk"):
+                extractor.batch_openie({"a": {"content": "passage"}})
+
 
 if __name__ == "__main__":
     unittest.main()
