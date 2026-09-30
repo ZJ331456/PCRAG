@@ -76,6 +76,7 @@ def greedy_path_set_selection(
     while remaining and len(selected) < set_size:
         best_idx = -1
         best_gain = -1e9
+        best_key = None
 
         for idx, cand in enumerate(remaining):
             if cand.passage_key in used_passages:
@@ -84,9 +85,13 @@ def greedy_path_set_selection(
             incremental = len((cand.covered_entities - covered_entities) & target_entities)
             inc_cov = incremental / target_total
             objective = (1.0 - diversity_lambda) * cand.score_total + diversity_lambda * inc_cov
+            candidate_key = (cand.passage_key, tuple(cand.nodes))
 
-            if objective > best_gain:
+            if objective > best_gain or (
+                objective == best_gain and (best_key is None or candidate_key < best_key)
+            ):
                 best_gain = objective
+                best_key = candidate_key
                 best_idx = idx
 
         if best_idx < 0:

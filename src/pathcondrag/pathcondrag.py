@@ -966,7 +966,7 @@ class PCRAG(BaseRAG):
             return {}
 
         raw_scores: Dict[str, float] = {}
-        for ent in seed_entities:
+        for ent in sorted(seed_entities):
             local_idx = self.entity_key_to_local_idx.get(ent)
             if local_idx is None or local_idx >= len(self.entity_embeddings):
                 continue
@@ -1006,7 +1006,7 @@ class PCRAG(BaseRAG):
             score = idf / (1.0 + deg)
             cands.append((nb_name, score))
 
-        cands.sort(key=lambda x: x[1], reverse=True)
+        cands.sort(key=lambda x: (-x[1], x[0]))
         return [x[0] for x in cands[: self.pcrag_config.bridge_cache_top_k_per_entity]]
 
     def _detect_bridge_entities(self, query: str, seed_entities: Set[str]) -> Dict[str, List[str]]:
@@ -1031,7 +1031,7 @@ class PCRAG(BaseRAG):
         query_emb = self.query_to_embedding["triple"].get(query)
         
         bridges: Dict[str, List[str]] = {}
-        for seed in seed_entities:
+        for seed in sorted(seed_entities):
             if seed in self.bridge_neighbor_cache:
                 ranked_nb = self.bridge_neighbor_cache[seed]
             else:
@@ -1170,7 +1170,7 @@ class PCRAG(BaseRAG):
 
         scored: Dict[str, float] = {}
         min_score = float(self.pcrag_config.no_facts_weak_seed_min_score)
-        for ent_key in candidate_keys:
+        for ent_key in sorted(candidate_keys):
             surf = self.entity_surface_norm.get(ent_key, "")
             if not surf:
                 continue
@@ -1192,7 +1192,7 @@ class PCRAG(BaseRAG):
             return dpr_sorted_doc_ids, dpr_sorted_doc_scores, False
 
         top_k = max(1, int(self.pcrag_config.no_facts_weak_seed_top_k))
-        scored_items = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        scored_items = sorted(scored.items(), key=lambda x: (-x[1], x[0]))[:top_k]
         seed_distribution = self._softmax(dict(scored_items), temperature=0.7)
         if not seed_distribution:
             return dpr_sorted_doc_ids, dpr_sorted_doc_scores, False
@@ -1239,13 +1239,13 @@ class PCRAG(BaseRAG):
             if doc_id >= len(self.passage_node_keys):
                 continue
             pkey = self.passage_node_keys[doc_id]
-            for ent_key in self.chunk_to_entities.get(pkey, set()):
+            for ent_key in sorted(self.chunk_to_entities.get(pkey, set())):
                 if ent_key in original_seed_entities:
                     continue
                 candidates[ent_key] = max(candidates.get(ent_key, 0.0), float(self.entity_idf.get(ent_key, 1.0)))
         if not candidates:
             return ""
-        best_ent = max(candidates.items(), key=lambda x: x[1])[0]
+        best_ent = min(candidates.items(), key=lambda x: (-x[1], x[0]))[0]
         return self._entity_surface(best_ent)
 
     @staticmethod
@@ -1324,7 +1324,7 @@ class PCRAG(BaseRAG):
         query_emb = self.query_to_embedding["triple"].get(query) if mode == "sim_idf" else None
 
         scored: List[Tuple[str, float]] = []
-        for ent_key in candidate_entities:
+        for ent_key in sorted(candidate_entities):
             if novel_only and ent_key in original_seed_entities:
                 continue
             local_idx = self.entity_key_to_local_idx.get(ent_key)
@@ -1341,7 +1341,7 @@ class PCRAG(BaseRAG):
 
             scored.append((ent_key, score))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
+        scored.sort(key=lambda x: (-x[1], x[0]))
         return scored[: self.pcrag_config.iterative_round2_seed_top_k]
 
     def _iterative_round2_search(
@@ -1453,7 +1453,7 @@ class PCRAG(BaseRAG):
         # EBA bridge augmentation
         bridges_by_seed = self._detect_bridge_entities(query, seed_entities)
         bridge_count = 0
-        for seed, bridge_entities in bridges_by_seed.items():
+        for seed, bridge_entities in sorted(bridges_by_seed.items()):
             seed_w = seed_distribution.get(seed, 0.0)
             for b in bridge_entities:
                 b_idx = self.node_name_to_vertex_idx.get(b)
@@ -1902,7 +1902,7 @@ class PCRAG(BaseRAG):
 
         # Pass 1: use seed->bridge candidates from EBA.
         for _, passage_key, doc_entities, evidence_text, path_score in top_doc_context:
-            for seed, bridge_entities in bridges_by_seed.items():
+            for seed, bridge_entities in sorted(bridges_by_seed.items()):
                 for bridge in bridge_entities:
                     if bridge not in doc_entities:
                         continue
@@ -1912,11 +1912,13 @@ class PCRAG(BaseRAG):
         if not grouped:
             seed_keys = set(seed_distribution.keys())
             for _, passage_key, doc_entities, evidence_text, path_score in top_doc_context:
-                doc_seed_entities = [s for s in seed_keys if s in doc_entities]
+                doc_seed_entities = sorted(seed_keys & doc_entities)
                 if not doc_seed_entities:
                     continue
-                bridge_pool = [e for e in doc_entities if e not in seed_keys]
-                bridge_pool.sort(key=lambda e: float(self.entity_idf.get(e, 1.0)), reverse=True)
+                bridge_pool = sorted(
+                    doc_entities - seed_keys,
+                    key=lambda e: (-float(self.entity_idf.get(e, 1.0)), e),
+                )
                 bridge_pool = bridge_pool[: max(1, self.pcrag_config.pcqd_entity_top_k)]
                 for seed in doc_seed_entities:
                     for bridge in bridge_pool:
@@ -1927,11 +1929,13 @@ class PCRAG(BaseRAG):
             relaxed_docs = top_doc_context[:1]
             seed_keys = set(seed_distribution.keys())
             for _, passage_key, doc_entities, evidence_text, path_score in relaxed_docs:
-                doc_seed_entities = [s for s in seed_keys if s in doc_entities]
+                doc_seed_entities = sorted(seed_keys & doc_entities)
                 if not doc_seed_entities:
-                    doc_seed_entities = list(seed_keys)[:1]
-                bridge_pool = [e for e in doc_entities if e not in seed_keys]
-                bridge_pool.sort(key=lambda e: float(self.entity_idf.get(e, 1.0)), reverse=True)
+                    doc_seed_entities = sorted(seed_keys)[:1]
+                bridge_pool = sorted(
+                    doc_entities - seed_keys,
+                    key=lambda e: (-float(self.entity_idf.get(e, 1.0)), e),
+                )
                 bridge_pool = bridge_pool[: max(1, self.pcrag_config.pcqd_entity_top_k)]
                 for seed in doc_seed_entities:
                     for bridge in bridge_pool:
@@ -1944,21 +1948,27 @@ class PCRAG(BaseRAG):
                 per_source[str(h.get("_seed_key", ""))].append(h)
 
             voted_hints: List[Dict[str, Any]] = []
-            for src, cands in per_source.items():
+            for src in sorted(per_source):
+                cands = per_source[src]
                 cands.sort(
                     key=lambda x: (
-                        int(x.get("votes", 0)),
-                        float(x.get("confidence", 0.0)),
-                        float(x.get("max_path_score", 0.0)),
-                        float(self.entity_idf.get(str(x.get("_bridge_key", "")), 1.0)),
+                        -int(x.get("votes", 0)),
+                        -float(x.get("confidence", 0.0)),
+                        -float(x.get("max_path_score", 0.0)),
+                        -float(self.entity_idf.get(str(x.get("_bridge_key", "")), 1.0)),
+                        str(x.get("_bridge_key", "")),
                     ),
-                    reverse=True,
                 )
                 keep = cands[: self.pcrag_config.pcqd_max_bridges_per_source]
                 voted_hints.extend(keep)
             hints = voted_hints
 
-        hints.sort(key=lambda x: (float(x["confidence"]), int(x["votes"])), reverse=True)
+        hints.sort(key=lambda x: (
+            -float(x["confidence"]),
+            -int(x["votes"]),
+            str(x.get("_seed_key", "")),
+            str(x.get("_bridge_key", "")),
+        ))
 
         if self.pcrag_config.pcqd_entity_top_k > 0:
             hints = hints[: self.pcrag_config.pcqd_entity_top_k]
@@ -2406,7 +2416,7 @@ class PCRAG(BaseRAG):
                 continue
 
             # Direct two-node path: seed -> passage
-            for seed in seed_entities:
+            for seed in sorted(seed_entities):
                 if seed not in doc_entities:
                     continue
 
@@ -2430,7 +2440,7 @@ class PCRAG(BaseRAG):
                 )
 
             # Three-node path: seed -> bridge -> passage
-            for seed, bridge_entities in bridges_by_seed.items():
+            for seed, bridge_entities in sorted(bridges_by_seed.items()):
                 for b in bridge_entities:
                     if b not in doc_entities:
                         continue
@@ -2507,7 +2517,7 @@ class PCRAG(BaseRAG):
         selected_meta: List[Dict[str, Any]] = []
         for p in selected:
             pkey = str(p.passage_key)
-            covered = list(self.chunk_to_entities.get(pkey, set()))
+            covered = sorted(self.chunk_to_entities.get(pkey, set()))
             selected_meta.append(
                 {
                     "passage_key": pkey,
