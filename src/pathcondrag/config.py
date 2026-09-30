@@ -100,6 +100,9 @@ class PCRAGConfig(BaseConfig):
     qd_merge_alpha: float = field(default=0.30)
     qd_llm_temperature: float = field(default=0.0)
     qd_cache_decompositions: bool = field(default=True)
+    # In-flight QD/PCQD generation requests per retrieval process.  The
+    # default retains the original serial execution order.
+    llm_prefetch_workers: int = field(default=1)
 
     # Path-conditioned QD
     use_path_conditioned_qd: bool = field(default=False)
@@ -125,7 +128,7 @@ class PCRAGConfig(BaseConfig):
         super().__post_init__()
         self.qcappr_hub_penalty_gamma = max(0.0, float(self.qcappr_hub_penalty_gamma))
         self.eba_bridge_weight = max(0.0, float(self.eba_bridge_weight))
-        self.hop_force_max = min(3, max(1, int(self.hop_force_max)))
+        self.hop_force_max = min(4, max(1, int(self.hop_force_max)))
         self.hop_multi_min_signals = min(3, max(1, int(self.hop_multi_min_signals)))
         self.path_set_size = max(1, int(self.path_set_size))
         self.path_candidate_docs = max(self.path_set_size, int(self.path_candidate_docs))
@@ -150,6 +153,7 @@ class PCRAGConfig(BaseConfig):
         self.bridge_cache_entity_limit = max(1, int(self.bridge_cache_entity_limit))
         self.qd_min_hops = max(1, int(self.qd_min_hops))
         self.qd_max_sub_questions = max(1, int(self.qd_max_sub_questions))
+        self.llm_prefetch_workers = min(8, max(1, int(self.llm_prefetch_workers)))
         self.qd_sub_retrieval_top_k = max(1, int(self.qd_sub_retrieval_top_k))
         self.qd_sequential_top_docs_for_anchor = max(1, int(self.qd_sequential_top_docs_for_anchor))
         if self.qd_sub_retrieval_mode not in {"dpr", "query_ppr"}:

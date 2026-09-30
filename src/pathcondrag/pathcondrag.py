@@ -7,7 +7,9 @@ import os
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from numbers import Integral
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -57,6 +59,8 @@ class PCRAG(BaseRAG):
         )
 
         self.pcrag_config: PCRAGConfig = self.global_config
+        self._query_hop_overrides: Optional[List[int]] = None
+        self._query_hop_override_source: Optional[str] = None
 
         # Index-side artifacts
         self.entity_idf: Dict[str, float] = {}
@@ -87,6 +91,35 @@ class PCRAG(BaseRAG):
     # ---------------------------------------------------------------------
     # Diagnostics
     # ---------------------------------------------------------------------
+    def set_query_hop_overrides(self, hops: List[int], source: str) -> None:
+        """Use one externally supplied hop count for each query in the next retrieve.
+
+        The list is aligned by position, never by question text.  Explicit
+        labels bypass ``hop_force_max``, which only caps the heuristic estimate.
+        ``retrieve`` validates the list length before starting any work.
+        """
+        if not isinstance(hops, list) or any(
+            isinstance(hop, bool) or not isinstance(hop, Integral) or not 1 <= hop <= 4
+            for hop in hops
+        ):
+            raise ValueError("hops must be a list of integers from 1 through 4")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("hop override source must be a nonempty string")
+        self._query_hop_overrides = [int(hop) for hop in hops]
+        self._query_hop_override_source = source.strip()
+
+    def clear_query_hop_overrides(self) -> None:
+        """Return subsequent retrievals to heuristic hop estimation."""
+        self._query_hop_overrides = None
+        self._query_hop_override_source = None
+
+    def _qd_subquestion_limit(self, hops: int) -> int:
+        """Preserve the old three-question prompt except for labeled four-hop items."""
+        configured = self.pcrag_config.qd_max_sub_questions
+        if self._query_hop_overrides is None:
+            return configured
+        return min(configured, max(3, hops))
+
     def reset_retrieval_diagnostics(self):
         super().reset_retrieval_diagnostics()
         cfg = getattr(self, "pcrag_config", None) or getattr(self, "global_config", None)
@@ -98,7 +131,8 @@ class PCRAG(BaseRAG):
 
         self.retrieval_diagnostics.update(
             {
-                "hop_counter": {"1": 0, "2": 0, "3": 0},
+                "hop_counter": {"1": 0, "2": 0, "3": 0, "4": 0},
+                "hop_override_source": getattr(self, "_query_hop_override_source", None),
                 "avg_bridge_entities": 0.0,
                 "avg_path_candidates": 0.0,
                 "avg_selected_paths": 0.0,
@@ -388,12 +422,114 @@ class PCRAG(BaseRAG):
             "mpce_consensus_passages": int(consensus_count),
             "mpce_consensus_entities": int(len(consensus_entities)),
         }
+    def _iter_retrieval_states(self, queries: List[str]):
+        """Bound outstanding LLM jobs to one small, ordered query window."""
+        workers = self.pcrag_config.llm_prefetch_workers
+        if workers <= 1 or not self.pcrag_config.use_query_decomposition:
+            for q_idx, query in enumerate(queries):
+                yield {"query_idx": q_idx, "query": query}
+            return
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pcrag-qd") as executor:
+            for start in range(0, len(queries), workers):
+                states: List[Dict[str, Any]] = []
+                # Prepare the entire window on the caller thread before starting
+                # QD jobs.  Reranking can itself use the LLM, so overlapping
+                # preparation with workers would exceed the request budget.
+                for q_idx in range(start, min(start + workers, len(queries))):
+                    query = queries[q_idx]
+                    query_fact_scores = self.get_fact_scores(query)
+                    top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
+                    state: Dict[str, Any] = {
+                        "query_idx": q_idx,
+                        "query": query,
+                        "rerank": (query_fact_scores, top_k_fact_indices, top_k_facts, rerank_log),
+                    }
+                    if top_k_facts:
+                        hop_override = (
+                            self._query_hop_overrides[q_idx]
+                            if self._query_hop_overrides is not None else None
+                        )
+                        base = self._path_graph_search(
+                            query=query,
+                            query_fact_scores=query_fact_scores,
+                            top_k_facts=top_k_facts,
+                            top_k_fact_indices=top_k_fact_indices,
+                            hop_override=hop_override,
+                            defer_qd=True,
+                        )
+                        state["base"] = base
+                        _base_ids, _base_scores, ctx = base
+                        if ctx.get("_qd_deferred") and int(ctx["hops"]) >= self.pcrag_config.qd_min_hops:
+                            state["qd_plan"] = True
+                    states.append(state)
+
+                # Phase 1: parallelize independent static decomposition calls.
+                for state in states:
+                    if "qd_plan" in state:
+                        state["static_future"] = executor.submit(
+                            self._decompose_query,
+                            state["query"],
+                            self._qd_subquestion_limit(int(state["base"][2]["hops"])),
+                        )
+                for state in states:
+                    if "static_future" in state:
+                        state["static_sub_questions"] = state.pop("static_future").result()
+
+                # Phase 2: build static tracks and path hints serially.  The
+                # original path only asks PCQD after a usable static track.
+                for state in states:
+                    if "qd_plan" not in state:
+                        continue
+                    static_sub_questions = state["static_sub_questions"]
+                    if not static_sub_questions:
+                        continue
+                    base_ids, base_scores, ctx = state["base"]
+                    static_track = self._build_qd_track_ranking(
+                        query=state["query"],
+                        hops=int(ctx["hops"]),
+                        sub_questions=static_sub_questions,
+                        base_sorted_doc_ids=base_ids,
+                        original_seed_entities=set(ctx["seed_entities"]),
+                    )
+                    state["static_track"] = static_track
+                    static_ids, static_scores, static_stats = static_track
+                    static_used = bool(static_stats.get("used", False) and static_ids is not None and static_scores is not None)
+                    if static_used and self.pcrag_config.use_path_conditioned_qd:
+                        state["path_hints"] = self._build_pcqd_path_hints(
+                            base_sorted_doc_ids=base_ids,
+                            base_sorted_doc_scores=base_scores,
+                            seed_distribution=ctx["seed_distribution"],
+                            bridges_by_seed=ctx["bridges_by_seed"],
+                        )
+
+                # Phase 3: parallelize PCQD calls only where the old serial
+                # path would make one, then finalize every query in input order.
+                for state in states:
+                    if "path_hints" in state and state["path_hints"][0]:
+                        state["pcqd_future"] = executor.submit(
+                            self._decompose_query_with_hints,
+                            state["query"],
+                            state["path_hints"][0],
+                            self._qd_subquestion_limit(int(state["base"][2]["hops"])),
+                        )
+                for state in states:
+                    if "pcqd_future" in state:
+                        state["pcqd_sub_questions"] = state.pop("pcqd_future").result()
+                for state in states:
+                    yield state
+
     def retrieve(
         self,
         queries: List[str],
         num_to_retrieve: Optional[int] = None,
         gold_docs: Optional[List[List[str]]] = None,
     ):
+        if self._query_hop_overrides is not None and len(self._query_hop_overrides) != len(queries):
+            raise ValueError(
+                "query hop override count must match the number of queries: "
+                f"{len(self._query_hop_overrides)} != {len(queries)}"
+            )
         retrieve_start_time = time.time()
         self.reset_retrieval_diagnostics()
 
@@ -414,9 +550,13 @@ class PCRAG(BaseRAG):
 
         retrieval_results: List[QuerySolution] = []
 
-        for q_idx, query in tqdm(enumerate(queries), total=len(queries), desc="PCRAG Retrieving"):
-            query_fact_scores = self.get_fact_scores(query)
-            top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
+        for state in tqdm(self._iter_retrieval_states(queries), total=len(queries), desc="PCRAG Retrieving"):
+            q_idx, query = state["query_idx"], state["query"]
+            if "rerank" in state:
+                query_fact_scores, top_k_fact_indices, top_k_facts, rerank_log = state["rerank"]
+            else:
+                query_fact_scores = self.get_fact_scores(query)
+                top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
             no_facts_reason = (
                 rerank_log.get("no_facts_reason", "none")
                 if isinstance(rerank_log, dict)
@@ -488,6 +628,8 @@ class PCRAG(BaseRAG):
                             else ("query_ppr" if used_query_ppr else fallback_strategy)
                         ),
                         "hops": None,
+                        "hop_source": self._query_hop_override_source if self._query_hop_overrides is not None else "estimated",
+                        "assigned_hops": self._query_hop_overrides[q_idx] if self._query_hop_overrides is not None else None,
                         "bridge_entities": 0,
                         "path_candidates": 0,
                         "selected_paths": 0,
@@ -505,12 +647,38 @@ class PCRAG(BaseRAG):
                 )
                 continue
 
-            sorted_doc_ids, sorted_doc_scores, ctx = self._path_graph_search(
-                query=query,
-                query_fact_scores=query_fact_scores,
-                top_k_facts=top_k_facts,
-                top_k_fact_indices=top_k_fact_indices,
-            )
+            if "base" in state:
+                sorted_doc_ids, sorted_doc_scores, ctx = state["base"]
+                if "qd_plan" in state:
+                    # Propagate terminal request errors: silently dropping QD or
+                    # PCQD changes retrieval results without alerting the user.
+                    static_sub_questions = state["static_sub_questions"]
+                    pcqd_sub_questions = state.get("pcqd_sub_questions")
+                    path_hints, conflict_rate = state.get("path_hints", ([], 0.0))
+                    sorted_doc_ids, sorted_doc_scores, qd_stats = self._query_decomposition_retrieval(
+                        query=query,
+                        hops=int(ctx["hops"]),
+                        base_sorted_doc_ids=sorted_doc_ids,
+                        base_sorted_doc_scores=sorted_doc_scores,
+                        seed_entities=ctx["seed_entities"],
+                        seed_distribution=ctx["seed_distribution"],
+                        bridges_by_seed=ctx["bridges_by_seed"],
+                        prefetched_qd=(static_sub_questions, pcqd_sub_questions, path_hints, conflict_rate),
+                        prefetched_static_track=state.get("static_track"),
+                    )
+                    ctx.update(qd_stats)
+                ctx.pop("_qd_deferred", None)
+            else:
+                sorted_doc_ids, sorted_doc_scores, ctx = self._path_graph_search(
+                    query=query,
+                    query_fact_scores=query_fact_scores,
+                    top_k_facts=top_k_facts,
+                    top_k_fact_indices=top_k_fact_indices,
+                    hop_override=(
+                        self._query_hop_overrides[q_idx]
+                        if self._query_hop_overrides is not None else None
+                    ),
+                )
             self._record_retrieval_diagnostic(
                 query_idx=q_idx,
                 query=query,
@@ -585,6 +753,7 @@ class PCRAG(BaseRAG):
                     "no_facts": False,
                     "no_facts_reason": no_facts_reason,
                     "hops": hops,
+                    "hop_source": self._query_hop_override_source if self._query_hop_overrides is not None else "estimated",
                     "bridge_entities": int(ctx.get("bridge_count", 0)),
                     "path_candidates": int(path_stats.get("path_candidates", 0)),
                     "selected_paths": int(path_stats.get("selected_paths", 0)),
@@ -1258,12 +1427,20 @@ class PCRAG(BaseRAG):
         query_fact_scores: np.ndarray,
         top_k_facts: List[Tuple],
         top_k_fact_indices: List[int],
+        hop_override: Optional[int] = None,
+        defer_qd: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         num_nodes = len(self.graph.vs["name"])
         phrase_weights = np.zeros(num_nodes, dtype=np.float32)
         passage_weights = np.zeros(num_nodes, dtype=np.float32)
 
-        hops = self._estimate_query_hops(query, top_k_facts=top_k_facts)
+        if hop_override is not None and (
+            isinstance(hop_override, bool)
+            or not isinstance(hop_override, Integral)
+            or not 1 <= hop_override <= 4
+        ):
+            raise ValueError("hop_override must be an integer from 1 through 4")
+        hops = int(hop_override) if hop_override is not None else self._estimate_query_hops(query, top_k_facts=top_k_facts)
         seed_entities = self._extract_seed_entities_from_facts(top_k_facts)
         seed_distribution = self._build_seed_distribution(query, seed_entities, hops)
 
@@ -1354,16 +1531,19 @@ class PCRAG(BaseRAG):
             ctx.update(iter_stats)
 
         if self.pcrag_config.use_query_decomposition:
-            current_ids, current_scores, qd_stats = self._query_decomposition_retrieval(
-                query=query,
-                hops=hops,
-                base_sorted_doc_ids=current_ids,
-                base_sorted_doc_scores=current_scores,
-                seed_entities=seed_entities,
-                seed_distribution=seed_distribution,
-                bridges_by_seed=bridges_by_seed,
-            )
-            ctx.update(qd_stats)
+            if defer_qd:
+                ctx["_qd_deferred"] = True
+            else:
+                current_ids, current_scores, qd_stats = self._query_decomposition_retrieval(
+                    query=query,
+                    hops=hops,
+                    base_sorted_doc_ids=current_ids,
+                    base_sorted_doc_scores=current_scores,
+                    seed_entities=seed_entities,
+                    seed_distribution=seed_distribution,
+                    bridges_by_seed=bridges_by_seed,
+                )
+                ctx.update(qd_stats)
 
         return current_ids, current_scores, ctx
 
@@ -1482,10 +1662,11 @@ class PCRAG(BaseRAG):
         Results are cached in ``_qd_cache`` to avoid redundant LLM calls.
         """
         if not hasattr(self, "_qd_cache"):
-            self._qd_cache: Dict[str, List[str]] = {}
+            self._qd_cache: Dict[Tuple[str, int], List[str]] = {}
 
-        if self.pcrag_config.qd_cache_decompositions and query in self._qd_cache:
-            return self._qd_cache[query]
+        cache_key = (query, max_sub_questions)
+        if self.pcrag_config.qd_cache_decompositions and cache_key in self._qd_cache:
+            return self._qd_cache[cache_key]
 
         messages = [
             {"role": "system", "content": self._QD_SYSTEM_PROMPT},
@@ -1518,11 +1699,11 @@ class PCRAG(BaseRAG):
             raw = self._extract_llm_text(response_obj)
             sub_qs = self._parse_sub_questions_from_text(raw, max_sub_questions=max_sub_questions)
         except Exception as e:
-            logger.warning("[QD] decompose_query failed for %r: %s", query[:60], e)
-            sub_qs = []
+            logger.exception("[QD] decompose_query failed for %r: %s", query[:60], e)
+            raise
 
         if self.pcrag_config.qd_cache_decompositions:
-            self._qd_cache[query] = sub_qs
+            self._qd_cache[cache_key] = sub_qs
         return sub_qs
 
     def _decompose_query_with_hints(
@@ -1632,7 +1813,8 @@ class PCRAG(BaseRAG):
                 if structured_sub_qs:
                     break
         except Exception as e:
-            logger.warning("[PCQD] decompose with hints failed for %r: %s", query[:60], e)
+            logger.exception("[PCQD] decompose with hints failed for %r: %s", query[:60], e)
+            raise
 
         if not structured_sub_qs:
             fallback_qs = self._decompose_query(query, max_sub_questions=max_sub_questions)
@@ -1958,6 +2140,12 @@ class PCRAG(BaseRAG):
         seed_entities: Set[str],
         seed_distribution: Dict[str, float],
         bridges_by_seed: Dict[str, List[str]],
+        prefetched_qd: Optional[
+            Tuple[List[str], Optional[List[Dict[str, Any]]], List[Dict[str, Any]], float]
+        ] = None,
+        prefetched_static_track: Optional[
+            Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]
+        ] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         if hops < self.pcrag_config.qd_min_hops:
             return base_sorted_doc_ids, base_sorted_doc_scores, {
@@ -1976,7 +2164,12 @@ class PCRAG(BaseRAG):
                 "pcqd_conflict_rate": 0.0,
             }
 
-        static_sub_questions = self._decompose_query(query, self.pcrag_config.qd_max_sub_questions)
+        max_sub_questions = self._qd_subquestion_limit(hops)
+        static_sub_questions = (
+            prefetched_qd[0]
+            if prefetched_qd is not None
+            else self._decompose_query(query, max_sub_questions)
+        )
         if not static_sub_questions:
             return base_sorted_doc_ids, base_sorted_doc_scores, {
                 "qd_used": False,
@@ -1994,12 +2187,16 @@ class PCRAG(BaseRAG):
                 "pcqd_conflict_rate": 0.0,
             }
 
-        static_ids, static_scores, static_stats = self._build_qd_track_ranking(
-            query=query,
-            hops=hops,
-            sub_questions=static_sub_questions,
-            base_sorted_doc_ids=base_sorted_doc_ids,
-            original_seed_entities=set(seed_entities),
+        static_ids, static_scores, static_stats = (
+            prefetched_static_track
+            if prefetched_static_track is not None
+            else self._build_qd_track_ranking(
+                query=query,
+                hops=hops,
+                sub_questions=static_sub_questions,
+                base_sorted_doc_ids=base_sorted_doc_ids,
+                original_seed_entities=set(seed_entities),
+            )
         )
         static_used = bool(static_stats.get("used", False) and static_ids is not None and static_scores is not None)
         if not static_used:
@@ -2046,19 +2243,26 @@ class PCRAG(BaseRAG):
             }
 
         # PC-QD path hints
-        path_hints, conflict_rate = self._build_pcqd_path_hints(
-            base_sorted_doc_ids=base_sorted_doc_ids,
-            base_sorted_doc_scores=base_sorted_doc_scores,
-            seed_distribution=seed_distribution,
-            bridges_by_seed=bridges_by_seed,
-        )
+        if prefetched_qd is not None:
+            path_hints, conflict_rate = prefetched_qd[2], prefetched_qd[3]
+        else:
+            path_hints, conflict_rate = self._build_pcqd_path_hints(
+                base_sorted_doc_ids=base_sorted_doc_ids,
+                base_sorted_doc_scores=base_sorted_doc_scores,
+                seed_distribution=seed_distribution,
+                bridges_by_seed=bridges_by_seed,
+            )
         pcqd_fallback = len(path_hints) == 0
         pcqd_structured_sub_qs: List[Dict[str, Any]] = []
         if path_hints:
-            pcqd_structured_sub_qs = self._decompose_query_with_hints(
-                query=query,
-                path_hints=path_hints,
-                max_sub_questions=self.pcrag_config.qd_max_sub_questions,
+            pcqd_structured_sub_qs = (
+                prefetched_qd[1]
+                if prefetched_qd is not None and prefetched_qd[1] is not None
+                else self._decompose_query_with_hints(
+                    query=query,
+                    path_hints=path_hints,
+                    max_sub_questions=max_sub_questions,
+                )
             )
 
         pcqd_questions: List[str] = []
