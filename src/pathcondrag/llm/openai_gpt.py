@@ -2,8 +2,13 @@ import functools
 import hashlib
 import json
 import os
+import random
 import sqlite3
+import threading
+import time
 from copy import deepcopy
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import List, Tuple
 
 import httpx
@@ -12,7 +17,6 @@ from filelock import FileLock
 from openai import OpenAI
 from openai import AzureOpenAI
 from packaging import version
-from tenacity import retry, stop_after_attempt, wait_fixed
 
 from ..utils.config_utils import BaseConfig
 from ..utils.llm_utils import (
@@ -46,6 +50,68 @@ def _safe_env_float(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+# This bound is shared by every CacheOpenAI instance in this process. Waiting and
+# retry backoff happen outside the semaphore, so only active HTTP calls occupy it.
+LLM_MAX_IN_FLIGHT = _safe_env_int("PATHCONDRAG_LLM_MAX_IN_FLIGHT", 4)
+_LLM_HTTP_SEMAPHORE = threading.BoundedSemaphore(LLM_MAX_IN_FLIGHT)
+
+
+def _effective_generation_params(self, kwargs):
+    """Build the same generation parameters for both the request and cache key."""
+    params = deepcopy(self.llm_config.generate_params)
+    params.update(deepcopy(kwargs))
+    params.pop("messages", None)
+    model_name = str(params.get("model") or "").lower()
+    configured_name = str(getattr(self, "llm_name", "") or "").lower()
+    if "qwen3" in model_name or "qwen3" in configured_name:
+        # A caller override must not accidentally switch Qwen3 back to thinking.
+        extra_body = dict(params.get("extra_body") or {})
+        chat_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
+        chat_kwargs["enable_thinking"] = False
+        extra_body["chat_template_kwargs"] = chat_kwargs
+        params["extra_body"] = extra_body
+    return params
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        status = exc.status_code
+        return status in (408, 409, 429) or status >= 500
+    return False
+
+
+def _retry_after_seconds(exc: Exception):
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    for header, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        value = headers.get(header)
+        if value is None:
+            continue
+        try:
+            return max(0.0, float(value) * scale)
+        except (TypeError, ValueError):
+            if header == "retry-after":
+                try:
+                    when = parsedate_to_datetime(value)
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return None
+
+
+def _increment_stat(self, name: str):
+    lock = getattr(self, "_llm_stats_lock", None)
+    if lock is not None:
+        with lock:
+            setattr(self, name, getattr(self, name, 0) + 1)
+
+
 def cache_response(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -57,42 +123,51 @@ def cache_response(func):
         if messages is None:
             raise ValueError("Missing required 'messages' parameter for caching.")
 
-        # Include generation params that affect the response (esp. max tokens).
-        # NER retries 512 -> 1024; without max tokens in the key the retry hits the
-        # truncated 512-token cache entry and fails forever (HippoRAG includes it).
-        gen_params = getattr(self, "llm_config", {}).generate_params if hasattr(self, "llm_config") else {}
-        model = kwargs.get("model", gen_params.get("model"))
-        seed = kwargs.get("seed", gen_params.get("seed"))
-        temperature = kwargs.get("temperature", gen_params.get("temperature"))
-        max_tokens = (
-            kwargs.get("max_completion_tokens")
-            or kwargs.get("max_tokens")
-            or kwargs.get("max_new_tokens")
-            or gen_params.get("max_completion_tokens")
-            or gen_params.get("max_tokens")
-            or gen_params.get("max_new_tokens")
-        )
-
-        # build key data, convert to JSON string and hash to generate key_hash
+        # Include every effective generation setting, including Qwen3 thinking mode,
+        # rather than just temperature and length. The version prevents collisions
+        # with old keys that did not record the chat template settings.
+        generation_params = _effective_generation_params(self, kwargs)
         key_data = {
-            "messages": messages,  # messages requires JSON serializable
-            "model": model,
-            "seed": seed,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        key_str = json.dumps(key_data, sort_keys=True, default=str)
-        key_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
-        # Legacy key (pre max_tokens) so existing NER caches remain usable.
-        legacy_key_data = {
+            "cache_key_version": 2,
             "messages": messages,
-            "model": model,
-            "seed": seed,
-            "temperature": temperature,
+            "generation": generation_params,
+            "base_url": getattr(self, "llm_base_url", None),
         }
-        legacy_key_hash = hashlib.sha256(
-            json.dumps(legacy_key_data, sort_keys=True, default=str).encode("utf-8")
+        key_hash = hashlib.sha256(
+            json.dumps(key_data, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
+
+        # Existing non-Qwen caches remain usable. Qwen3 legacy entries cannot
+        # establish whether thinking was enabled, so never read them.
+        legacy_hashes = []
+        model_name = str(generation_params.get("model") or "").lower()
+        configured_name = str(getattr(self, "llm_name", "") or "").lower()
+        old_key_fields = {"model", "seed", "temperature", "max_completion_tokens",
+                          "max_tokens", "max_new_tokens", "n"}
+        legacy_compatible = (set(generation_params).issubset(old_key_fields)
+                             and generation_params.get("n", 1) == 1)
+        if "qwen3" not in model_name and "qwen3" not in configured_name and legacy_compatible:
+            gen_params = self.llm_config.generate_params
+            model = kwargs.get("model", gen_params.get("model"))
+            seed = kwargs.get("seed", gen_params.get("seed"))
+            temperature = kwargs.get("temperature", gen_params.get("temperature"))
+            max_tokens = (
+                kwargs.get("max_completion_tokens")
+                or kwargs.get("max_tokens")
+                or kwargs.get("max_new_tokens")
+                or gen_params.get("max_completion_tokens")
+                or gen_params.get("max_tokens")
+                or gen_params.get("max_new_tokens")
+            )
+            for legacy_key_data in (
+                {"messages": messages, "model": model, "seed": seed,
+                 "temperature": temperature, "max_tokens": max_tokens},
+                {"messages": messages, "model": model, "seed": seed,
+                 "temperature": temperature},
+            ):
+                legacy_hashes.append(hashlib.sha256(
+                    json.dumps(legacy_key_data, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest())
 
         # the file name of lock, ensure mutual exclusion when accessing concurrently
         lock_file = self.cache_file_name + ".lock"
@@ -113,22 +188,27 @@ def cache_response(func):
             c.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
             row = c.fetchone()
             if row is None:
-                c.execute("SELECT message, metadata FROM cache WHERE key = ?", (legacy_key_hash,))
-                row = c.fetchone()
-                # Do not reuse a length-truncated legacy entry for a larger budget retry.
-                if row is not None:
-                    _msg, _meta_str = row
-                    _meta = json.loads(_meta_str)
-                    if _meta.get("finish_reason") == "length":
-                        row = None
+                for legacy_idx, legacy_hash in enumerate(legacy_hashes):
+                    c.execute("SELECT message, metadata FROM cache WHERE key = ?", (legacy_hash,))
+                    row = c.fetchone()
+                    if row is not None and legacy_idx == 1:
+                        # The oldest key omitted the token budget. Its truncated
+                        # response must not satisfy a larger-budget retry.
+                        _msg, _meta_str = row
+                        if json.loads(_meta_str).get("finish_reason") == "length":
+                            row = None
+                    if row is not None:
+                        break
             conn.close()
             if row is not None:
                 message, metadata_str = row
                 metadata = json.loads(metadata_str)
+                _increment_stat(self, "llm_cache_hit_count")
                 # return cached result and mark as hit
                 return message, metadata, True
 
         # if cache miss, call the original function to get the result
+        _increment_stat(self, "llm_cache_miss_count")
         result = func(self, *args, **kwargs)
         message, metadata = result
 
@@ -157,10 +237,24 @@ def cache_response(func):
 def dynamic_retry_decorator(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
-        max_retries = getattr(self, "max_retries", 5)  
-        dynamic_retry = retry(stop=stop_after_attempt(max_retries), wait=wait_fixed(1))
-        decorated_func = dynamic_retry(func)
-        return decorated_func(self, *args, **kwargs)
+        max_attempts = max(1, int(getattr(self, "max_retries", 5)))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return func(self, *args, **kwargs)
+            except Exception as exc:
+                if not _is_retryable_llm_error(exc) or attempt == max_attempts:
+                    _increment_stat(self, "llm_failure_count")
+                    logger.error("LLM request failed after %d attempt(s): %s", attempt, exc)
+                    raise
+                _increment_stat(self, "llm_retry_count")
+                backoff = min(16.0, 2.0 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+                retry_after = _retry_after_seconds(exc)
+                delay = max(backoff, retry_after or 0.0)
+                logger.warning(
+                    "Retryable LLM request error (attempt %d/%d, sleep %.2fs): %s",
+                    attempt, max_attempts, delay, exc,
+                )
+                time.sleep(delay)
     return wrapper
 
 class CacheOpenAI(BaseLLM):
@@ -187,6 +281,12 @@ class CacheOpenAI(BaseLLM):
         if cache_filename is None:
             cache_filename = f"{self.llm_name.replace('/', '_')}_cache.sqlite"
         self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
+        self._llm_stats_lock = threading.Lock()
+        self.llm_cache_hit_count = 0
+        self.llm_cache_miss_count = 0
+        self.llm_http_attempt_count = 0
+        self.llm_retry_count = 0
+        self.llm_failure_count = 0
 
         self._init_llm_config()
         if high_throughput:
@@ -209,13 +309,26 @@ class CacheOpenAI(BaseLLM):
         else:
             client = None
 
+        # max_retries is the total attempt budget for our one retry layer.
         self.max_retries = kwargs.get("max_retries", _safe_env_int("HIPPO_OPENAI_MAX_RETRIES", 2))
 
         if self.global_config.azure_endpoint is None:
-            self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries)
+            self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=0)
         else:
             self.openai_client = AzureOpenAI(api_version=self.global_config.azure_endpoint.split('api-version=')[1],
-                                             azure_endpoint=self.global_config.azure_endpoint, max_retries=self.max_retries)
+                                             azure_endpoint=self.global_config.azure_endpoint, max_retries=0)
+
+    def get_request_stats(self):
+        """Return a consistent snapshot for fail-fast checks and benchmarking."""
+        with self._llm_stats_lock:
+            return {
+                "cache_hits": self.llm_cache_hit_count,
+                "cache_misses": self.llm_cache_miss_count,
+                "http_attempts": self.llm_http_attempt_count,
+                "retries": self.llm_retry_count,
+                "failures": self.llm_failure_count,
+                "max_in_flight": LLM_MAX_IN_FLIGHT,
+            }
 
     def _init_llm_config(self) -> None:
         config_dict = self.global_config.__dict__
@@ -248,9 +361,7 @@ class CacheOpenAI(BaseLLM):
         messages: List[TextChatMessage],
         **kwargs
     ) -> Tuple[List[TextChatMessage], dict]:
-        params = deepcopy(self.llm_config.generate_params)
-        if kwargs:
-            params.update(kwargs)
+        params = _effective_generation_params(self, kwargs)
         params["messages"] = messages
         logger.debug(f"Calling OpenAI GPT API with:\n{params}")
 
@@ -258,7 +369,9 @@ class CacheOpenAI(BaseLLM):
             # TODO strange version change in openai protocol, but our current vllm version not changed yet
             params['max_tokens'] = params.pop('max_completion_tokens')
 
-        response = self.openai_client.chat.completions.create(**params)
+        with _LLM_HTTP_SEMAPHORE:
+            _increment_stat(self, "llm_http_attempt_count")
+            response = self.openai_client.chat.completions.create(**params)
 
         message_obj = response.choices[0].message
         response_message = ""
