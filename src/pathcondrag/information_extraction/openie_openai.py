@@ -117,7 +117,7 @@ class OpenIE:
         except Exception as e:
             # For any other unexpected exceptions, log them and return with the error message
             logger.warning(e)
-            metadata.update({'error': str(e)})
+            metadata.update({'error': f'{type(e).__name__}: {e}'})
             return NerRawOutput(
                 chunk_id=chunk_key,
                 response=raw_response,  # Store the error message in metadata
@@ -163,7 +163,7 @@ class OpenIE:
 
         except Exception as e:
             logger.warning(f"Exception for chunk {chunk_key}: {e}")
-            metadata.update({'error': str(e)})
+            metadata.update({'error': f'{type(e).__name__}: {e}'})
             return TripleRawOutput(
                 chunk_id=chunk_key,
                 response=raw_response,
@@ -201,7 +201,7 @@ class OpenIE:
         # Extract passages from the provided chunks
         chunk_passages = {chunk_key: chunk["content"] for chunk_key, chunk in chunks.items()}
 
-        ner_results_list = []
+        ner_results_by_id: Dict[str, NerRawOutput] = {}
         total_prompt_tokens = 0
         total_completion_tokens = 0
         num_cache_hit = 0
@@ -220,7 +220,10 @@ class OpenIE:
             pbar = tqdm(as_completed(ner_futures), total=len(ner_futures), desc="NER")
             for future in pbar:
                 result = future.result()
-                ner_results_list.append(result)
+                chunk_key = ner_futures[future]
+                if result.chunk_id != chunk_key:
+                    raise RuntimeError(f"NER returned chunk {result.chunk_id!r} for {chunk_key!r}")
+                ner_results_by_id[chunk_key] = result
                 # Update metrics based on the metadata from the result
                 metadata = result.metadata
                 total_prompt_tokens += metadata.get('prompt_tokens', 0)
@@ -234,25 +237,30 @@ class OpenIE:
                     'num_cache_hit': num_cache_hit
                 })
 
-        failed_ner_chunk_ids = [result.chunk_id for result in ner_results_list if result.metadata.get("error")]
+        failed_ner_chunk_ids = [
+            chunk_key for chunk_key in chunk_passages
+            if ner_results_by_id[chunk_key].metadata.get("error")
+        ]
         if failed_ner_chunk_ids:
             raise RuntimeError(f"NER failed for {len(failed_ner_chunk_ids)} chunk(s): {failed_ner_chunk_ids}")
 
-        triple_results_list = []
+        triple_results_by_id: Dict[str, TripleRawOutput] = {}
         total_prompt_tokens, total_completion_tokens, num_cache_hit = 0, 0, 0
         with ThreadPoolExecutor(max_workers=triple_max_workers) as executor:
             # Create triple extraction futures for each chunk
             re_futures = {
-                executor.submit(self.triple_extraction, ner_result.chunk_id,
-                                chunk_passages[ner_result.chunk_id],
-                                ner_result.unique_entities): ner_result.chunk_id
-                for ner_result in ner_results_list
+                executor.submit(self.triple_extraction, chunk_key,
+                                passage, ner_results_by_id[chunk_key].unique_entities): chunk_key
+                for chunk_key, passage in chunk_passages.items()
             }
             # Collect triple extraction results with progress bar
             pbar = tqdm(as_completed(re_futures), total=len(re_futures), desc="Extracting triples")
             for future in pbar:
                 result = future.result()
-                triple_results_list.append(result)
+                chunk_key = re_futures[future]
+                if result.chunk_id != chunk_key:
+                    raise RuntimeError(f"Triple extraction returned chunk {result.chunk_id!r} for {chunk_key!r}")
+                triple_results_by_id[chunk_key] = result
                 metadata = result.metadata
                 total_prompt_tokens += metadata.get('prompt_tokens', 0)
                 total_completion_tokens += metadata.get('completion_tokens', 0)
@@ -264,11 +272,14 @@ class OpenIE:
                     'num_cache_hit': num_cache_hit
                 })
 
-        failed_triple_chunk_ids = [result.chunk_id for result in triple_results_list if result.metadata.get("error")]
+        failed_triple_chunk_ids = [
+            chunk_key for chunk_key in chunk_passages
+            if triple_results_by_id[chunk_key].metadata.get("error")
+        ]
         if failed_triple_chunk_ids:
             raise RuntimeError(f"Triple extraction failed for {len(failed_triple_chunk_ids)} chunk(s): {failed_triple_chunk_ids}")
 
-        ner_results_dict = {res.chunk_id: res for res in ner_results_list}
-        triple_results_dict = {res.chunk_id: res for res in triple_results_list}
+        ner_results_dict = {chunk_key: ner_results_by_id[chunk_key] for chunk_key in chunk_passages}
+        triple_results_dict = {chunk_key: triple_results_by_id[chunk_key] for chunk_key in chunk_passages}
 
         return ner_results_dict, triple_results_dict

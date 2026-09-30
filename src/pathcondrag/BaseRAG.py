@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from copy import deepcopy
-from typing import Union, Optional, List, Set, Dict, Any, Tuple, Literal
+from typing import Union, Optional, List, Set, Dict, Any, Tuple, Literal, Iterable
 import numpy as np
 import importlib
 from collections import defaultdict
@@ -1003,7 +1003,7 @@ class BaseRAG:
         gc.collect()
         logger.info(f"Added {num_synonym_triple} synonymy edges.")
 
-    def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
+    def load_existing_openie(self, chunk_keys: Iterable[str]) -> Tuple[List[dict], List[str]]:
         """
         Loads existing OpenIE results from the specified file if it exists and combines
         them with new content while standardizing indices. If the file does not exist or
@@ -1022,10 +1022,13 @@ class BaseRAG:
         """
 
         # combine openie_results with contents already in file, if file exists
-        chunk_keys_to_save = set()
+        # Preserve corpus order.  A set here changes OpenIE request, file, and
+        # potentially graph tie-break order across Python hash seeds.
+        chunk_keys_to_save = []
 
         if not self.global_config.force_openie_from_scratch and os.path.isfile(self.openie_results_path):
-            openie_results = json.load(open(self.openie_results_path))
+            with open(self.openie_results_path, encoding="utf-8") as openie_file:
+                openie_results = json.load(openie_file)
             all_openie_info = openie_results.get('docs', [])
 
             #Standardizing indices for OpenIE Files.
@@ -1041,10 +1044,10 @@ class BaseRAG:
 
             for chunk_key in chunk_keys:
                 if chunk_key not in existing_openie_keys:
-                    chunk_keys_to_save.add(chunk_key)
+                    chunk_keys_to_save.append(chunk_key)
         else:
             all_openie_info = []
-            chunk_keys_to_save = chunk_keys
+            chunk_keys_to_save = list(chunk_keys)
 
         return all_openie_info, chunk_keys_to_save
 
