@@ -7,7 +7,6 @@ import sqlite3
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -142,6 +141,22 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         sleep.assert_not_called()
 
+    def test_exhausted_503_stops_at_budget_and_honors_retry_after(self):
+        calls = []
+
+        @client_module.dynamic_retry_decorator
+        def request(self):
+            calls.append(1)
+            raise status_error(503, {"retry-after": "5"})
+
+        model = SimpleNamespace(max_retries=2)
+        with patch.object(client_module.time, "sleep") as sleep:
+            with patch.object(client_module.random, "uniform", return_value=1.0):
+                with self.assertRaises(openai.APIStatusError):
+                    request(model)
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(5.0)
+
 
 class ConcurrencyTests(unittest.TestCase):
     def test_http_limit_is_shared_across_calls_and_thinking_stays_off(self):
@@ -150,6 +165,7 @@ class ConcurrencyTests(unittest.TestCase):
             active = 0
             high_water = 0
             seen_thinking = []
+            two_calls_started = threading.Event()
 
             def create(**params):
                 nonlocal active, high_water
@@ -157,7 +173,11 @@ class ConcurrencyTests(unittest.TestCase):
                     active += 1
                     high_water = max(high_water, active)
                     seen_thinking.append(params["extra_body"]["chat_template_kwargs"]["enable_thinking"])
-                time.sleep(0.03)
+                    if active == 2:
+                        two_calls_started.set()
+                # Keep the first call active until a second worker reaches the
+                # HTTP boundary; this makes the concurrency check deterministic.
+                two_calls_started.wait(timeout=2)
                 with gate:
                     active -= 1
                 return SimpleNamespace(

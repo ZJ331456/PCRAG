@@ -437,6 +437,11 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
                 "retrieval_metrics": retrieval_metrics,
                 "qa_metrics": qa_metrics,
                 "retrieval_diagnostics": retrieval_diagnostics,
+                "retrieval_seconds": float(getattr(rag, "all_retrieval_time", 0.0)),
+                "llm_request_stats": (
+                    rag.llm_model.get_request_stats()
+                    if hasattr(rag.llm_model, "get_request_stats") else {}
+                ),
                 "runtime_config": asdict(config),
                 "results": output_rows,
                 "runtime": {
