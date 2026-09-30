@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -24,6 +25,7 @@ from eval_utils import (
     ensure_gold_docs_in_corpus,
     get_gold_answers,
     get_gold_docs,
+    get_benchmark_hops,
     load_json,
     sample_indices,
 )
@@ -50,8 +52,12 @@ def _select_samples(samples: List[Dict[str, Any]], sample_size: int, sample_seed
 
 
 def run_eval(dataset: str, args: argparse.Namespace) -> str:
-    data_path = args.data_path or os.path.join(PROJECT_ROOT, "datasets", f"{dataset}.json")
-    corpus_path = args.corpus_path or os.path.join(PROJECT_ROOT, "datasets", f"{dataset}_corpus.json")
+    dataset_file_stem = "nq_rear" if dataset == "nq" else dataset
+    data_path = args.data_path or os.path.join(PROJECT_ROOT, "datasets", f"{dataset_file_stem}.json")
+    corpus_path = args.corpus_path or os.path.join(PROJECT_ROOT, "datasets", f"{dataset_file_stem}_corpus.json")
+    hop_source = getattr(args, "hop_source", "estimated")
+    if hop_source not in ("estimated", "benchmark"):
+        raise ValueError(f"Unknown hop_source={hop_source!r}")
 
     llm_name = args.llm_name or os.environ.get("HIPPO_LLM_NAME", "qwen3-8b")
     llm_base_url = args.llm_base_url or os.environ.get("HIPPO_LLM_BASE_URL", "http://127.0.0.1:8035/v1")
@@ -65,6 +71,10 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
     samples_all = load_json(data_path)
     corpus = load_json(corpus_path)
 
+    # Validate the entire benchmark split before sampling. A subset must not
+    # conceal missing MuSiQue decomposition labels elsewhere in the file.
+    benchmark_hops_all = get_benchmark_hops(samples_all, dataset) if hop_source == "benchmark" else None
+
     samples, selected_indices = _select_samples(
         samples=samples_all,
         sample_size=max(0, int(args.sample_size)),
@@ -73,6 +83,40 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
     )
 
     queries = [s["question"] for s in samples]
+    benchmark_hops = (
+        [benchmark_hops_all[i] for i in selected_indices]
+        if benchmark_hops_all is not None
+        else None
+    )
+    if benchmark_hops is not None:
+        if dataset == "musique":
+            hop_provenance = {
+                "kind": "per_question_oracle",
+                "field": "question_decomposition length",
+                "oracle": True,
+                "validated_samples": len(samples_all),
+            }
+        elif dataset in ("hotpotqa", "2wikimultihopqa"):
+            hop_provenance = {
+                "kind": "dataset_level_prior",
+                "value": 2,
+                "oracle": False,
+                "note": "Question type and support count are not serial hop labels.",
+            }
+        else:
+            hop_provenance = {
+                "kind": "dataset_level_prior",
+                "value": 1,
+                "oracle": False,
+                "note": "Single-hop benchmark prior; support count is not a hop label.",
+            }
+    else:
+        hop_provenance = {"kind": "online_estimator", "oracle": False}
+    hop_type_distribution = (
+        dict(Counter(str(s["type"]) for s in samples))
+        if dataset in ("hotpotqa", "2wikimultihopqa")
+        else {}
+    )
     gold_answers = get_gold_answers(samples)
     gold_docs = get_gold_docs(samples, dataset)
 
@@ -110,6 +154,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         max_new_tokens=args.max_new_tokens,
         max_qa_steps=int(args.max_qa_steps),
         embedding_batch_size=int(args.embedding_batch_size),
+        llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 1)),
         use_enhanced_hop_estimation=not args.no_enhanced_hop_estimation,
         use_iterative_retrieval=bool(args.use_iterative_retrieval),
         use_qcappr=not args.no_qcappr,
@@ -281,11 +326,23 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
     if args.mpce_entity_consensus_weight is not None:
         cfg_kwargs["mpce_entity_consensus_weight"] = float(args.mpce_entity_consensus_weight)
 
+    if hop_source == "benchmark":
+        if dataset == "musique":
+            cfg_kwargs["hop_force_max"] = max(4, int(cfg_kwargs.get("hop_force_max", 3)))
+            cfg_kwargs["qd_max_sub_questions"] = max(4, int(cfg_kwargs.get("qd_max_sub_questions", 3)))
+        elif dataset in ("nq", "popqa"):
+            # hops=1 must not activate QD/PCQD for the single-hop benchmarks.
+            cfg_kwargs["qd_min_hops"] = 2
+
     config = PathCondRAGConfig(**cfg_kwargs)
 
     logger.info("[2/4] Building index")
     rag = PathCondRAG(global_config=config)
     rag.index(docs=docs)
+    if benchmark_hops is not None:
+        rag.set_query_hop_overrides(hops=benchmark_hops, source="benchmark")
+        logger.info("Benchmark hop policy: %s; selected distribution=%s", hop_provenance,
+                    dict(Counter(str(h) for h in benchmark_hops)))
 
     logger.info("[3/4] Running evaluation mode=%s", args.eval_mode)
     retrieval_metrics: Dict[str, Any] = {}
@@ -358,6 +415,14 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         json.dump(
             {
                 "dataset": dataset,
+                "hop_source": hop_source,
+                "hop_provenance": hop_provenance,
+                "hop_distribution": (
+                    dict(Counter(str(h) for h in benchmark_hops))
+                    if benchmark_hops is not None
+                    else retrieval_diagnostics.get("hop_counter", {})
+                ),
+                "hop_type_distribution": hop_type_distribution,
                 "data_path": data_path,
                 "corpus_path": corpus_path,
                 "sample_size_requested": int(args.sample_size),
@@ -397,6 +462,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", required=True, choices=["musique", "hotpotqa", "2wikimultihopqa", "nq", "popqa"])
     parser.add_argument("--data_path", default="")
     parser.add_argument("--corpus_path", default="")
+    parser.add_argument("--hop_source", choices=["estimated", "benchmark"], default="estimated",
+                        help="estimated preserves prior behavior; benchmark uses documented dataset labels/priors (MuSiQue is oracle).")
 
     parser.add_argument("--sample_size", type=int, default=0, help="0 means all")
     parser.add_argument("--sample_seed", type=int, default=42)
@@ -420,6 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_qa_steps", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--embedding_batch_size", type=int, default=2)
+    parser.add_argument("--llm_prefetch_workers", type=int, default=1,
+                        help="Bounded concurrent LLM prefetch across queries; 1 keeps serial behavior.")
 
     parser.add_argument("--save_dir", default="")
     parser.add_argument("--eval_subdir", default="")

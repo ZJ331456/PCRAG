@@ -17,6 +17,52 @@ def sample_indices(total: int, sample_size: int, seed: int) -> Optional[List[int
     return sorted(rng.sample(range(total), sample_size))
 
 
+def get_benchmark_hops(samples: List[Dict[str, Any]], dataset_name: str) -> List[int]:
+    """Return benchmark hop labels in sample order, never using answer content.
+
+    MuSiQue supplies an oracle decomposition for every question. The other
+    datasets only support a dataset-level prior, not a per-question hop count.
+    """
+    if dataset_name == "musique":
+        hops = []
+        for idx, sample in enumerate(samples):
+            decomposition = sample.get("question_decomposition")
+            if (
+                not isinstance(decomposition, list)
+                or len(decomposition) not in (2, 3, 4)
+                or any(
+                    not isinstance(step, dict)
+                    or not isinstance(step.get("question"), str)
+                    or not step["question"].strip()
+                    for step in decomposition
+                )
+            ):
+                raise ValueError(
+                    f"MuSiQue sample index {idx} lacks a valid 2/3/4-step question_decomposition"
+                )
+            hops.append(len(decomposition))
+        return hops
+    if dataset_name in ("hotpotqa", "2wikimultihopqa"):
+        return [2] * len(samples)
+    if dataset_name in ("nq", "popqa"):
+        return [1] * len(samples)
+    raise ValueError(f"No benchmark hop policy for dataset={dataset_name!r}")
+
+
+def _answer_alias_list(value: Any) -> List[str]:
+    """Decode PopQA's JSON-encoded aliases without iterating over characters."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            value = [value]
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple, set)):
+        value = [value]
+    return [str(alias) for alias in value if alias is not None and str(alias)]
+
+
 def get_gold_docs(samples: List[Dict[str, Any]], dataset_name: str) -> List[List[str]]:
     """
     Same extraction policy as hipporag/eval/ori_eval_utils.py.
@@ -78,11 +124,11 @@ def get_gold_answers(samples: List[Dict[str, Any]]) -> List[List[str]]:
         elif "obj" in sample:
             ans_set = {sample["obj"]}
             if "possible_answers" in sample:
-                ans_set.update(sample["possible_answers"])
+                ans_set.update(_answer_alias_list(sample["possible_answers"]))
             if "o_wiki_title" in sample:
                 ans_set.add(sample["o_wiki_title"])
             if "o_aliases" in sample:
-                ans_set.update(sample["o_aliases"])
+                ans_set.update(_answer_alias_list(sample["o_aliases"]))
             gold_ans = list(ans_set)
         elif "answers" in sample:
             gold_ans = sample["answers"]
