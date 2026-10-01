@@ -10,9 +10,11 @@ SAMPLE_SEED="${SAMPLE_SEED:-42}"
 CONDA_ENV="${CONDA_ENV:-rag}"
 LLM_BASE_URL="${LLM_BASE_URL:-http://127.0.0.1:8035/v1}"
 VLLM_LOG="${VLLM_LOG:-/root/eval/logs/vllm_qwen3.log}"
-MODE_TAG="full"
-if (( SAMPLE_SIZE > 0 )); then MODE_TAG="smoke${SAMPLE_SIZE}"; fi
-OUT_ROOT="${OUT_ROOT:-${ROOT}/outputs/recall_top5_improvements_qwen3emb8b_b4_w8_${MODE_TAG}_$(date +%Y%m%d_%H%M%S)}"
+DEFAULT_OUT_ROOT="${ROOT}/outputs/pathcondrag_new_innvotion_10_1"
+if (( SAMPLE_SIZE > 0 )); then
+  DEFAULT_OUT_ROOT="${DEFAULT_OUT_ROOT}_smoke${SAMPLE_SIZE}_$(date +%Y%m%d_%H%M%S)"
+fi
+OUT_ROOT="${OUT_ROOT:-${DEFAULT_OUT_ROOT}}"
 TOOLS="${ROOT}/scripts/experiment_tools.py"
 
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"

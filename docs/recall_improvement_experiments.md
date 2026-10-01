@@ -52,7 +52,7 @@ SAMPLE_SIZE=0 bash scripts/run_recall_top5_improvements.sh
 
 | 参数 | 默认与作用 |
 |---|---|
-| `OUT_ROOT` | 自动生成 `outputs/recall_top5_improvements_qwen3emb8b_b4_w8_<full\|smokeN>_<timestamp>` |
+| `OUT_ROOT` | 全量默认 `outputs/pathcondrag_new_innvotion_10_1`；小测试增加 `_smokeN_<timestamp>` 后缀 |
 | `SOURCE_INDEX` | 上述原 Hippo 索引 |
 | `SAMPLE_SIZE` | 0 表示全量；2 表示固定 2/4 跳测试；其他正值按 seed 抽样 |
 | `SAMPLE_SEED` | 42 |
@@ -127,6 +127,6 @@ tail -f <OUT_ROOT>/logs/run.log
 
 该验证证明流程和导出可用，**不证明精度提升**。四跳题的规划两次仍存在依赖引用不一致，按规则回退；两跳题执行了答案绑定后的后继检索，但出现桥答案关系判断不正确、后继证据为空的问题。精确引用检查只能保证答案文本和引用来自所给段落，关系是否成立仍依赖 LLM 判断，不能将其称为逻辑正确性的保证。所有情况均保留在逐题 trace 中。全量结果用于测量这些机制的收益与副作用，不能用这两题选参数或报告论文主结果。
 
-最终小测试目录：`outputs/recall_top5_improvements_qwen3emb8b_b4_w8_smoke2_final_20261001`。最初验证目录的日志和结果仍保留，其已被替代的七份临时索引副本已清理以释放磁盘；原始 Hippo 索引未改动。
+上述小测试结果已按用户要求清理。重新运行的全量七组统一保存到 `outputs/pathcondrag_new_innvotion_10_1`，五个新实验对应 `cases/exp1_correctness` 至 `cases/exp5_verified_beam`；两组对照也在该根目录的 `cases` 下。原始 Hippo 索引保留作为统一输入。
 
 当前七组不加载新 reranker。后续可用 [Qwen3 官方 reranker](https://github.com/QwenLM/Qwen3-Embedding) 作为排序瓶颈工程对照；若增加 reranker，HippoRAG2 也应采用相同候选、相同模型与相同预算，以免把辅助模型收益全部算作算法贡献。
