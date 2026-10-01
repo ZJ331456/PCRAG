@@ -12,7 +12,7 @@ export HIPPO_EMBEDDING_BASE_URL="${HIPPO_EMBEDDING_BASE_URL:-}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-local-dummy}"
 export EMBEDDING_BATCH_SIZE="${EMBEDDING_BATCH_SIZE:-2}"
 export HIPPO_OPENIE_MAX_WORKERS="${HIPPO_OPENIE_MAX_WORKERS:-8}"
-# Local measured limit: OpenIE can use 8; retrieval prefetch defaults to 4.
+# Local measured limit: OpenIE and retrieval prefetch can each use 8.
 export PATHCONDRAG_LLM_MAX_IN_FLIGHT="${PATHCONDRAG_LLM_MAX_IN_FLIGHT:-8}"
 export TOKENIZERS_PARALLELISM=false
 

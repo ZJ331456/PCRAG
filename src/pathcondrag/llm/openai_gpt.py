@@ -52,7 +52,7 @@ def _safe_env_float(name: str, default: float) -> float:
 
 # This bound is shared by every CacheOpenAI instance in this process. Waiting and
 # retry backoff happen outside the semaphore, so only active HTTP calls occupy it.
-LLM_MAX_IN_FLIGHT = _safe_env_int("PATHCONDRAG_LLM_MAX_IN_FLIGHT", 4)
+LLM_MAX_IN_FLIGHT = _safe_env_int("PATHCONDRAG_LLM_MAX_IN_FLIGHT", 8)
 _LLM_HTTP_SEMAPHORE = threading.BoundedSemaphore(LLM_MAX_IN_FLIGHT)
 
 

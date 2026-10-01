@@ -155,7 +155,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         max_qa_steps=int(args.max_qa_steps),
         embedding_batch_size=int(args.embedding_batch_size),
         openie_max_workers=getattr(args, "openie_max_workers", None),
-        llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 4)),
+        llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 8)),
         use_enhanced_hop_estimation=not args.no_enhanced_hop_estimation,
         use_iterative_retrieval=bool(args.use_iterative_retrieval),
         use_qcappr=not args.no_qcappr,
@@ -507,8 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding_batch_size", type=int, default=2)
     parser.add_argument("--openie_max_workers", type=_openie_worker_count, default=None,
                         help="Online indexing NER/triple concurrency (1..8). Explicit values override all HIPPO_OPENIE_* worker env settings; omitted uses env or 8. HTTP ceiling still applies.")
-    parser.add_argument("--llm_prefetch_workers", type=int, default=4,
-                        help="Bounded concurrent LLM prefetch across queries; 1 keeps serial behavior.")
+    parser.add_argument("--llm_prefetch_workers", type=int, default=8,
+                        help="Bounded QD/PCQD LLM prefetch across queries (default 8); 1 keeps serial behavior.")
 
     parser.add_argument("--save_dir", default="")
     parser.add_argument("--eval_subdir", default="")

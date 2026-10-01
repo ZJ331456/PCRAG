@@ -54,13 +54,14 @@ export PYTHONHASHSEED=0
 
 For retrieval with Qwen3-Embedding-8B, pass
 `--embedding_model_name /root/models/Qwen3-Embedding-8B
---embedding_batch_size 4 --openie_max_workers 8 --llm_prefetch_workers 4`
+--embedding_batch_size 4 --openie_max_workers 8 --llm_prefetch_workers 8`
 to `scripts/eval_dataset.py`.
 Embedding batch size, retrieval prefetch workers, and the HTTP request limit
-control different stages. The library keeps a conservative HTTP default of 4;
-the settings above are for the measured local Qwen3 server. The machine-specific
+control different stages. The process HTTP ceiling now defaults to 8;
+set a lower `PATHCONDRAG_LLM_MAX_IN_FLIGHT` to bound both stages more tightly.
+The settings above are for the measured local Qwen3 server. The machine-specific
 `env_qwen3_nvembed.sh` also defaults the HTTP ceiling to 8. Retrieval prefetch
-now defaults to 4; set `--llm_prefetch_workers 1` for serial generation.
+now defaults to 8; set `--llm_prefetch_workers 1` for serial generation.
 
 `--openie_max_workers` accepts 1 through 8 and applies to both NER and triple
 extraction. The two phases run sequentially; documents within each phase run

@@ -22,14 +22,14 @@ from pathcondrag.utils.config_utils import BaseConfig  # noqa: E402
 
 
 class OpenIEConcurrencyConfigTests(unittest.TestCase):
-    def test_defaults_preserve_openie_environment_and_use_retrieval_four(self):
+    def test_defaults_preserve_openie_environment_and_use_retrieval_eight(self):
         self.assertIsNone(BaseConfig().openie_max_workers)
         self.assertIsNone(build_parser().parse_args(["--dataset", "musique"]).openie_max_workers)
         config = PCRAGConfig(openie_max_workers=8, llm_prefetch_workers=4)
         self.assertEqual(config.openie_max_workers, 8)
         self.assertEqual(config.llm_prefetch_workers, 4)
-        self.assertEqual(PCRAGConfig().llm_prefetch_workers, 4)
-        self.assertEqual(build_parser().parse_args(["--dataset", "musique"]).llm_prefetch_workers, 4)
+        self.assertEqual(PCRAGConfig().llm_prefetch_workers, 8)
+        self.assertEqual(build_parser().parse_args(["--dataset", "musique"]).llm_prefetch_workers, 8)
         self.assertEqual(PCRAGConfig(llm_prefetch_workers=1).llm_prefetch_workers, 1)
 
     def test_invalid_explicit_limits_fail_without_clamping(self):
