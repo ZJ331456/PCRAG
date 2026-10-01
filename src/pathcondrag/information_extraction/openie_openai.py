@@ -9,7 +9,7 @@ from ..prompts import PromptTemplateManager
 from ..utils.logging_utils import get_logger
 from ..utils.llm_utils import filter_invalid_triples
 from ..utils.misc_utils import TripleRawOutput, NerRawOutput
-from ..llm.openai_gpt import CacheOpenAI
+from ..llm.openai_gpt import CacheOpenAI, LLM_MAX_IN_FLIGHT
 
 logger = get_logger(__name__)
 _LENGTH_RETRY_FREQUENCY_PENALTIES = (0.2, 0.5)
@@ -76,12 +76,23 @@ def _length_retry_seed(llm_model: CacheOpenAI) -> int:
 
 
 class OpenIE:
-    def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8):
+    def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, respect_env_workers: bool = True):
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1.")
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
         self.llm_model = llm_model
         self.max_workers = max_workers
+        self.respect_env_workers = respect_env_workers
+
+    def worker_limits(self) -> Tuple[int, int]:
+        """Resolve NER/triple limits; explicit config takes priority over legacy env."""
+        if not getattr(self, "respect_env_workers", True):
+            return self.max_workers, self.max_workers
+        openie_workers = _safe_env_int('HIPPO_OPENIE_MAX_WORKERS', self.max_workers)
+        return (
+            _safe_env_int('HIPPO_OPENIE_NER_WORKERS', openie_workers),
+            _safe_env_int('HIPPO_OPENIE_TRIPLE_WORKERS', openie_workers),
+        )
 
     def ner(self, chunk_key: str, passage: str) -> NerRawOutput:
         # PREPROCESSING
@@ -307,9 +318,13 @@ class OpenIE:
         total_completion_tokens = 0
         num_cache_hit = 0
 
-        openie_max_workers = _safe_env_int('HIPPO_OPENIE_MAX_WORKERS', self.max_workers)
-        ner_max_workers = _safe_env_int('HIPPO_OPENIE_NER_WORKERS', openie_max_workers)
-        triple_max_workers = _safe_env_int('HIPPO_OPENIE_TRIPLE_WORKERS', openie_max_workers)
+        ner_max_workers, triple_max_workers = self.worker_limits()
+        logger.info(
+            "Online OpenIE concurrency: NER workers=%d, triple workers=%d, "
+            "process HTTP ceiling=%d (PATHCONDRAG_LLM_MAX_IN_FLIGHT), legacy worker env=%s",
+            ner_max_workers, triple_max_workers, LLM_MAX_IN_FLIGHT,
+            "enabled" if getattr(self, "respect_env_workers", True) else "overridden by config",
+        )
 
         with ThreadPoolExecutor(max_workers=ner_max_workers) as executor:
             # Create NER futures for each chunk

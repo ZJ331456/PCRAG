@@ -100,9 +100,9 @@ class PCRAGConfig(BaseConfig):
     qd_merge_alpha: float = field(default=0.30)
     qd_llm_temperature: float = field(default=0.0)
     qd_cache_decompositions: bool = field(default=True)
-    # In-flight QD/PCQD generation requests per retrieval process.  The
-    # default retains the original serial execution order.
-    llm_prefetch_workers: int = field(default=1)
+    # In-flight QD/PCQD generation requests per retrieval process.  Use 1
+    # to retain serial generation; the tested default is 4.
+    llm_prefetch_workers: int = field(default=4)
 
     # Path-conditioned QD
     use_path_conditioned_qd: bool = field(default=False)

@@ -49,16 +49,30 @@ On this machine, online OpenIE can use 8 worker threads with a bounded limit of
 
 ```bash
 export PATHCONDRAG_LLM_MAX_IN_FLIGHT=8
-export HIPPO_OPENIE_MAX_WORKERS=8
 export PYTHONHASHSEED=0
 ```
 
 For retrieval with Qwen3-Embedding-8B, pass
 `--embedding_model_name /root/models/Qwen3-Embedding-8B
---embedding_batch_size 4 --llm_prefetch_workers 4` to `scripts/eval_dataset.py`.
+--embedding_batch_size 4 --openie_max_workers 8 --llm_prefetch_workers 4`
+to `scripts/eval_dataset.py`.
 Embedding batch size, retrieval prefetch workers, and the HTTP request limit
 control different stages. The library keeps a conservative HTTP default of 4;
-the settings above are for the measured local Qwen3 server.
+the settings above are for the measured local Qwen3 server. The machine-specific
+`env_qwen3_nvembed.sh` also defaults the HTTP ceiling to 8. Retrieval prefetch
+now defaults to 4; set `--llm_prefetch_workers 1` for serial generation.
+
+`--openie_max_workers` accepts 1 through 8 and applies to both NER and triple
+extraction. The two phases run sequentially; documents within each phase run
+concurrently. Explicit CLI/config values override the legacy
+`HIPPO_OPENIE_MAX_WORKERS`, `HIPPO_OPENIE_NER_WORKERS`, and
+`HIPPO_OPENIE_TRIPLE_WORKERS` settings. Without an explicit value, those
+environment variables and the existing 8-worker default remain supported.
+Effective HTTP concurrency is bounded by both the stage's worker count and
+`PATHCONDRAG_LLM_MAX_IN_FLIGHT`; setting 8 workers with an HTTP ceiling of 4
+still allows only 4 active requests. Reusing complete OpenIE results makes no
+new indexing LLM requests. Passage/entity/fact embedding and graph construction
+do not use the chat LLM.
 
 Qwen3 thinking is forced off. Normal OpenIE requests keep NER's existing
 512-to-1024 retry policy and the 2048-token triple extraction limit. A truncated

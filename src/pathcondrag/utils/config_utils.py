@@ -114,6 +114,10 @@ class BaseConfig:
         default="online",
         metadata={"help": "Mode of the OpenIE model to use."}
     )
+    openie_max_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "Online NER/triple workers (1..8). None preserves legacy HIPPO_OPENIE_* worker settings, with fallback 8."}
+    )
     skip_graph: bool = field(
         default=False,
         metadata={"help": "Whether to skip graph construction or not. Set it to be true when running vllm offline indexing for the first time."}
@@ -225,6 +229,12 @@ class BaseConfig:
     
     
     def __post_init__(self):
+        if self.openie_max_workers is not None and (
+            isinstance(self.openie_max_workers, bool)
+            or not isinstance(self.openie_max_workers, int)
+            or not 1 <= self.openie_max_workers <= 8
+        ):
+            raise ValueError("openie_max_workers must be an integer between 1 and 8, or None.")
         if self.save_dir is None: # If save_dir not given
             if self.dataset is None: self.save_dir = 'outputs' # running freely
             else: self.save_dir = os.path.join('outputs', self.dataset) # customize your dataset's output dir here

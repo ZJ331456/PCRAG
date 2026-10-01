@@ -124,7 +124,12 @@ class BaseRAG:
         self.llm_model: BaseLLM = _get_llm_class(self.global_config)
 
         if self.global_config.openie_mode == 'online':
-            self.openie = OpenIE(llm_model=self.llm_model)
+            openie_workers = self.global_config.openie_max_workers
+            self.openie = OpenIE(
+                llm_model=self.llm_model,
+                max_workers=8 if openie_workers is None else openie_workers,
+                respect_env_workers=openie_workers is None,
+            )
         elif self.global_config.openie_mode == 'offline':
             from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
             self.openie = VLLMOfflineOpenIE(self.global_config)

@@ -154,7 +154,8 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         max_new_tokens=args.max_new_tokens,
         max_qa_steps=int(args.max_qa_steps),
         embedding_batch_size=int(args.embedding_batch_size),
-        llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 1)),
+        openie_max_workers=getattr(args, "openie_max_workers", None),
+        llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 4)),
         use_enhanced_hop_estimation=not args.no_enhanced_hop_estimation,
         use_iterative_retrieval=bool(args.use_iterative_retrieval),
         use_qcappr=not args.no_qcappr,
@@ -464,6 +465,16 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
     return out_path
 
 
+def _openie_worker_count(value: str) -> int:
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("OpenIE workers must be an integer between 1 and 8.") from exc
+    if not 1 <= workers <= 8:
+        raise argparse.ArgumentTypeError("OpenIE workers must be between 1 and 8.")
+    return workers
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate PCRAG on supported datasets")
     parser.add_argument("--dataset", required=True, choices=["musique", "hotpotqa", "2wikimultihopqa", "nq", "popqa"])
@@ -494,7 +505,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_qa_steps", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--embedding_batch_size", type=int, default=2)
-    parser.add_argument("--llm_prefetch_workers", type=int, default=1,
+    parser.add_argument("--openie_max_workers", type=_openie_worker_count, default=None,
+                        help="Online indexing NER/triple concurrency (1..8). Explicit values override all HIPPO_OPENIE_* worker env settings; omitted uses env or 8. HTTP ceiling still applies.")
+    parser.add_argument("--llm_prefetch_workers", type=int, default=4,
                         help="Bounded concurrent LLM prefetch across queries; 1 keeps serial behavior.")
 
     parser.add_argument("--save_dir", default="")
