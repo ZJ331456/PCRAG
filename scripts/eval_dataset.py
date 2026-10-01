@@ -394,6 +394,8 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
             gold_answers=gold_answers,
             global_config=config,
             predicted_answers=predicted_answers_for_stratified,
+            query_hops=benchmark_hops,
+            hop_provenance=hop_provenance,
         )
         print_stratified_results(stratified_results)
 

@@ -1,6 +1,7 @@
 """Stratified evaluation by query hop complexity."""
 
 import json
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
@@ -47,42 +48,40 @@ def stratify_by_hops(
     retrieval_results: List[QuerySolution],
     gold_docs: List[List[str]],
     gold_answers: List[List[str]],
+    query_hops: Optional[List[int]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Stratify evaluation results by query hop complexity.
-    
-    Returns:
-        {
-            "single_hop": {"queries": [...], "retrieval_results": [...], ...},
-            "two_hop": {...},
-            "multi_hop": {...},
-            "overall": {...}
-        }
+    Group by supplied benchmark labels, or the legacy keyword heuristic.
+
+    Explicit labels keep three-hop and four-hop questions separate. ``indices``
+    preserves the alignment of predicted answers with each group's examples.
     """
-    single_hop_data = {"queries": [], "retrieval_results": [], "gold_docs": [], "gold_answers": []}
-    two_hop_data = {"queries": [], "retrieval_results": [], "gold_docs": [], "gold_answers": []}
-    multi_hop_data = {"queries": [], "retrieval_results": [], "gold_docs": [], "gold_answers": []}
-    
+    if query_hops is not None:
+        if len(query_hops) != len(queries):
+            raise ValueError("query_hops must have one label per selected query")
+        if any(isinstance(h, bool) or not isinstance(h, (int, np.integer)) or not 1 <= h <= 4
+               for h in query_hops):
+            raise ValueError("query_hops labels must be integers from 1 through 4")
+        group_names = {1: "single_hop", 2: "two_hop", 3: "three_hop", 4: "four_hop"}
+    else:
+        # Preserve the original keyword-based report for estimated runs.
+        group_names = {1: "single_hop", 2: "two_hop", 3: "multi_hop"}
+    grouped = {
+        name: {"queries": [], "retrieval_results": [], "gold_docs": [],
+               "gold_answers": [], "indices": []}
+        for name in group_names.values()
+    }
+
     for i, query in enumerate(queries):
-        hops = estimate_query_hops_simple(query)
-        
-        if hops == 1:
-            target = single_hop_data
-        elif hops == 2:
-            target = two_hop_data
-        else:
-            target = multi_hop_data
-        
+        hops = query_hops[i] if query_hops is not None else estimate_query_hops_simple(query)
+        target = grouped[group_names[hops]]
         target["queries"].append(query)
         target["retrieval_results"].append(retrieval_results[i])
         target["gold_docs"].append(gold_docs[i])
         target["gold_answers"].append(gold_answers[i])
-    
-    return {
-        "single_hop": single_hop_data,
-        "two_hop": two_hop_data,
-        "multi_hop": multi_hop_data,
-    }
+        target["indices"].append(i)
+
+    return grouped
 
 
 def evaluate_stratified(
@@ -93,17 +92,15 @@ def evaluate_stratified(
     global_config: Any,
     predicted_answers: Optional[List[str]] = None,
     k_list: List[int] = None,
+    query_hops: Optional[List[int]] = None,
+    hop_provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Perform stratified evaluation by hop complexity.
-    
-    Returns:
-        {
-            "overall": {...},
-            "single_hop": {"count": N, "retrieval": {...}, "qa": {...}},
-            "two_hop": {...},
-            "multi_hop": {...}
-        }
+    Evaluate hop groups without changing retrieval or QA metric formulas.
+
+    ``query_hops`` must follow the selected query order. When supplied, the
+    report records their provenance and exposes separate 1/2/3/4-hop groups.
+    Without labels, the legacy single/two/multi-hop grouping is retained.
     """
     if k_list is None:
         k_list = [1, 2, 5, 10, 20, 30, 50, 100]
@@ -141,7 +138,9 @@ def evaluate_stratified(
         overall_qa = {}
     
     # Stratified evaluation
-    stratified_data = stratify_by_hops(queries, retrieval_results, gold_docs, gold_answers)
+    stratified_data = stratify_by_hops(
+        queries, retrieval_results, gold_docs, gold_answers, query_hops=query_hops,
+    )
     
     result = {
         "overall": {
@@ -151,18 +150,12 @@ def evaluate_stratified(
         }
     }
     
-    if can_eval_qa:
-        idx_groups = {"single_hop": [], "two_hop": [], "multi_hop": []}
-        for i, query in enumerate(queries):
-            hops = estimate_query_hops_simple(query)
-            if hops == 1:
-                idx_groups["single_hop"].append(i)
-            elif hops == 2:
-                idx_groups["two_hop"].append(i)
-            else:
-                idx_groups["multi_hop"].append(i)
-    else:
-        idx_groups = {}
+    if query_hops is not None:
+        result["stratification"] = {
+            "hop_source": "benchmark",
+            "hop_provenance": hop_provenance or {},
+            "hop_distribution": dict(Counter(str(h) for h in query_hops)),
+        }
 
     for hop_type, data in stratified_data.items():
         count = len(data["queries"])
@@ -179,7 +172,7 @@ def evaluate_stratified(
         
         # QA metrics (optional)
         if can_eval_qa:
-            hop_indices = idx_groups.get(hop_type, [])
+            hop_indices = data["indices"]
             hop_pred_answers = [predicted_answers[i] for i in hop_indices]
             qa_em_eval = QAExactMatch(global_config=global_config)
             qa_f1_eval = QAF1Score(global_config=global_config)
@@ -214,7 +207,7 @@ def print_stratified_results(results: Dict[str, Any]):
     print("STRATIFIED EVALUATION RESULTS")
     print("=" * 80)
     
-    for hop_type in ["overall", "single_hop", "two_hop", "multi_hop"]:
+    for hop_type in ["overall", "single_hop", "two_hop", "three_hop", "four_hop", "multi_hop"]:
         if hop_type not in results:
             continue
         
