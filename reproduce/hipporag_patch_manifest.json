@@ -1,0 +1,35 @@
+{
+  "baseline_head": "1438aba3fc44ff10573e5a5e1e7cc3c7f9794aff",
+  "full_patch": "hipporag_local_runtime.patch",
+  "incremental_patch": "hipporag_detailed_retrieval.patch",
+  "incremental_files": {
+    "main.py": {
+      "before_sha256": "5856a4009f4ec14ecb96a67e06c3b027c9fd1c5697d72e90dc168e7894f4ec53",
+      "after_sha256": "5860077bade0877e5f14cb7201a6b7577b813ffc779825d257be84e4ecd52ed5"
+    },
+    "src/hipporag/utils/misc_utils.py": {
+      "before_sha256": "80399e6ea0bb9ba36d51066e883bc2a53274c455f445fe8c2772ab9900752546",
+      "after_sha256": "e4cb79fa329a3da744650cb788859176f622f19db7e60f9bdd0f95f20d70dc72"
+    },
+    "src/hipporag/HippoRAG.py": {
+      "before_sha256": "179de8618c890769e3a975eaa89aad9fb0ee451f90a0175c5d0c382548210c0d",
+      "after_sha256": "8c5d4d9ef0c9b3106536dad9d99e46ef592c7f972decdc7654fb4d08edc9f42f"
+    },
+    "src/hipporag/utils/config_utils.py": {
+      "before_sha256": "d9ac58840aaff50e3668ece3c9e12c8626c93a8dc36a3d9ac909fa48e94d5b2b",
+      "after_sha256": "83af0bcd8b4d1bd5063f28ae7b98858652b262f96b8e4a4b89b6560a3f3609c8"
+    },
+    "src/hipporag/llm/openai_gpt.py": {
+      "before_sha256": "8e7c4fd15f4de590fdd63924e6c00b96e35192ee0379f060e9b09c8c0ee2c2ee",
+      "after_sha256": "933ee13c5255f7c1bb6c042181f27860d8457f8a1e9c1d49b6c5ffcc92c39094"
+    },
+    "src/hipporag/information_extraction/openie_openai.py": {
+      "before_sha256": "9c9b6b79e1e317822204771a9e5f2ea673308080916ac5aa32419fdcf2e93bd9",
+      "after_sha256": "19921d5b7595efc539959ba754ce91e27037c7d137b289ed184d603645cd1c12"
+    },
+    "src/hipporag/rerank.py": {
+      "before_sha256": "5b21d2f925fc4067ec2d239d89c190528ae03263307d24a5802e5cc421e7953f",
+      "after_sha256": "bb0a54c511b085d606118329652aab1277ef2d30d377dd71335e141abe27904c"
+    }
+  }
+}

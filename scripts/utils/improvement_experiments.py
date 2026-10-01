@@ -100,10 +100,27 @@ def load_indices(path, total):
     return indices
 
 
+def index_identity(source, docs):
+    identity = read_json(Path(source) / MODEL_DIR / "index_manifest.json")
+    require(identity.get("embedding", {}).get("model_name") == EMBEDDING_MODEL,
+            "source index embedding model is not Qwen3-Embedding-8B")
+    require(identity.get("embedding", {}).get("provider") == "transformers", "source embedding provider mismatch")
+    require(identity.get("openie", {}).get("identity", {}).get("model_name") == "qwen3-8b",
+            "source extraction model mismatch")
+    chunk_ids = set(read_json(Path(source) / MODEL_DIR / "chunk_metadata.json"))
+    expected_ids = {"chunk-" + hashlib.md5(doc.encode()).hexdigest() for doc in docs}
+    require(chunk_ids == expected_ids, "source index does not contain exactly the declared corpus")
+
+
 def prepare(args):
     out, source = Path(args.out_root).resolve(), Path(args.source_index).resolve()
-    require(source != out and source not in out.parents and out not in source.parents,
-            "source index and output directory must be separate")
+    fresh = bool(getattr(args, "build_shared_index", False))
+    if fresh:
+        require(source == out / "shared_hipporag2_index",
+                "fresh source_index must equal OUT_ROOT/shared_hipporag2_index")
+    else:
+        require(source != out and source not in out.parents and out not in source.parents,
+                "source index and output directory must be separate")
     data, docs, hops = validated_dataset(args.data_path, args.corpus_path)
     require(0 <= args.sample_size <= len(data), "sample_size must be between 0 and dataset size")
     if args.sample_indices_file:
@@ -120,21 +137,18 @@ def prepare(args):
     require(bool(names) and len(names) == len(set(names)) and all(n in CASES for n in names),
             "CASES contains unknown or duplicate case names")
     names = [n for n in CASES if n in names]
-    identity = read_json(source / MODEL_DIR / "index_manifest.json")
-    require(identity.get("embedding", {}).get("model_name") == EMBEDDING_MODEL,
-            "source index embedding model is not Qwen3-Embedding-8B")
-    require(identity.get("embedding", {}).get("provider") == "transformers", "source embedding provider mismatch")
-    require(identity.get("openie", {}).get("identity", {}).get("model_name") == "qwen3-8b",
-            "source extraction model mismatch")
-    chunk_ids = set(read_json(source / MODEL_DIR / "chunk_metadata.json"))
-    expected_ids = {"chunk-" + hashlib.md5(doc.encode()).hexdigest() for doc in docs}
-    require(chunk_ids == expected_ids, "source index does not contain exactly the declared corpus")
-    hashes = asset_hashes(source)
-    require((source / "llm_cache").is_dir(), "Hippo source llm_cache is missing")
-    initial_cache = cache_hashes(source / "llm_cache")
-    require(bool(initial_cache), "Hippo source llm_cache is empty")
+    if fresh:
+        hashes, initial_cache = {}, {}
+    else:
+        index_identity(source, docs)
+        hashes = asset_hashes(source)
+        require((source / "llm_cache").is_dir(), "Hippo source llm_cache is missing")
+        initial_cache = cache_hashes(source / "llm_cache")
+        require(bool(initial_cache), "Hippo source llm_cache is empty")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "index_build_mode": "fresh" if fresh else "external_snapshot",
+        "index_build_status": "pending" if fresh else "ready",
         "source_index": str(source), "model_dir": MODEL_DIR,
         "data_path": str(Path(args.data_path).resolve()),
         "corpus_path": str(Path(args.corpus_path).resolve()),
@@ -156,13 +170,28 @@ def prepare(args):
     manifest_path = out / "manifest.json"
     snapshot = out / "initial_llm_cache"
     if manifest_path.exists():
-        require(read_json(manifest_path) == manifest, "existing manifest differs; use a new OUT_ROOT")
-        require(cache_hashes(snapshot) == initial_cache, "initial LLM cache snapshot changed")
+        existing = read_json(manifest_path)
+        comparable = dict(existing)
+        if fresh:
+            for key in ("source_asset_sha256", "initial_cache_sha256", "index_build_status"):
+                comparable[key] = manifest[key]
+            comparable.pop("index_build_validation", None)
+        require(comparable == manifest, "existing manifest differs; use a new OUT_ROOT")
+        if existing["index_build_status"] == "ready":
+            require(cache_hashes(snapshot) == existing["initial_cache_sha256"], "initial LLM cache snapshot changed")
+            if fresh:
+                require(index_ready(args) == 0, "fresh shared index validation failed")
+        else:
+            require(not snapshot.exists(), "pending index must not have a cache snapshot")
         require(load_indices(out / "selected_indices.json", len(data)) == indices, "saved indices changed")
     else:
         require(not snapshot.exists(), "partial cache snapshot exists; use a new OUT_ROOT")
-        shutil.copytree(source / "llm_cache", snapshot, ignore=shutil.ignore_patterns("*.lock"))
-        require(cache_hashes(snapshot) == initial_cache, "source LLM cache changed during snapshot")
+        if fresh:
+            require(not source.exists() or not any(source.iterdir()), "fresh shared index directory is not empty")
+            require(not (out / "index_build_result.json").exists(), "fresh index build result already exists")
+        else:
+            shutil.copytree(source / "llm_cache", snapshot, ignore=shutil.ignore_patterns("*.lock"))
+            require(cache_hashes(snapshot) == initial_cache, "source LLM cache changed during snapshot")
         write_json(out / "selected_indices.json", indices)
         write_json(manifest_path, manifest)
     print(f"[prepared] n={len(indices)} hops={manifest['hop_distribution']} cases={names}", flush=True)
@@ -172,9 +201,108 @@ def manifest_at(root):
     return read_json(Path(root) / "manifest.json")
 
 
+def index_ready(args):
+    root, manifest = Path(args.out_root).resolve(), manifest_at(args.out_root)
+    if manifest.get("index_build_status") != "ready":
+        return 1
+    require(asset_hashes(manifest["source_index"]) == manifest["source_asset_sha256"], "shared source index changed")
+    require(cache_hashes(root / "initial_llm_cache") == manifest["initial_cache_sha256"],
+            "shared cache snapshot changed")
+    if manifest.get("index_build_mode") == "fresh":
+        validation = manifest.get("index_build_validation") or {}
+        require(validation.get("result_sha256") == sha256(root / "index_build_result.json")
+                and validation.get("report_sha256") == sha256(root / "index_build_report.json"),
+                "index build result/report changed")
+        require(validation.get("openie_sha256")
+                == sha256(Path(manifest["source_index"]) / "openie_results_ner_qwen3-8b.json"),
+                "fresh OpenIE results changed")
+    return 0
+
+
+def freeze_index(args):
+    root, manifest = Path(args.out_root).resolve(), manifest_at(args.out_root)
+    require(manifest.get("index_build_mode") == "fresh", "freeze-index requires fresh build mode")
+    if manifest.get("index_build_status") == "ready":
+        require(index_ready(args) == 0, "frozen shared index validation failed")
+        print("[index-ready] shared Hippo index already validated", flush=True)
+        return
+    require(manifest.get("index_build_status") == "pending", "invalid shared index state")
+    source = Path(manifest["source_index"]).resolve()
+    require(source == root / "shared_hipporag2_index", "fresh shared index path mismatch")
+    require(sha256(manifest["data_path"]) == manifest["data_sha256"], "dataset changed during index build")
+    require(sha256(manifest["corpus_path"]) == manifest["corpus_sha256"], "corpus changed during index build")
+    _, docs, _ = validated_dataset(manifest["data_path"], manifest["corpus_path"])
+    index_identity(source, docs)
+    result = read_json(root / "index_build_result.json")
+    require(result.get("eval_mode") == "index_only" and result.get("index_build_complete") is True,
+            "index_only did not report successful index completion")
+    require(result.get("indexed_docs") == len(docs) and result.get("openie_document_count") == len(docs),
+            "fresh index/OpenIE document coverage is incomplete")
+    require(result.get("openie_failure_count") == 0, "fresh OpenIE has failed documents")
+    openie_path = source / "openie_results_ner_qwen3-8b.json"
+    openie_rows = read_json(openie_path).get("docs")
+    require(isinstance(openie_rows, list) and len(openie_rows) == len(docs),
+            "fresh OpenIE artifact has incomplete document coverage")
+    require({row.get("passage") for row in openie_rows} == docs,
+            "fresh OpenIE artifact does not cover the full corpus")
+    for row in openie_rows:
+        passage = row["passage"]
+        require(row.get("idx") == "chunk-" + hashlib.md5(passage.encode()).hexdigest(),
+                "fresh OpenIE artifact chunk identity mismatch")
+        require(isinstance(row.get("extracted_entities"), list)
+                and isinstance(row.get("extracted_triples"), list), "fresh OpenIE extraction output is invalid")
+        metadata = row.get("openie_metadata") or {}
+        for stage in ("ner", "triples"):
+            stage_meta = metadata.get(stage) or {}
+            require(stage_meta.get("finish_reason") == "stop" and not stage_meta.get("error"),
+                    f"fresh OpenIE {stage} did not finish successfully: {row['idx']}")
+    config = result.get("runtime_config") or {}
+    for key in ("embedding_model_name", "llm_name", "embedding_batch_size", "openie_max_workers",
+                "llm_prefetch_workers", "max_new_tokens"):
+        require(config.get(key) == manifest["runtime"][key], f"fresh index runtime_config.{key} mismatch")
+    require(config.get("force_index_from_scratch") is True and config.get("force_openie_from_scratch") is True,
+            "fresh index must rebuild both graph and OpenIE")
+    require(config.get("openie_mode") == "online", "fresh OpenIE must use online LLM extraction")
+    stats = result.get("llm_request_stats") or {}
+    require(stats.get("failures") == 0 and stats.get("max_in_flight") == 8,
+            "fresh indexing LLM failures/concurrency mismatch")
+    require(isinstance(stats.get("http_attempts"), int) and stats["http_attempts"] > 0,
+            "fresh OpenIE build did not make actual LLM HTTP requests")
+    require(args.log_start >= 0 and args.log_end >= args.log_start, "vLLM index-build log rotated/truncated")
+    status = http_status_counts(args.vllm_log, args.log_start, args.log_end)
+    require(bool(status) and not any(code != "200" for code in status),
+            f"fresh indexing missing statuses or non-200 HTTP responses: {status}")
+    hashes = asset_hashes(source)
+    require((source / "llm_cache").is_dir(), "fresh indexing LLM cache is missing")
+    snapshot = root / "initial_llm_cache"
+    require(not snapshot.exists(), "pending fresh index already has a cache snapshot")
+    current_cache = cache_hashes(source / "llm_cache")
+    require(bool(current_cache), "fresh indexing LLM cache is empty")
+    shutil.copytree(source / "llm_cache", snapshot, ignore=shutil.ignore_patterns("*.lock"))
+    require(cache_hashes(snapshot) == current_cache, "fresh LLM cache changed during freeze")
+    output = {
+        "validated": True, "index_build_mode": "fresh", "indexed_docs": len(docs),
+        "openie_document_count": result["openie_document_count"], "openie_failure_count": 0,
+        "seconds": args.elapsed, "runtime_config": config, "llm_request_stats": stats,
+        "http_status_in_log": status, "source_asset_sha256": hashes,
+        "initial_cache_sha256": current_cache,
+        "vllm_log_slice": {"path": args.vllm_log, "start": args.log_start, "end": args.log_end},
+    }
+    write_json(root / "index_build_report.json", output)
+    manifest.update({"index_build_status": "ready", "source_asset_sha256": hashes,
+                     "initial_cache_sha256": current_cache,
+                     "index_build_validation": {"result_sha256": sha256(root / "index_build_result.json"),
+                                                "report_sha256": sha256(root / "index_build_report.json"),
+                                                "openie_sha256": sha256(openie_path)}})
+    write_json(root / "manifest.json", manifest)
+    print(f"[index-ready] fresh Hippo graph/OpenIE validated: docs={len(docs)}, http={stats['http_attempts']}", flush=True)
+
+
 def initialize_case(args):
     root, name = Path(args.out_root).resolve(), args.name
     manifest = manifest_at(root)
+    require(manifest.get("index_build_status") == "ready", "shared Hippo index is pending; freeze it before retrieval")
+    require(index_ready(args) == 0, "shared Hippo index integrity check failed")
     require(name in manifest["cases"], f"case not selected: {name}")
     source = Path(manifest["source_index"])
     require(asset_hashes(source) == manifest["source_asset_sha256"], "source graph/embeddings changed")
@@ -362,7 +490,19 @@ def register_commands(subparsers):
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--sample-indices-file")
     parser.add_argument("--cases", default="")
+    parser.add_argument("--build-shared-index", action="store_true",
+                        help="prepare an empty OUT_ROOT/shared_hipporag2_index for fresh OpenIE/index build")
     parser.set_defaults(handler=prepare)
+    parser = subparsers.add_parser("improvement-index-ready", help="check frozen shared index integrity")
+    parser.add_argument("--out-root", required=True)
+    parser.set_defaults(handler=index_ready)
+    parser = subparsers.add_parser("improvement-freeze-index", help="validate fresh OpenIE/index and freeze its cache")
+    parser.add_argument("--out-root", required=True)
+    parser.add_argument("--elapsed", type=int, required=True)
+    parser.add_argument("--vllm-log", required=True)
+    parser.add_argument("--log-start", type=int, required=True)
+    parser.add_argument("--log-end", type=int, required=True)
+    parser.set_defaults(handler=freeze_index)
     for command, handler in (("improvement-initialize-case", initialize_case), ("improvement-ready", ready)):
         parser = subparsers.add_parser(command)
         parser.add_argument("--out-root", required=True)

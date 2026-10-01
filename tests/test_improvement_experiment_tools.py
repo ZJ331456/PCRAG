@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -202,6 +203,123 @@ class ImprovementExperimentTests(unittest.TestCase):
             self.init_case("pathcondrag_original")
         with self.assertRaisesRegex(ValueError, "case is incomplete"):
             helpers.summary(argparse.Namespace(out_root=str(self.out)))
+
+    def prepare_fresh(self):
+        out = self.root / "fresh results"
+        args = argparse.Namespace(**vars(self.prepare_args))
+        args.out_root = str(out)
+        args.source_index = str(out / "shared_hipporag2_index")
+        args.build_shared_index = True
+        helpers.prepare(args)
+        return out, args
+
+    def fake_fresh_build(self, out):
+        source = out / "shared_hipporag2_index"
+        shutil.copytree(self.source, source)
+        self.write(source / "openie_results_ner_qwen3-8b.json", {"docs": [
+            {"idx": "chunk-" + hashlib.md5(helpers.passage_text(p).encode()).hexdigest(),
+             "passage": helpers.passage_text(p), "extracted_entities": [], "extracted_triples": [],
+             "openie_metadata": {"ner": {"finish_reason": "stop", "cache_hit": False},
+                                 "triples": {"finish_reason": "stop", "cache_hit": False}}}
+            for p in self.corpus
+        ]})
+        result = {
+            "eval_mode": "index_only", "index_build_complete": True,
+            "indexed_docs": len(self.corpus), "openie_document_count": len(self.corpus),
+            "openie_failure_count": 0,
+            "runtime_config": {**helpers.manifest_at(out)["runtime"],
+                               "force_index_from_scratch": True, "force_openie_from_scratch": True,
+                               "openie_mode": "online"},
+            "llm_request_stats": {"http_attempts": 400, "failures": 0, "max_in_flight": 8},
+        }
+        self.write(out / "index_build_result.json", result)
+        return result
+
+    def freeze_fresh(self, out):
+        helpers.freeze_index(argparse.Namespace(
+            out_root=str(out), elapsed=5, vllm_log=str(self.log), log_start=0,
+            log_end=self.log.stat().st_size,
+        ))
+
+    def test_fresh_prepare_creates_pending_without_reading_old_index_or_cache(self):
+        out, args = self.prepare_fresh()
+        manifest = helpers.manifest_at(out)
+        self.assertEqual(manifest["index_build_mode"], "fresh")
+        self.assertEqual(manifest["index_build_status"], "pending")
+        self.assertEqual(manifest["source_asset_sha256"], {})
+        self.assertEqual(manifest["initial_cache_sha256"], {})
+        self.assertFalse((out / "shared_hipporag2_index").exists())
+        self.assertFalse((out / "initial_llm_cache").exists())
+        self.assertEqual(helpers.index_ready(args), 1)
+        with self.assertRaisesRegex(ValueError, "index is pending"):
+            helpers.initialize_case(argparse.Namespace(out_root=str(out), name="pathcondrag_original"))
+
+    def test_fresh_source_must_be_empty_and_inside_output(self):
+        args = argparse.Namespace(**vars(self.prepare_args))
+        args.build_shared_index = True
+        with self.assertRaisesRegex(ValueError, "must equal OUT_ROOT"):
+            helpers.prepare(args)
+        args.out_root = str(self.root / "nonempty-fresh")
+        args.source_index = str(Path(args.out_root) / "shared_hipporag2_index")
+        Path(args.source_index).mkdir(parents=True)
+        (Path(args.source_index) / "old_cache.sqlite").write_bytes(b"old")
+        with self.assertRaisesRegex(ValueError, "directory is not empty"):
+            helpers.prepare(args)
+
+    def test_fresh_freeze_verifies_openie_and_enables_case_initialization(self):
+        out, args = self.prepare_fresh()
+        self.fake_fresh_build(out)
+        self.freeze_fresh(out)
+        manifest = helpers.manifest_at(out)
+        self.assertEqual(manifest["index_build_status"], "ready")
+        self.assertEqual(helpers.index_ready(args), 0)
+        helpers.prepare(args)
+        helpers.initialize_case(argparse.Namespace(out_root=str(out), name="pathcondrag_original"))
+        self.assertEqual((out / "initial_llm_cache" / "qwen.sqlite").read_bytes(), b"initial-cache")
+        self.assertTrue((out / "index_build_report.json").exists())
+
+    def test_fresh_freeze_rejects_reuse_failed_openie_and_no_http_requests(self):
+        out, _ = self.prepare_fresh()
+        result = self.fake_fresh_build(out)
+        for change, message in (("reuse", "rebuild both"), ("incomplete", "incomplete"),
+                                ("failure", "failed documents"), ("no_http", "actual LLM HTTP")):
+            broken = copy.deepcopy(result)
+            if change == "reuse": broken["runtime_config"]["force_openie_from_scratch"] = False
+            elif change == "incomplete": broken["openie_document_count"] = 199
+            elif change == "failure": broken["openie_failure_count"] = 1
+            elif change == "no_http": broken["llm_request_stats"]["http_attempts"] = 0
+            self.write(out / "index_build_result.json", broken)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, message):
+                self.freeze_fresh(out)
+            self.assertEqual(helpers.manifest_at(out)["index_build_status"], "pending")
+            self.assertFalse((out / "initial_llm_cache").exists())
+
+    def test_fresh_openie_artifact_metadata_and_http_failures_block_freeze(self):
+        out, _ = self.prepare_fresh()
+        self.fake_fresh_build(out)
+        path = out / "shared_hipporag2_index" / "openie_results_ner_qwen3-8b.json"
+        payload = helpers.read_json(path)
+        payload["docs"][0]["openie_metadata"]["triples"]["finish_reason"] = "length"
+        self.write(path, payload)
+        with self.assertRaisesRegex(ValueError, "did not finish successfully"):
+            self.freeze_fresh(out)
+        payload["docs"][0]["openie_metadata"]["triples"]["finish_reason"] = "stop"
+        self.write(path, payload)
+        self.log.write_text('POST /v1/chat/completions HTTP/1.1" 500\n')
+        with self.assertRaisesRegex(ValueError, "non-200"):
+            self.freeze_fresh(out)
+        self.assertFalse((out / "initial_llm_cache").exists())
+
+    def test_frozen_openie_result_changes_are_detected(self):
+        out, args = self.prepare_fresh()
+        self.fake_fresh_build(out)
+        self.freeze_fresh(out)
+        path = out / "shared_hipporag2_index" / "openie_results_ner_qwen3-8b.json"
+        payload = helpers.read_json(path)
+        payload["provenance"] = {"changed": True}
+        self.write(path, payload)
+        with self.assertRaisesRegex(ValueError, "OpenIE results changed"):
+            helpers.index_ready(args)
 
 
 if __name__ == "__main__":

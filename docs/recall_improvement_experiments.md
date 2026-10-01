@@ -4,7 +4,7 @@
 
 这组实验检验 PathCondRAG 的逐步改进是否提升 MuSiQue 的前 1、2、5 篇支撑文档召回。目标值 `Recall@5 ≈ 0.7528` 是实验目标，代码和本说明不保证达到该分数。由 `0.6528` 到 `0.7528` 是增加 **10 个百分点**，相对提高约 15.3%。
 
-七组都重新检索，使用同一份原始 HippoRAG2 图和向量、同一批问题、同一个 Qwen3-Embedding-8B 与 qwen3-8b。实验仅执行检索，不执行 QA。`pathcondrag_original` 使用当前代码的 stage 0，并与其他 Path 组统一采用逐题 2/3/4 跳标签，因此不保证复现此前固定最大 2 跳的历史数值。
+先由 HippoRAG2 从完整语料重新构建索引，再让七组重新检索，使用同一份新图和向量、同一批问题、同一个 Qwen3-Embedding-8B 与 qwen3-8b。实验包含索引构建与检索，不执行 QA。`pathcondrag_original` 使用当前代码的 stage 0，并与其他 Path 组统一采用逐题 2/3/4 跳标签，因此不保证复现此前固定最大 2 跳的历史数值。
 
 | 目录名称 | stage | 相对上一阶段增加的机制 |
 |---|---:|---|
@@ -22,7 +22,7 @@ stage 1—5 **逐步累加**。相邻两组差值表示该机制在已有机制�
 
 ## 固定配置
 
-- 原始索引：`outputs/emb_ablation_qwen3emb8b_distinct_b4_retrieve/hipporag2_musique`。不从 PathCondRAG 的历史索引复制。
+- 新共享索引：`<OUT_ROOT>/shared_hipporag2_index`。HippoRAG2 使用空工作目录，`force_index_from_scratch=true`、`force_openie_from_scratch=true`，重新执行 NER、三元组提取、向量编码和图构建。
 - 数据：`/root/datasets/musique.json`；语料：`/root/datasets/musique_corpus.json`，使用完整语料。
 - embedding：`/root/models/Qwen3-Embedding-8B`，batch 固定为 4。
 - LLM：`qwen3-8b`，默认 `http://127.0.0.1:8035/v1`。
@@ -32,7 +32,7 @@ stage 1—5 **逐步累加**。相邻两组差值表示该机制在已有机制�
 - 每题检索和导出 200 个候选；保留前 10 篇最终结果，用于 Recall@1/2/5/10/20/200 及错误诊断。
 - 原 PC3 参数：迭代首轮 1 篇、第二轮种子 top5、`idf_novel`、迭代融合 0.45；QD 最小 2 跳、子检索 top3；PCQD evidence top5、entity top3、路径阈值 0.60、base/static/path 权重 0.40/0.20/0.40。
 
-所有组的图和向量从原 Hippo 索引隔离复制。源 Hippo 的初始 `llm_cache` 冻结为单独快照，每组复制相同快照到自己的索引目录；某组新增的 LLM 缓存不会传给下一组。由于各机制的请求内容不同，实际请求数可能不同，报告保留这些开销。
+新共享索引完整构建并通过校验后，所有组的图和向量从它隔离复制。此次索引构建生成的 `llm_cache` 冻结为单独快照，每组复制相同快照到自己的索引目录；某组新增的 LLM 缓存不会传给下一组。由于各机制的请求内容不同，实际请求数可能不同，报告保留这些开销。
 
 ## 启动命令
 
@@ -42,7 +42,7 @@ stage 1—5 **逐步累加**。相邻两组差值表示该机制在已有机制�
 SAMPLE_SIZE=2 bash scripts/run_recall_top5_improvements.sh
 ```
 
-两题默认选原始数据索引 `[0, 5]`，分别覆盖 2 跳和 4 跳。七组使用同一脚本、同一参数定义；小测试仅改变问题数量。全量运行：
+两题默认选原始数据索引 `[0, 5]`，分别覆盖 2 跳和 4 跳。七组使用同一脚本、同一参数定义；小测试仅改变检索问题数量，索引仍从完整语料重建。全量运行：
 
 ```bash
 SAMPLE_SIZE=0 bash scripts/run_recall_top5_improvements.sh
@@ -53,7 +53,6 @@ SAMPLE_SIZE=0 bash scripts/run_recall_top5_improvements.sh
 | 参数 | 默认与作用 |
 |---|---|
 | `OUT_ROOT` | 全量默认 `outputs/pathcondrag_new_innvotion_10_1`；小测试增加 `_smokeN_<timestamp>` 后缀 |
-| `SOURCE_INDEX` | 上述原 Hippo 索引 |
 | `SAMPLE_SIZE` | 0 表示全量；2 表示固定 2/4 跳测试；其他正值按 seed 抽样 |
 | `SAMPLE_SEED` | 42 |
 | `SAMPLE_INDICES_FILE` | 可选，JSON 整数列表；也接受含 `selected_indices` 的对象。原样保持顺序，不重新抽样 |
@@ -75,9 +74,13 @@ tail -f <OUT_ROOT>/logs/run.log
 ```text
 <OUT_ROOT>/
 ├── manifest.json                  # 数据/语料/索引身份、配置、样本与跳数
+├── shared_hipporag2_index/         # 本次从零构建的唯一共享源索引
+├── index_build_result.json        # 索引完成状态、数量、配置及真实请求统计
+├── index_build_report.json        # 构建完成校验、耗时及 HTTP 状态
 ├── selected_indices.json          # 七组共用问题索引
-├── initial_llm_cache/             # 源 Hippo 初始缓存快照
+├── initial_llm_cache/             # 本次新索引构建完成时的缓存快照
 ├── logs/run.log                   # 总日志
+├── logs/hipporag2_index.log        # NER/三元组/embedding/图构建日志
 ├── logs/<case>.log                # 每组日志
 ├── cases/<case>/
 │   ├── index/                     # 隔离图、向量和独立缓存
@@ -90,7 +93,7 @@ tail -f <OUT_ROOT>/logs/run.log
 └── completed.ok                  # 所有选定组都验证成功后生成
 ```
 
-准备阶段验证全部 1000 题的跳数标签与 ID 一致、支撑文档在完整语料中、源索引 chunk 身份与完整语料完全一致。所有组共用一个问题清单。
+准备阶段验证全部 1000 题的跳数标签与 ID 一致、支撑文档在完整语料中，记录索引状态为 pending。建索引后独立验证 OpenIE 覆盖全部语料且没有失败或未完成截断，图及三份向量文件存在，chunk 身份与完整语料完全一致，批量及并发参数正确，真实请求统计和 HTTP 日志一致；然后冻结 SHA 和缓存快照，将索引状态设为 ready。所有组共用一个问题清单，pending 状态禁止初始化或运行检索组。
 
 每组结束后严格检查：
 
@@ -111,9 +114,9 @@ tail -f <OUT_ROOT>/logs/run.log
 
 可研究的主线是：显式依赖与证据来源约束 → 桥实体候选绑定和验证 → 五篇预算内的证据覆盖。其新颖性和有效性需要进一步相关工作比较及严格消融。
 
-## 本机两题验证记录（2026-10-01）
+## 本机两题验证记录：复用旧索引阶段（2026-10-01）
 
-最终版本通过同一个总脚本运行完整七组，使用原始索引 `[0, 5]`，分别为 2 跳与 4 跳；每组 10 篇结果、200 篇候选、运行配置、宏召回重算和索引 SHA 校验均通过。对应日志窗口 48 个 HTTP 请求全部为 200，所有组失败及重试计数均为 0；Hippo 的两个事实过滤请求命中原始缓存。
+重建流程加入前，通过同一个总脚本运行完整七组，使用问题原始序号 `[0, 5]`，分别为 2 跳与 4 跳；每组 10 篇结果、200 篇候选、运行配置、宏召回重算和索引 SHA 校验均通过。对应日志窗口 48 个 HTTP 请求全部为 200，所有组失败及重试计数均为 0；Hippo 的两个事实过滤请求命中原始缓存。这是检索及结果导出流程的历史验证，不代表本次从零重建索引后的结果。
 
 | 组 | 两题 Recall@5 |
 |---|---:|
@@ -127,6 +130,6 @@ tail -f <OUT_ROOT>/logs/run.log
 
 该验证证明流程和导出可用，**不证明精度提升**。四跳题的规划两次仍存在依赖引用不一致，按规则回退；两跳题执行了答案绑定后的后继检索，但出现桥答案关系判断不正确、后继证据为空的问题。精确引用检查只能保证答案文本和引用来自所给段落，关系是否成立仍依赖 LLM 判断，不能将其称为逻辑正确性的保证。所有情况均保留在逐题 trace 中。全量结果用于测量这些机制的收益与副作用，不能用这两题选参数或报告论文主结果。
 
-上述小测试结果已按用户要求清理。重新运行的全量七组统一保存到 `outputs/pathcondrag_new_innvotion_10_1`，五个新实验对应 `cases/exp1_correctness` 至 `cases/exp5_verified_beam`；两组对照也在该根目录的 `cases` 下。原始 Hippo 索引保留作为统一输入。
+上述基于旧索引的小测试结果已按用户要求清理。此次全量任务从头重建 HippoRAG2 索引，再运行七组；统一保存到 `outputs/pathcondrag_new_innvotion_10_1`，五个新实验对应 `cases/exp1_correctness` 至 `cases/exp5_verified_beam`；两组对照也在该根目录的 `cases` 下。
 
 当前七组不加载新 reranker。后续可用 [Qwen3 官方 reranker](https://github.com/QwenLM/Qwen3-Embedding) 作为排序瓶颈工程对照；若增加 reranker，HippoRAG2 也应采用相同候选、相同模型与相同预算，以免把辅助模型收益全部算作算法贡献。

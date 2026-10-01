@@ -1,5 +1,5 @@
 diff --git a/main.py b/main.py
-index 4fd53f4..1249522 100644
+index 4fd53f4..f84b92b 100644
 --- a/main.py
 +++ b/main.py
 @@ -2,18 +2,25 @@ import argparse
@@ -47,7 +47,7 @@ index 4fd53f4..1249522 100644
      parser.add_argument("--embedding_provider", choices=["openai", "transformers", "vllm", "gritlm", "nvembed", "contriever", "cohere"], help="Explicit embedding provider; otherwise inferred from the model name")
      parser.add_argument("--azure_endpoint", help="Azure OpenAI resource endpoint")
      parser.add_argument("--azure_api_version", help="Azure OpenAI API version for chat completions")
-@@ -71,25 +79,103 @@ def parse_args():
+@@ -71,25 +79,162 @@ def parse_args():
      parser.add_argument("--azure_embedding_endpoint", help="Azure OpenAI resource endpoint for embeddings")
      parser.add_argument("--azure_embedding_api_version", help="Azure OpenAI embeddings API version; defaults to --azure_api_version")
      parser.add_argument("--azure_embedding_deployment", help="Azure OpenAI embedding deployment name; defaults to --embedding_name")
@@ -65,7 +65,7 @@ index 4fd53f4..1249522 100644
 +    parser.add_argument("--sample_size", type=int, default=0, help="0 = full dataset; >0 = subsample for smoke tests")
 +    parser.add_argument("--sample_seed", type=int, default=42)
 +    parser.add_argument("--sample_indices_file", help="JSON list or object with selected_indices; original dataset indices")
-+    parser.add_argument("--eval_mode", choices=["retrieve", "rag_qa"], default="rag_qa")
++    parser.add_argument("--eval_mode", choices=["retrieve", "rag_qa", "index_only"], default="rag_qa")
 +    parser.add_argument("--output", help="Detailed result JSON path; defaults to the legacy metrics path")
 +    parser.add_argument("--save_dir_exact", action="store_true", help="Use --save_dir exactly without the legacy dataset suffix")
 +    parser.add_argument("--reuse_index", action="store_true", help="Require and retrieve from the existing index without calling index/OpenIE")
@@ -128,6 +128,65 @@ index 4fd53f4..1249522 100644
 +    return row
 +
 +
++def require_fresh_index_directory(save_dir, config, reuse_index=False):
++    if reuse_index:
++        raise ValueError("index_only cannot reuse an existing index")
++    if not config.force_index_from_scratch or not config.force_openie_from_scratch:
++        raise ValueError("index_only requires both force_index_from_scratch and force_openie_from_scratch")
++    directory = Path(save_dir)
++    if directory.exists() and any(directory.iterdir()):
++        raise ValueError("index_only requires a new empty save_dir; old graph/vectors/OpenIE/cache must not be present")
++
++
++def index_build_report(rag, docs, config, seconds):
++    expected_docs = set(docs)
++    indexed_docs = set(rag.chunk_embedding_store.get_all_texts())
++    chunk_ids = set(rag.chunk_embedding_store.get_all_ids())
++    openie_docs = getattr(rag, "_openie_info", None)
++    if not isinstance(openie_docs, list):
++        raise RuntimeError("Index construction did not retain its completed OpenIE rows")
++    openie_ids = [row.get("idx") for row in openie_docs]
++    if len(openie_ids) != len(set(openie_ids)) or set(openie_ids) != chunk_ids:
++        raise RuntimeError("Index/OpenIE coverage is incomplete or contains duplicate chunk IDs")
++    failures = 0
++    for row in openie_docs:
++        for stage in ("ner", "triples"):
++            metadata = (row.get("openie_metadata") or {}).get(stage) or {}
++            failures += int(bool(metadata.get("error")) or metadata.get("finish_reason") != "stop")
++    if failures:
++        raise RuntimeError(f"Incomplete or failed OpenIE stages: {failures}")
++    if indexed_docs != expected_docs:
++        raise RuntimeError("Constructed passage index does not cover the complete corpus")
++    if rag.graph.vcount() != len(chunk_ids) + len(rag.entity_embedding_store.get_all_ids()):
++        raise RuntimeError("Constructed graph and vector stores have different node counts")
++    if not Path(rag._graph_pickle_filename).is_file() or not Path(rag.index_manifest_path).is_file():
++        raise RuntimeError("Constructed index is missing its graph or schema manifest")
++    stats = rag.llm_model.get_request_stats()
++    if stats.get("failures", 0) or stats.get("http_attempts", 0) <= 0:
++        raise RuntimeError(f"Fresh index has invalid LLM request statistics: {stats}")
++    return {
++        "dataset": config.dataset,
++        "method": "hipporag2",
++        "eval_mode": "index_only",
++        "save_dir": config.save_dir,
++        "indexed_docs": len(indexed_docs),
++        "indexed_chunks": len(chunk_ids),
++        "corpus_docs": len(docs),
++        "openie_document_count": len(openie_docs),
++        "openie_failure_count": failures,
++        "openie_empty_entities_count": sum(not row.get("extracted_entities") for row in openie_docs),
++        "openie_empty_triples_count": sum(not row.get("extracted_triples") for row in openie_docs),
++        "index_seconds": seconds,
++        "runtime_config": asdict(config),
++        "llm_request_stats": stats,
++        "force_index_from_scratch": config.force_index_from_scratch,
++        "force_openie_from_scratch": config.force_openie_from_scratch,
++        "reuse_index": False,
++        "shared_index": True,
++        "index_build_complete": True,
++    }
++
++
  def main():
      args = parse_args()
      if Path(args.dataset).name != args.dataset:
@@ -154,7 +213,7 @@ index 4fd53f4..1249522 100644
      docs = [f"{doc['title']}\n{doc['text']}" for doc in corpus]
      queries = [sample["question"] for sample in samples]
      gold_answers = get_gold_answers(samples)
-@@ -103,6 +189,7 @@ def main():
+@@ -103,6 +248,7 @@ def main():
          save_dir=save_dir,
          llm_base_url=args.llm_base_url,
          llm_name=args.llm_name,
@@ -162,7 +221,7 @@ index 4fd53f4..1249522 100644
          azure_endpoint=args.azure_endpoint,
          azure_api_version=args.azure_api_version,
          azure_chat_deployment=args.azure_chat_deployment,
-@@ -115,17 +202,106 @@ def main():
+@@ -115,17 +261,120 @@ def main():
          force_index_from_scratch=string_to_bool(args.force_index_from_scratch),
          force_openie_from_scratch=string_to_bool(args.force_openie_from_scratch),
          rerank_dspy_file_path=str(PROJECT_ROOT / "src" / "hipporag" / "prompts" / "dspy_prompts" / "filter_llama3.3-70B-Instruct.json"),
@@ -181,6 +240,10 @@ index 4fd53f4..1249522 100644
 +        synonymy_edge_query_batch_size=128,
 +        synonymy_edge_key_batch_size=1024,
      )
++    if args.eval_mode == "index_only":
++        if args.rag_type != "hipporag":
++            raise ValueError("index_only is reserved for the shared HippoRAG2 index")
++        require_fresh_index_directory(save_dir, config, args.reuse_index)
 +    if args.reuse_index:
 +        if config.force_index_from_scratch or config.force_openie_from_scratch:
 +            raise ValueError("--reuse_index cannot be combined with rebuild flags")
@@ -203,6 +266,16 @@ index 4fd53f4..1249522 100644
      with rag_class(global_config=config) as rag:
 -        rag.index(docs)
 -        rag.rag_qa(queries=queries, gold_docs=gold_docs, gold_answers=gold_answers)
++        if args.eval_mode == "index_only":
++            index_started = time.perf_counter()
++            rag.index(docs)
++            report = index_build_report(rag, docs, config, time.perf_counter() - index_started)
++            output = Path(args.output) if args.output else Path(save_dir) / "index_build_result.json"
++            output.parent.mkdir(parents=True, exist_ok=True)
++            output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
++            print(json.dumps({key: report[key] for key in ("dataset", "eval_mode", "indexed_docs", "openie_document_count", "index_seconds", "llm_request_stats")}, indent=2, ensure_ascii=False))
++            print(f"[saved] {output}")
++            return
 +        if args.reuse_index:
 +            indexed_docs = set(rag.chunk_embedding_store.get_all_texts())
 +            if indexed_docs != set(docs):
@@ -273,7 +346,7 @@ index 4fd53f4..1249522 100644
  
  if __name__ == "__main__":
 diff --git a/src/hipporag/HippoRAG.py b/src/hipporag/HippoRAG.py
-index 8a87f5f..8ca9957 100644
+index 8a87f5f..99d8c9f 100644
 --- a/src/hipporag/HippoRAG.py
 +++ b/src/hipporag/HippoRAG.py
 @@ -3,6 +3,7 @@ import json
@@ -346,7 +419,37 @@ index 8a87f5f..8ca9957 100644
  
          retrieve_end_time = time.time()  # Record end time
  
-@@ -2075,6 +2087,17 @@ class HippoRAG:
+@@ -1435,13 +1447,26 @@ class HippoRAG:
+         merged_rows = []
+         for chunk_key, row in chunks_to_save.items():
+             passage = row['content']
+-            entities = ner_results_dict[chunk_key].unique_entities
+-            triples = triple_results_dict[chunk_key].triples
++            ner_result = ner_results_dict[chunk_key]
++            triple_result = triple_results_dict[chunk_key]
++            for stage, result in (("ner", ner_result), ("triples", triple_result)):
++                if result.chunk_id != chunk_key or result.metadata.get("error"):
++                    raise StateConsistencyError(f"Failed/misaligned {stage} output for chunk {chunk_key}.")
++                if result.metadata.get("finish_reason") != "stop":
++                    raise StateConsistencyError(f"Incomplete {stage} output for chunk {chunk_key}: {result.metadata.get('finish_reason')!r}.")
++            entities = ner_result.unique_entities
++            triples = triple_result.triples
+             if not isinstance(entities, list) or not all(isinstance(entity, str) for entity in entities):
+                 raise StateConsistencyError(f"Invalid NER result for chunk {chunk_key}.")
+             if not isinstance(triples, list) or not all(isinstance(triple, (list, tuple)) and len(triple) == 3 and all(isinstance(value, str) for value in triple) for triple in triples):
+                 raise StateConsistencyError(f"Invalid triple result for chunk {chunk_key}.")
+-            merged_rows.append({'idx': chunk_key, 'passage': passage, 'extracted_entities': entities, 'extracted_triples': triples})
++            merged_rows.append({
++                'idx': chunk_key,
++                'passage': passage,
++                'extracted_entities': entities,
++                'extracted_triples': triples,
++                'openie_metadata': {'ner': dict(ner_result.metadata), 'triples': dict(triple_result.metadata)},
++            })
+ 
+         all_openie_info.extend(merged_rows)
+ 
+@@ -2075,6 +2100,17 @@ class HippoRAG:
                                                                             phrase_weights,
                                                                             linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
  
@@ -364,7 +467,7 @@ index 8a87f5f..8ca9957 100644
          #Get passage scores according to chosen dense retrieval model
          dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
          normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
-@@ -2110,58 +2133,68 @@ class HippoRAG:
+@@ -2110,58 +2146,68 @@ class HippoRAG:
          return ppr_sorted_doc_ids, ppr_sorted_doc_scores
  
  
@@ -612,23 +715,62 @@ index 9a04dd3..d36f991 100644
      elif embedding_model_name.startswith("VLLM/"):
          class_name = "VLLMEmbeddingModel"
 diff --git a/src/hipporag/information_extraction/openie_openai.py b/src/hipporag/information_extraction/openie_openai.py
-index e7ca0d9..565fefc 100644
+index e7ca0d9..bea765b 100644
 --- a/src/hipporag/information_extraction/openie_openai.py
 +++ b/src/hipporag/information_extraction/openie_openai.py
-@@ -66,23 +66,47 @@ class OpenIE:
+@@ -11,6 +11,7 @@ from ..utils.misc_utils import TripleRawOutput, NerRawOutput
+ from ..llm.openai_gpt import CacheOpenAI
+ 
+ logger = get_logger(__name__)
++_LENGTH_RETRY_FREQUENCY_PENALTIES = (0.2, 0.5)
+ 
+ 
+ class ChunkInfo(TypedDict):
+@@ -48,6 +49,18 @@ def _extract_ner_from_response(real_response):
+     return _extract_json_list_field(real_response, "named_entities")
+ 
+ 
++def _length_retry_seed(llm_model: CacheOpenAI) -> int:
++    """Change the cache key once without changing the decoding settings."""
++    config = getattr(llm_model, "llm_config", None)
++    params = getattr(config, "generate_params", {}) or {}
++    base_seed = params.get("seed")
++    if base_seed is None:
++        base_seed = 0
++    if not isinstance(base_seed, int) or isinstance(base_seed, bool):
++        raise ValueError(f"OpenIE retry requires an integer or null seed, got {base_seed!r}")
++    return base_seed + 1
++
++
+ class OpenIE:
+     def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, ner_max_tokens: int = 512, triple_max_tokens: int = 2048):
+         # Init prompt template manager
+@@ -66,28 +79,103 @@ class OpenIE:
          ner_input_message = self.prompt_template_manager.render(name='ner', passage=passage)
          raw_response = ""
          metadata = {}
-+        # Retry once with a higher cap when default 512 truncates dense entity lists.
-+        token_budgets = [self.ner_max_tokens]
-+        if self.ner_max_tokens < 1024:
++        # Align with HippoRAG: default 512, escalate to 1024 on parse failure or truncation.
++        ner_max_tokens = self.ner_max_tokens
++        token_budgets = [ner_max_tokens]
++        if ner_max_tokens < 1024:
 +            token_budgets.append(1024)
++        final_budget = token_budgets[-1]
++        attempts = [(budget, None) for budget in token_budgets]
++        attempts.append((final_budget, "seed"))
++        attempts.extend(
++            (final_budget, penalty)
++            for penalty in _LENGTH_RETRY_FREQUENCY_PENALTIES
++        )
++        length_observed_count = 0
++        length_retry_count = 0
++        length_retry_penalties_attempted = []
++        openie_attempt_settings = []
++        previous_was_length = False
++        attempt_count = 0
          try:
 -            # LLM INFERENCE
 -            inference_kwargs = {"max_new_tokens": self.ner_max_tokens}
-+            last_error = None
-+            unique_entities = []
-             response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
+-            response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
 -            if response_format is not None:
 -                inference_kwargs["response_format"] = response_format
 -            raw_response, metadata, cache_hit = self.llm_model.infer(
@@ -642,27 +784,62 @@ index e7ca0d9..565fefc 100644
 -                real_response = raw_response
 -            extracted_entities = _extract_ner_from_response(real_response)
 -            unique_entities = list(dict.fromkeys(extracted_entities))
-+            for attempt, max_new_tokens in enumerate(token_budgets):
-+                inference_kwargs = {"max_new_tokens": max_new_tokens}
++            unique_entities = []
++            for attempt, (max_new_tokens, retry_setting) in enumerate(attempts):
++                # Decoding changes are reached only after the final budget was truncated.
++                kwargs = {"messages": ner_input_message, "max_new_tokens": max_new_tokens}
++                if retry_setting == "seed":
++                    kwargs["seed"] = _length_retry_seed(self.llm_model)
++                elif retry_setting is not None:
++                    kwargs["frequency_penalty"] = retry_setting
++                    length_retry_penalties_attempted.append(retry_setting)
++                if previous_was_length:
++                    length_retry_count += 1
++                attempt_count += 1
++                openie_attempt_settings.append({key: value for key, value in kwargs.items()
++                                                if key != "messages"})
++                response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
 +                if response_format is not None:
-+                    inference_kwargs["response_format"] = response_format
-+                raw_response, metadata, cache_hit = self.llm_model.infer(
-+                    messages=ner_input_message,
-+                    **inference_kwargs,
-+                )
-+                metadata['cache_hit'] = cache_hit
-+                metadata['ner_max_tokens_used'] = max_new_tokens
++                    kwargs["response_format"] = response_format
++                raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
++                metadata = dict(response_metadata)
++                metadata.update({
++                    'cache_hit': cache_hit,
++                    'ner_max_tokens_used': max_new_tokens,
++                    'openie_attempt_count': attempt_count,
++                    'length_retry_count': length_retry_count,
++                    'length_observed_count': length_observed_count,
++                    'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
++                    'openie_attempt_settings': list(openie_attempt_settings),
++                })
++                if retry_setting == "seed":
++                    metadata['length_retry_seed'] = kwargs['seed']
++                elif retry_setting is not None:
++                    metadata['length_retry_frequency_penalty'] = retry_setting
 +                if metadata.get('finish_reason') == 'length':
-+                    real_response = fix_broken_generated_json(raw_response)
-+                else:
-+                    real_response = raw_response
++                    length_observed_count += 1
++                    metadata['length_observed_count'] = length_observed_count
++                    previous_was_length = True
++                    if attempt + 1 == len(attempts):
++                        raise RuntimeError(
++                            f"NER chunk {chunk_key} remains truncated (finish_reason=length) "
++                            f"after {attempt + 1} attempts"
++                        )
++                    logger.warning(
++                        "NER response truncated for %s at max_new_tokens=%s; retrying",
++                        chunk_key, max_new_tokens,
++                    )
++                    continue
++                previous_was_length = False
++                if metadata.get('finish_reason') != 'stop':
++                    raise RuntimeError(f"NER chunk {chunk_key} did not complete: {metadata.get('finish_reason')!r}")
 +                try:
-+                    extracted_entities = _extract_ner_from_response(real_response)
++                    extracted_entities = _extract_ner_from_response(raw_response)
++                    if not all(isinstance(entity, str) and entity.strip() for entity in extracted_entities):
++                        raise ValueError("NER entities must be non-empty strings")
 +                    unique_entities = list(dict.fromkeys(extracted_entities))
-+                    last_error = None
 +                    break
 +                except Exception as parse_error:
-+                    last_error = parse_error
 +                    if attempt + 1 < len(token_budgets):
 +                        logger.warning(
 +                            "NER parse failed for %s with max_new_tokens=%s (%s); retrying with %s",
@@ -673,11 +850,113 @@ index e7ca0d9..565fefc 100644
 +                        )
 +                        continue
 +                    raise
-+            if last_error is not None:
-+                raise last_error
  
          except Exception as e:
              # For any other unexpected exceptions, log them and return with the error message
+             logger.warning(e)
+-            metadata.update({'error': str(e)})
++            metadata.update({
++                'error': f'{type(e).__name__}: {e}',
++                'openie_attempt_count': attempt_count,
++                'length_retry_count': length_retry_count,
++                'length_observed_count': length_observed_count,
++                'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
++                'openie_attempt_settings': list(openie_attempt_settings),
++            })
+             return NerRawOutput(
+                 chunk_id=chunk_key,
+                 response=raw_response,  # Store the error message in metadata
+@@ -115,27 +203,75 @@ class OpenIE:
+ 
+         raw_response = ""
+         metadata = {}
++        # Align with HippoRAG openie_triple_max_tokens default=2048
++        triple_max_tokens = self.triple_max_tokens
++        length_observed_count = 0
++        length_retry_count = 0
++        length_retry_penalties_attempted = []
++        openie_attempt_settings = []
++        attempt_count = 0
+         try:
+             # LLM INFERENCE
+-            inference_kwargs = {"max_new_tokens": self.triple_max_tokens}
+-            response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
+-            if response_format is not None:
+-                inference_kwargs["response_format"] = response_format
+-            raw_response, metadata, cache_hit = self.llm_model.infer(
+-                messages=messages,
+-                **inference_kwargs,
+-            )
+-            metadata['cache_hit'] = cache_hit
+-            if metadata.get('finish_reason') == 'length':
+-                real_response = fix_broken_generated_json(raw_response)
+-            else:
+-                real_response = raw_response
+-            extracted_triples = _extract_triples_from_response(real_response)
++            for attempt in range(len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 2):
++                kwargs = {"messages": messages, "max_new_tokens": triple_max_tokens}
++                if attempt == 1:
++                    kwargs['seed'] = _length_retry_seed(self.llm_model)
++                elif attempt > 1:
++                    penalty = _LENGTH_RETRY_FREQUENCY_PENALTIES[attempt - 2]
++                    kwargs['frequency_penalty'] = penalty
++                    length_retry_penalties_attempted.append(penalty)
++                if attempt:
++                    length_retry_count += 1
++                attempt_count += 1
++                openie_attempt_settings.append({key: value for key, value in kwargs.items()
++                                                if key != "messages"})
++                response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
++                if response_format is not None:
++                    kwargs["response_format"] = response_format
++                raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
++                metadata = dict(response_metadata)
++                metadata.update({
++                    'cache_hit': cache_hit,
++                    'openie_attempt_count': attempt_count,
++                    'length_retry_count': length_retry_count,
++                    'length_observed_count': length_observed_count,
++                    'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
++                    'openie_attempt_settings': list(openie_attempt_settings),
++                })
++                if attempt == 1:
++                    metadata['length_retry_seed'] = kwargs['seed']
++                elif attempt > 1:
++                    metadata['length_retry_frequency_penalty'] = kwargs['frequency_penalty']
++                if metadata.get('finish_reason') != 'length':
++                    break
++                length_observed_count += 1
++                metadata['length_observed_count'] = length_observed_count
++                if attempt == len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 1:
++                    raise RuntimeError(
++                        f"Triple extraction chunk {chunk_key} remains truncated "
++                        f"(finish_reason=length) after {attempt + 1} attempts"
++                    )
++                logger.warning("Triple response truncated for %s; retrying at max_new_tokens=%s",
++                               chunk_key, triple_max_tokens)
++            extracted_triples = _extract_triples_from_response(raw_response)
++            if metadata.get('finish_reason') != 'stop':
++                raise RuntimeError(f"Triple extraction chunk {chunk_key} did not complete: {metadata.get('finish_reason')!r}")
+             triplets = filter_invalid_triples(triples=extracted_triples)
++            metadata['raw_triple_count'] = len(extracted_triples)
++            metadata['valid_triple_count'] = len(triplets)
++            if extracted_triples and not triplets:
++                raise ValueError("Triple output was non-empty but contained no valid triples")
+ 
+         except Exception as e:
+             logger.warning(f"Exception for chunk {chunk_key}: {e}")
+-            metadata.update({'error': str(e)})
++            metadata.update({
++                'error': f'{type(e).__name__}: {e}',
++                'openie_attempt_count': attempt_count,
++                'length_retry_count': length_retry_count,
++                'length_observed_count': length_observed_count,
++                'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
++                'openie_attempt_settings': list(openie_attempt_settings),
++            })
+             return TripleRawOutput(
+                 chunk_id=chunk_key,
+                 response=raw_response,
 diff --git a/src/hipporag/llm/openai_gpt.py b/src/hipporag/llm/openai_gpt.py
 index 69194f3..3de271a 100644
 --- a/src/hipporag/llm/openai_gpt.py

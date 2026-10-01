@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Seven retrieve-only cases, cloned from one untouched HippoRAG2 index.
+# Build a fresh HippoRAG2 index, then reuse it for seven retrieval cases.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HIPPO_ROOT="${HIPPO_ROOT:-/root/baseline/HippoRAG}"
-SOURCE_INDEX="${SOURCE_INDEX:-${ROOT}/outputs/emb_ablation_qwen3emb8b_distinct_b4_retrieve/hipporag2_musique}"
 SAMPLE_SIZE="${SAMPLE_SIZE:-0}"
 SAMPLE_SEED="${SAMPLE_SEED:-42}"
 CONDA_ENV="${CONDA_ENV:-rag}"
@@ -15,6 +14,7 @@ if (( SAMPLE_SIZE > 0 )); then
   DEFAULT_OUT_ROOT="${DEFAULT_OUT_ROOT}_smoke${SAMPLE_SIZE}_$(date +%Y%m%d_%H%M%S)"
 fi
 OUT_ROOT="${OUT_ROOT:-${DEFAULT_OUT_ROOT}}"
+SOURCE_INDEX="${OUT_ROOT}/shared_hipporag2_index"
 TOOLS="${ROOT}/scripts/experiment_tools.py"
 
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
@@ -39,6 +39,7 @@ prepare_args=(
   --out-root "${OUT_ROOT}" --source-index "${SOURCE_INDEX}"
   --data-path /root/datasets/musique.json --corpus-path /root/datasets/musique_corpus.json
   --sample-size "${SAMPLE_SIZE}" --sample-seed "${SAMPLE_SEED}" --cases "${CASES:-}"
+  --build-shared-index
 )
 if [[ -n "${SAMPLE_INDICES_FILE:-}" ]]; then
   prepare_args+=(--sample-indices-file "${SAMPLE_INDICES_FILE}")
@@ -47,7 +48,41 @@ python "${TOOLS}" improvement-prepare "${prepare_args[@]}"
 
 echo "[run] OUT_ROOT=${OUT_ROOT} SAMPLE_SIZE=${SAMPLE_SIZE} seed=${SAMPLE_SEED}"
 echo "[run] Qwen3-Embedding-8B batch=4; qwen3-8b workers=8; max_new_tokens=2048; thinking disabled in clients"
-echo "[run] source=${SOURCE_INDEX}; all cases use identical selected_indices.json and initial cache snapshot"
+echo "[run] source=${SOURCE_INDEX}; build NER/triples, vectors and graph from scratch before retrieval"
+
+build_shared_index() {
+  if python "${TOOLS}" improvement-index-ready --out-root "${OUT_ROOT}"; then
+    echo "[index] verified fresh shared index already completed"
+    return 0
+  fi
+  if [[ -e "${SOURCE_INDEX}" ]]; then
+    echo "[index] incomplete build exists: ${SOURCE_INDEX}; inspect before restarting" >&2
+    return 1
+  fi
+  local log_start log_end start end
+  log_start="$(stat -c %s "${VLLM_LOG}")"
+  start="$(date +%s)"
+  echo "[index] HippoRAG2 fresh build started=$(date '+%F %T'); OpenIE workers=8, embedding batch=4"
+  conda run --no-capture-output -n "${CONDA_ENV}" python -u "${HIPPO_ROOT}/main.py" \
+    --dataset musique --datasets_dir /root/datasets --rag_type hipporag \
+    --sample_size "${SAMPLE_SIZE}" --sample_seed "${SAMPLE_SEED}" \
+    --sample_indices_file "${OUT_ROOT}/selected_indices.json" \
+    --llm_name qwen3-8b --llm_base_url "${LLM_BASE_URL}" \
+    --embedding_name /root/models/Qwen3-Embedding-8B --embedding_provider transformers \
+    --embedding_batch_size 4 --openie_max_workers 8 --llm_prefetch_workers 8 \
+    --openie_mode online --eval_mode index_only \
+    --force_index_from_scratch true --force_openie_from_scratch true \
+    --save_dir_exact --save_dir "${SOURCE_INDEX}" --output "${OUT_ROOT}/index_build_result.json" \
+    2>&1 | tee "${OUT_ROOT}/logs/hipporag2_index.log"
+  end="$(date +%s)"
+  log_end="$(stat -c %s "${VLLM_LOG}")"
+  python "${TOOLS}" improvement-freeze-index \
+    --out-root "${OUT_ROOT}" --elapsed "$((end-start))" \
+    --vllm-log "${VLLM_LOG}" --log-start "${log_start}" --log-end "${log_end}"
+  echo "[index] fresh shared index validated; seven retrieval cases can begin"
+}
+
+build_shared_index
 
 COMMON=(
   --dataset musique --sample_size "${SAMPLE_SIZE}" --sample_seed "${SAMPLE_SEED}"
