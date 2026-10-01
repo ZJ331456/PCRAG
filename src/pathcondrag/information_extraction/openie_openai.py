@@ -12,7 +12,7 @@ from ..utils.misc_utils import TripleRawOutput, NerRawOutput
 from ..llm.openai_gpt import CacheOpenAI
 
 logger = get_logger(__name__)
-_MAX_LENGTH_RETRIES = 2
+_LENGTH_RETRY_FREQUENCY_PENALTIES = (0.2, 0.5)
 
 
 def _safe_env_int(name: str, default: int | None = None) -> int | None:
@@ -63,8 +63,8 @@ def _extract_ner_from_response(real_response):
     return _extract_json_list_field(real_response, "named_entities")
 
 
-def _length_retry_seed(llm_model: CacheOpenAI, retry_number: int) -> int:
-    """Use a distinct, deterministic cache key for each truncated-response retry."""
+def _length_retry_seed(llm_model: CacheOpenAI) -> int:
+    """Change the cache key once without changing the decoding settings."""
     config = getattr(llm_model, "llm_config", None)
     params = getattr(config, "generate_params", {}) or {}
     base_seed = params.get("seed")
@@ -72,7 +72,7 @@ def _length_retry_seed(llm_model: CacheOpenAI, retry_number: int) -> int:
         base_seed = 0
     if not isinstance(base_seed, int) or isinstance(base_seed, bool):
         raise ValueError(f"OpenIE retry requires an integer or null seed, got {base_seed!r}")
-    return base_seed + retry_number
+    return base_seed + 1
 
 
 class OpenIE:
@@ -95,24 +95,32 @@ class OpenIE:
             token_budgets.append(1024)
         final_budget = token_budgets[-1]
         attempts = [(budget, None) for budget in token_budgets]
+        attempts.append((final_budget, "seed"))
         attempts.extend(
-            (final_budget, retry_number)
-            for retry_number in range(1, _MAX_LENGTH_RETRIES + 1)
+            (final_budget, penalty)
+            for penalty in _LENGTH_RETRY_FREQUENCY_PENALTIES
         )
         length_observed_count = 0
         length_retry_count = 0
+        length_retry_penalties_attempted = []
+        openie_attempt_settings = []
         previous_was_length = False
         attempt_count = 0
         try:
             unique_entities = []
-            for attempt, (max_new_tokens, retry_number) in enumerate(attempts):
-                # Seeded attempts are reached only after the final budget was truncated.
+            for attempt, (max_new_tokens, retry_setting) in enumerate(attempts):
+                # Decoding changes are reached only after the final budget was truncated.
                 kwargs = {"messages": ner_input_message, "max_completion_tokens": max_new_tokens}
-                if retry_number is not None:
-                    kwargs["seed"] = _length_retry_seed(self.llm_model, retry_number)
+                if retry_setting == "seed":
+                    kwargs["seed"] = _length_retry_seed(self.llm_model)
+                elif retry_setting is not None:
+                    kwargs["frequency_penalty"] = retry_setting
+                    length_retry_penalties_attempted.append(retry_setting)
                 if previous_was_length:
                     length_retry_count += 1
                 attempt_count += 1
+                openie_attempt_settings.append({key: value for key, value in kwargs.items()
+                                                if key != "messages"})
                 raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
                 metadata = dict(response_metadata)
                 metadata.update({
@@ -121,9 +129,13 @@ class OpenIE:
                     'openie_attempt_count': attempt_count,
                     'length_retry_count': length_retry_count,
                     'length_observed_count': length_observed_count,
+                    'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
+                    'openie_attempt_settings': list(openie_attempt_settings),
                 })
-                if retry_number is not None:
+                if retry_setting == "seed":
                     metadata['length_retry_seed'] = kwargs['seed']
+                elif retry_setting is not None:
+                    metadata['length_retry_frequency_penalty'] = retry_setting
                 if metadata.get('finish_reason') == 'length':
                     length_observed_count += 1
                     metadata['length_observed_count'] = length_observed_count
@@ -163,6 +175,8 @@ class OpenIE:
                 'openie_attempt_count': attempt_count,
                 'length_retry_count': length_retry_count,
                 'length_observed_count': length_observed_count,
+                'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
+                'openie_attempt_settings': list(openie_attempt_settings),
             })
             return NerRawOutput(
                 chunk_id=chunk_key,
@@ -195,16 +209,24 @@ class OpenIE:
         triple_max_tokens = _safe_env_int('HIPPO_OPENIE_TRIPLE_MAX_TOKENS', 2048)
         length_observed_count = 0
         length_retry_count = 0
+        length_retry_penalties_attempted = []
+        openie_attempt_settings = []
         attempt_count = 0
         try:
             # LLM INFERENCE
-            for attempt in range(_MAX_LENGTH_RETRIES + 1):
+            for attempt in range(len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 2):
                 kwargs = {"messages": messages, "max_completion_tokens": triple_max_tokens}
-                if attempt:
-                    kwargs['seed'] = _length_retry_seed(self.llm_model, attempt)
+                if attempt == 1:
+                    kwargs['seed'] = _length_retry_seed(self.llm_model)
+                elif attempt > 1:
+                    penalty = _LENGTH_RETRY_FREQUENCY_PENALTIES[attempt - 2]
+                    kwargs['frequency_penalty'] = penalty
+                    length_retry_penalties_attempted.append(penalty)
                 if attempt:
                     length_retry_count += 1
                 attempt_count += 1
+                openie_attempt_settings.append({key: value for key, value in kwargs.items()
+                                                if key != "messages"})
                 raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
                 metadata = dict(response_metadata)
                 metadata.update({
@@ -212,14 +234,18 @@ class OpenIE:
                     'openie_attempt_count': attempt_count,
                     'length_retry_count': length_retry_count,
                     'length_observed_count': length_observed_count,
+                    'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
+                    'openie_attempt_settings': list(openie_attempt_settings),
                 })
-                if attempt:
+                if attempt == 1:
                     metadata['length_retry_seed'] = kwargs['seed']
+                elif attempt > 1:
+                    metadata['length_retry_frequency_penalty'] = kwargs['frequency_penalty']
                 if metadata.get('finish_reason') != 'length':
                     break
                 length_observed_count += 1
                 metadata['length_observed_count'] = length_observed_count
-                if attempt == _MAX_LENGTH_RETRIES:
+                if attempt == len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 1:
                     raise RuntimeError(
                         f"Triple extraction chunk {chunk_key} remains truncated "
                         f"(finish_reason=length) after {attempt + 1} attempts"
@@ -236,6 +262,8 @@ class OpenIE:
                 'openie_attempt_count': attempt_count,
                 'length_retry_count': length_retry_count,
                 'length_observed_count': length_observed_count,
+                'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
+                'openie_attempt_settings': list(openie_attempt_settings),
             })
             return TripleRawOutput(
                 chunk_id=chunk_key,

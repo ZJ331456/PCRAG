@@ -137,10 +137,18 @@ class OpenIEOrderTests(unittest.TestCase):
         self.assertNotIn("seed", llm.calls[0])
         self.assertNotIn("seed", llm.calls[1])
         self.assertEqual(llm.calls[2]["seed"], 1)
+        self.assertNotIn("frequency_penalty", llm.calls[2])
         self.assertEqual(result.metadata["finish_reason"], "stop")
         self.assertEqual(result.metadata["ner_max_tokens_used"], 1024)
         self.assertEqual(result.metadata["length_observed_count"], 2)
         self.assertEqual(result.metadata["length_retry_count"], 2)
+        self.assertEqual(result.metadata["length_retry_penalties_attempted"], [])
+        self.assertEqual(result.metadata["length_retry_seed"], 1)
+        self.assertEqual(result.metadata["openie_attempt_settings"], [
+            {"max_completion_tokens": 512},
+            {"max_completion_tokens": 1024},
+            {"max_completion_tokens": 1024, "seed": 1},
+        ])
         self.assertEqual(result.metadata["openie_attempt_count"], 3)
 
     def test_triples_discard_parseable_length_and_retry_at_same_cap(self):
@@ -166,10 +174,46 @@ class OpenIEOrderTests(unittest.TestCase):
         self.assertEqual([call["max_completion_tokens"] for call in llm.calls], [2048, 2048])
         self.assertNotIn("seed", llm.calls[0])
         self.assertEqual(llm.calls[1]["seed"], 1)
+        self.assertNotIn("frequency_penalty", llm.calls[1])
         self.assertEqual(result.metadata["finish_reason"], "stop")
         self.assertEqual(result.metadata["length_observed_count"], 1)
         self.assertEqual(result.metadata["length_retry_count"], 1)
+        self.assertEqual(result.metadata["length_retry_penalties_attempted"], [])
+        self.assertEqual(result.metadata["length_retry_seed"], 1)
         self.assertEqual(result.metadata["openie_attempt_count"], 2)
+
+    def test_triples_retry_with_stronger_penalty_only_after_repeated_truncation(self):
+        class FakeLLM:
+            def __init__(self):
+                self.calls = []
+                self.responses = iter([
+                    ('{"triples":[["partial-0","r","x"]]}', "length", True),
+                    ('{"triples":[["partial-seed","r","x"]]}', "length", False),
+                    ('{"triples":[["partial-02","r","x"]]}', "length", False),
+                    ('{"triples":[["complete","r","x"]]}', "stop", False),
+                ])
+
+            def infer(self, **kwargs):
+                self.calls.append(kwargs)
+                text, finish_reason, cache_hit = next(self.responses)
+                return text, {"finish_reason": finish_reason}, cache_hit
+
+        llm = FakeLLM()
+        result = openie_openai.OpenIE(llm, max_workers=1).triple_extraction("a", "passage", ["x"])
+
+        self.assertEqual(result.triples, [["complete", "r", "x"]])
+        self.assertEqual([call.get("frequency_penalty") for call in llm.calls],
+                         [None, None, 0.2, 0.5])
+        self.assertEqual([call.get("seed") for call in llm.calls], [None, 1, None, None])
+        self.assertEqual(result.metadata["length_retry_penalties_attempted"], [0.2, 0.5])
+        self.assertEqual(result.metadata["length_retry_frequency_penalty"], 0.5)
+        self.assertEqual(result.metadata["length_observed_count"], 3)
+        self.assertEqual(result.metadata["openie_attempt_settings"], [
+            {"max_completion_tokens": 2048},
+            {"max_completion_tokens": 2048, "seed": 1},
+            {"max_completion_tokens": 2048, "frequency_penalty": 0.2},
+            {"max_completion_tokens": 2048, "frequency_penalty": 0.5},
+        ])
 
     def test_ner_that_remains_truncated_fails_the_batch(self):
         class AlwaysLengthLLM:
@@ -188,11 +232,15 @@ class OpenIEOrderTests(unittest.TestCase):
         self.assertEqual(result.unique_entities, [])
         self.assertEqual(result.metadata["finish_reason"], "length")
         self.assertIn("finish_reason=length", result.metadata["error"])
-        self.assertEqual(result.metadata["length_observed_count"], 4)
-        self.assertEqual(result.metadata["length_retry_count"], 3)
+        self.assertEqual(result.metadata["length_observed_count"], 5)
+        self.assertEqual(result.metadata["length_retry_count"], 4)
         self.assertEqual([call["max_completion_tokens"] for call in llm.calls],
-                         [512, 1024, 1024, 1024])
-        self.assertEqual([call.get("seed") for call in llm.calls], [None, None, 1, 2])
+                         [512, 1024, 1024, 1024, 1024])
+        self.assertEqual([call.get("frequency_penalty") for call in llm.calls],
+                         [None, None, None, 0.2, 0.5])
+        self.assertEqual([call.get("seed") for call in llm.calls],
+                         [None, None, 1, None, None])
+        self.assertEqual(result.metadata["length_retry_penalties_attempted"], [0.2, 0.5])
 
         with patch.object(openie_openai, "tqdm", QuietProgress):
             with self.assertRaisesRegex(RuntimeError, "NER failed for 1 chunk"):
@@ -215,9 +263,13 @@ class OpenIEOrderTests(unittest.TestCase):
         self.assertEqual(result.triples, [])
         self.assertEqual(result.metadata["finish_reason"], "length")
         self.assertIn("finish_reason=length", result.metadata["error"])
-        self.assertEqual(result.metadata["length_observed_count"], 3)
-        self.assertEqual(result.metadata["length_retry_count"], 2)
-        self.assertEqual([call.get("seed") for call in llm.calls], [None, 8, 9])
+        self.assertEqual(result.metadata["length_observed_count"], 4)
+        self.assertEqual(result.metadata["length_retry_count"], 3)
+        self.assertEqual([call.get("frequency_penalty") for call in llm.calls],
+                         [None, None, 0.2, 0.5])
+        self.assertEqual([call.get("seed") for call in llm.calls],
+                         [None, 8, None, None])
+        self.assertEqual(result.metadata["length_retry_penalties_attempted"], [0.2, 0.5])
 
         extractor.ner = lambda chunk_key, passage: NerRawOutput(chunk_key, "{}", ["x"], {})
         with patch.object(openie_openai, "tqdm", QuietProgress):

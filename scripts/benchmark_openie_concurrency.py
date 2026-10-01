@@ -229,6 +229,13 @@ def run(args: argparse.Namespace) -> int:
     stage_metadata = [row[stage]["metadata"] for row in rows for stage in ("ner", "triple")
                       if row[stage] is not None]
     length_retry_requests = sum(meta.get("length_retry_count", 0) for meta in stage_metadata)
+    frequency_penalty_retry_requests = sum(
+        len(meta.get("length_retry_penalties_attempted", [])) for meta in stage_metadata
+    )
+    frequency_penalties_used = sorted({
+        penalty for meta in stage_metadata
+        for penalty in meta.get("length_retry_penalties_attempted", [])
+    })
     length_recovered_stages = sum(
         bool(meta.get("length_observed_count")) and
         meta.get("finish_reason") != "length" and not meta.get("error")
@@ -281,6 +288,8 @@ def run(args: argparse.Namespace) -> int:
         "request_stats": request_stats,
         "ner_parse_retries_to_1024": parse_retries,
         "length_retry_requests": length_retry_requests,
+        "frequency_penalty_retry_requests": frequency_penalty_retry_requests,
+        "frequency_penalties_used": frequency_penalties_used,
         "length_recovered_stages": length_recovered_stages,
         "parsed_output_sha256": parsed_sha256,
         "problems": problems,
