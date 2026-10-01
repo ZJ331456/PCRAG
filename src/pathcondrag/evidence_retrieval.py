@@ -172,6 +172,8 @@ class EvidenceRetrieval:
         self.max_searches = int(getattr(self.cfg, "evidence_max_searches", 20))
         self.rank_constant = float(getattr(self.cfg, "evidence_local_rank_constant", 10.0))
         self._documents: Dict[int, str] = {}
+        self._plan_diagnostics: Dict[str, dict] = {}
+        self._verification_diagnostics: Dict[str, dict] = {}
 
     def _document(self, doc_id: int) -> str:
         if doc_id not in self._documents:
@@ -215,6 +217,14 @@ class EvidenceRetrieval:
                 "stay as placeholders ${s1.answer}, never guess an intermediate person, "
                 "place or answer. List every referenced node in depends_on. Use no other "
                 "references. Independent comparison branches should be independent nodes. "
+                "Preserve every nested location/relation qualifier in the question. "
+                "Resolve the innermost unknown entity before asking the final relationship. "
+                "For example, 'When was the person that A was compared with hired by B?' "
+                "starts with 'Who was A compared with?', followed by 'When was ${s1.answer} hired by B?'. "
+                "Do not carry 'hired by B' into the first subquestion. "
+                "For a region north of the region containing X, first locate X, then ask "
+                "for the region north of ${s1.answer}; do not replace this with north of X. "
+                "Every depends_on ID must appear literally as ${ID.answer} in that node's question. "
                 "No cycles. A node's answer_type describes what its passage must establish." )},
             {"role": "user", "content": (
                 f"Question: {query}\nMaximum nodes: {max_nodes}\n"
@@ -223,10 +233,26 @@ class EvidenceRetrieval:
                 '"question":"Where was ${s1.answer} born?","depends_on":["s1"],'
                 '"answer_type":"place"}]}\nUse only the input question to construct the plan.' )},
         ]
-        payload, reason = self._infer_object(messages)
-        if reason:
-            return [], reason
-        return validate_plan(payload, max_nodes)
+        diagnostics = {"attempts": 0, "outputs": [], "validation_errors": []}
+        self._plan_diagnostics[query] = diagnostics
+        for attempt in range(2):
+            payload, reason = self._infer_object(messages)
+            diagnostics["attempts"] += 1
+            diagnostics["outputs"].append(payload)
+            nodes, reason = ([], reason) if reason else validate_plan(payload, max_nodes)
+            if not reason:
+                return nodes, None
+            diagnostics["validation_errors"].append(reason)
+            if attempt == 0:
+                messages = messages + [
+                    {"role": "assistant", "content": json.dumps(payload or {}, ensure_ascii=False)},
+                    {"role": "user", "content": (
+                        f"The plan failed validation: {reason}. Correct the JSON plan, using at most {max_nodes} nodes. "
+                        "Every declared dependency must occur as a literal ${ID.answer} placeholder. "
+                        "Keep the original question's nested qualifiers, keep unknown entities unbound, "
+                        "and return only the corrected JSON. Do not add guessed answers.")},
+                ]
+        return [], reason
 
     def _verify(self, question: str, answer_type: str, docs: Dict[int, str]):
         messages = [
@@ -235,6 +261,9 @@ class EvidenceRetrieval:
                 "provided passages. Output ONLY JSON {hypotheses:[{answer,evidence,"
                 "doc_id,confidence}]}. evidence must be copied exactly from that passage "
                 "and contain the literal answer. doc_id must match its D-number. "
+                "Include the sentence that directly answers the subquestion. "
+                "If a full name appears before the relevant sentence, include that preceding "
+                "sentence in the same contiguous quote, or use the answer's literal surface in the quote. "
                 "Check that the quoted sentence establishes the requested relationship; "
                 "a mentioned name alone is insufficient. Return an empty hypotheses list "
                 "when unsupported. Retain up to 3 genuinely different supported answers. "
@@ -243,11 +272,32 @@ class EvidenceRetrieval:
                 f"Subquestion: {question}\nAnswer type: {answer_type}\n\n" +
                 "\n\n".join(f"[D{k}]\n{text}" for k, text in docs.items()))},
         ]
-        payload, reason = self._infer_object(messages)
-        if reason:
-            return [], [{"reason": reason}], reason
-        accepted, rejected = verify_hypotheses(payload, docs)
-        return accepted, rejected, None
+        key = question + "::" + ",".join(map(str, docs))
+        diagnostics = {"attempts": 0, "outputs": []}
+        self._verification_diagnostics[key] = diagnostics
+        all_rejected = []
+        for attempt in range(2):
+            payload, reason = self._infer_object(messages)
+            diagnostics["attempts"] += 1
+            diagnostics["outputs"].append(payload)
+            if reason:
+                accepted, rejected = [], [{"reason": reason}]
+            else:
+                accepted, rejected = verify_hypotheses(payload, docs)
+            all_rejected.extend(rejected)
+            if accepted or (not rejected and not reason):
+                return accepted, all_rejected, reason
+            if attempt == 0:
+                messages = messages + [
+                    {"role": "assistant", "content": json.dumps(payload or {}, ensure_ascii=False)},
+                    {"role": "user", "content": (
+                        "The proposed citations failed validation: " + json.dumps(rejected, ensure_ascii=False) +
+                        ". Recheck the original subquestion and the provided passages. "
+                        "Return a corrected hypothesis only if the exact original quote contains the literal answer "
+                        "and establishes the requested relationship. Otherwise return {\"hypotheses\":[]}. "
+                        "Do not change passage text or infer unsupported relationships.")},
+                ]
+        return [], all_rejected, reason
 
     def _candidate(self, state: dict, doc_id: int) -> dict:
         candidates = state["evidence_candidates"]
@@ -289,7 +339,7 @@ class EvidenceRetrieval:
             other = set(normalized_text(static).split())
             sim = len(tokens & other) / max(1, len(tokens | other))
             if sim > best[0]:
-                best = (sim, f"s{index + 1}")
+                best = (sim, f"static:s{index + 1}")
         return best[1] if best[0] >= 0.25 else fallback
 
     def _prepare_state(self, state: dict):
@@ -305,13 +355,13 @@ class EvidenceRetrieval:
                 self._candidate(state, int(doc_id))["base_score"] = score
         static = [q for q in state.get("static_sub_questions", []) if isinstance(q, str) and q.strip()]
         for index, question in enumerate(static[:4]):
-            self._add_route(state, f"static:{index + 1}", f"s{index + 1}", question)
+            self._add_route(state, f"static:{index + 1}", f"static:s{index + 1}", question)
         pcqd = state.get("pcqd_sub_questions") or []
         for index, item in enumerate(pcqd[:4]):
             question = item.get("question", "") if isinstance(item, dict) else str(item)
             if not question.strip():
                 continue
-            goal = self._goal_for_question(question, static, f"p{index + 1}")
+            goal = self._goal_for_question(question, static, f"pcqd:p{index + 1}")
             self._add_route(state, f"pcqd:{index + 1}", goal, question)
 
     @staticmethod
@@ -353,7 +403,7 @@ class EvidenceRetrieval:
                                 "requirements": list(node["depends_on"])})
                             continue
                         requirements = dict(beam["bindings"])
-                        ids = self._add_route(state, f"dag:{node['id']}", node["id"], question, requirements)
+                        ids = self._add_route(state, f"dag:{node['id']}", f"dag:{node['id']}", question, requirements)
                         if not ids:
                             continue
                         # The verifier sees exactly these spans, not unbounded full documents.
@@ -367,7 +417,10 @@ class EvidenceRetrieval:
             for task, (hypotheses, rejected, reason) in zip(tasks, results):
                 state, node, beam_index, ids, question, docs = task
                 trace = state["evidence_trace"]
-                trace["llm_verification_calls"] += 1
+                diagnostic_key = question + "::" + ",".join(map(str, docs))
+                verification_diagnostic = self._verification_diagnostics.get(diagnostic_key, {"attempts": 1})
+                trace["llm_verification_calls"] += verification_diagnostic["attempts"]
+                trace.setdefault("verification_outputs", []).append(dict(verification_diagnostic, node=node["id"]))
                 trace["rejected_hypotheses"].extend(dict(item, node=node["id"]) for item in rejected)
                 if reason:
                     trace["semantic_failures"].append({"node": node["id"], "reason": reason})
@@ -423,7 +476,7 @@ class EvidenceRetrieval:
             state["_evidence_winning_bindings"] = best["bindings"]
             for node_id, hyp in best["proofs"].items():
                 candidate = self._candidate(state, hyp["doc_id"])
-                candidate["verified"].append(dict(hyp, goal=node_id))
+                candidate["verified"].append(dict(hyp, goal=f"dag:{node_id}"))
 
     @staticmethod
     def _goal_scores(candidate: dict, bindings: dict) -> Dict[str, float]:
@@ -467,7 +520,9 @@ class EvidenceRetrieval:
                 requests.append((self._plan, (state["query"], int(ctx.get("hops", 1)))))
             for state, (plan, reason) in zip(states, self._collect_jobs(executor, requests)):
                 trace = state["evidence_trace"]
-                trace["llm_plan_calls"] += 1
+                planning_diagnostic = self._plan_diagnostics.get(state["query"], {"attempts": 1})
+                trace["llm_plan_calls"] += planning_diagnostic["attempts"]
+                trace["planning_outputs"] = planning_diagnostic
                 trace["plan"] = plan
                 state["_evidence_plan"] = plan
                 if reason:
@@ -506,7 +561,7 @@ class EvidenceRetrieval:
         covered, selected, selected_tokens, details = {}, [], [], []
         remaining = set(candidates)
         goal_ids = set(goal for goals in goal_by_id.values() for goal in goals)
-        goal_total = max(1, min(4, len(goal_ids)))
+        goal_total = max(1, len(goal_ids))
         coverage_weight = float(getattr(self.cfg, "evidence_coverage_weight", 0.45))
         relation_weight = float(getattr(self.cfg, "evidence_relation_weight", 0.25))
         redundancy_weight = float(getattr(self.cfg, "evidence_redundancy_weight", 0.15))

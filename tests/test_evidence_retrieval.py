@@ -142,10 +142,11 @@ class EvidenceRetrievalTests(unittest.TestCase):
         self.assertNotIn("forbidden", str(rag.llm_model.calls))
 
     def test_semantic_failure_is_recorded_and_http_error_propagates(self):
-        rag = FakeRAG(stage=4, responses=["not JSON"])
+        rag = FakeRAG(stage=4, responses=["not JSON", "still not JSON"])
         state = state_fixture()
         module.EvidenceRetrieval(rag).process_window([state])
         self.assertEqual(state["evidence_trace"]["semantic_failures"][0]["reason"], "invalid_json_object")
+        self.assertEqual(state["evidence_trace"]["llm_plan_calls"], 2)
         rag = FakeRAG(stage=4, responses=[ConnectionError("HTTP failed")])
         with self.assertRaisesRegex(ConnectionError, "HTTP failed"):
             module.EvidenceRetrieval(rag).process_window([state_fixture()])
@@ -176,11 +177,30 @@ class EvidenceRetrievalTests(unittest.TestCase):
         self.assertEqual(state["evidence_trace"]["search_count"], 2)
 
     def test_truncated_response_records_semantic_fallback(self):
-        rag = FakeRAG(stage=4, responses=[(PLAN, {"finish_reason": "length"})])
+        rag = FakeRAG(stage=4, responses=[(PLAN, {"finish_reason": "length"})] * 2)
         state = state_fixture()
         module.EvidenceRetrieval(rag).process_window([state])
         self.assertEqual(state["evidence_trace"]["semantic_failures"][0]["reason"], "truncated_response")
         self.assertEqual(state["evidence_trace"]["llm_verification_calls"], 0)
+
+    def test_invalid_plan_has_one_bounded_repair_then_executes_dependency(self):
+        rag = FakeRAG(stage=4, responses=["bad JSON", PLAN, ANSWER_ALPHA, ANSWER_ROME])
+        state = state_fixture()
+        module.EvidenceRetrieval(rag).process_window([state])
+        trace = state["evidence_trace"]
+        self.assertEqual(trace["llm_plan_calls"], 2)
+        self.assertEqual(trace["bindings"], {"s1": "Alpha", "s2": "Rome"})
+        self.assertEqual(trace["planning_outputs"]["validation_errors"], ["invalid_json_object"])
+
+    def test_citation_repair_keeps_original_rejection_and_exact_proof(self):
+        invalid = '{"hypotheses":[{"answer":"Mallory","doc_id":"D0","evidence":"Alpha wrote Work X in 1990."}]}'
+        rag = FakeRAG(stage=4, responses=[PLAN, invalid, ANSWER_ALPHA, ANSWER_ROME])
+        state = state_fixture()
+        module.EvidenceRetrieval(rag).process_window([state])
+        trace = state["evidence_trace"]
+        self.assertEqual(trace["llm_verification_calls"], 3)
+        self.assertEqual(trace["bindings"]["s1"], "Alpha")
+        self.assertEqual(trace["rejected_hypotheses"][0]["reason"], "answer_not_supported_in_quote")
 
     def test_embeddings_remain_on_main_thread_with_llm_executor(self):
         rag = FakeRAG(stage=4, responses=[PLAN, ANSWER_ALPHA, ANSWER_ROME])
