@@ -39,16 +39,18 @@ class QuerySolution:
     answer: str = None
     gold_answers: List[str] = None
     gold_docs: Optional[List[str]] = None
+    retrieval_trace: Optional[Dict[str, Any]] = None
 
 
-    def to_dict(self):
+    def to_dict(self, top_k: int = 10):
         return {
             "question": self.question,
             "answer": self.answer,
             "gold_answers": self.gold_answers,
-            "docs": self.docs[:5],
-            "doc_scores": [round(v, 4) for v in self.doc_scores.tolist()[:5]]  if self.doc_scores is not None else None,
+            "docs": self.docs[:top_k],
+            "doc_scores": [float(v) for v in self.doc_scores[:top_k]] if self.doc_scores is not None else None,
             "gold_docs": self.gold_docs,
+            "retrieval_trace": self.retrieval_trace or {},
         }
 
 def text_processing(text):

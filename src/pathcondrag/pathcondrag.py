@@ -59,6 +59,10 @@ class PCRAG(BaseRAG):
         )
 
         self.pcrag_config: PCRAGConfig = self.global_config
+        self.evidence_runtime = None
+        if self.pcrag_config.improvement_stage >= 2:
+            from .evidence_retrieval import EvidenceRetrieval
+            self.evidence_runtime = EvidenceRetrieval(self)
         self._query_hop_overrides: Optional[List[int]] = None
         self._query_hop_override_source: Optional[str] = None
 
@@ -425,7 +429,8 @@ class PCRAG(BaseRAG):
     def _iter_retrieval_states(self, queries: List[str]):
         """Bound outstanding LLM jobs to one small, ordered query window."""
         workers = self.pcrag_config.llm_prefetch_workers
-        if workers <= 1 or not self.pcrag_config.use_query_decomposition:
+        evidence_runtime = getattr(self, "evidence_runtime", None)
+        if (workers <= 1 or not self.pcrag_config.use_query_decomposition) and evidence_runtime is None:
             for q_idx, query in enumerate(queries):
                 yield {"query_idx": q_idx, "query": query}
             return
@@ -433,18 +438,23 @@ class PCRAG(BaseRAG):
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pcrag-qd") as executor:
             for start in range(0, len(queries), workers):
                 states: List[Dict[str, Any]] = []
-                # Prepare the entire window on the caller thread before starting
-                # QD jobs.  Reranking can itself use the LLM, so overlapping
-                # preparation with workers would exceed the request budget.
+                # Embed/read scores on the caller thread. Only independent LLM
+                # fact-filter calls enter the bounded worker pool.
                 for q_idx in range(start, min(start + workers, len(queries))):
                     query = queries[q_idx]
                     query_fact_scores = self.get_fact_scores(query)
-                    top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
                     state: Dict[str, Any] = {
                         "query_idx": q_idx,
                         "query": query,
-                        "rerank": (query_fact_scores, top_k_fact_indices, top_k_facts, rerank_log),
+                        "fact_scores": query_fact_scores,
+                        "rerank_future": executor.submit(self.rerank_facts, query, query_fact_scores),
                     }
+                    states.append(state)
+                for state in states:
+                    q_idx, query = state["query_idx"], state["query"]
+                    query_fact_scores = state.pop("fact_scores")
+                    top_k_fact_indices, top_k_facts, rerank_log = state.pop("rerank_future").result()
+                    state["rerank"] = (query_fact_scores, top_k_fact_indices, top_k_facts, rerank_log)
                     if top_k_facts:
                         hop_override = (
                             self._query_hop_overrides[q_idx]
@@ -462,7 +472,14 @@ class PCRAG(BaseRAG):
                         _base_ids, _base_scores, ctx = base
                         if ctx.get("_qd_deferred") and int(ctx["hops"]) >= self.pcrag_config.qd_min_hops:
                             state["qd_plan"] = True
-                    states.append(state)
+                    elif evidence_runtime is not None:
+                        ids, scores = self.dense_passage_retrieval(query)
+                        hops = (self._query_hop_overrides[q_idx] if self._query_hop_overrides is not None
+                                else self._estimate_query_hops(query, top_k_facts=[]))
+                        state["base"] = (ids, scores, {"hops": hops, "seed_entities": [],
+                                                     "seed_distribution": {}, "bridges_by_seed": {}})
+                        if self.pcrag_config.use_query_decomposition and hops >= self.pcrag_config.qd_min_hops:
+                            state["qd_plan"] = True
 
                 # Phase 1: parallelize independent static decomposition calls.
                 for state in states:
@@ -502,6 +519,7 @@ class PCRAG(BaseRAG):
                             seed_distribution=ctx["seed_distribution"],
                             bridges_by_seed=ctx["bridges_by_seed"],
                         )
+                        state["hint_diagnostics"] = dict(getattr(self, "_last_pcqd_hint_stats", {}))
 
                 # Phase 3: parallelize PCQD calls only where the old serial
                 # path would make one, then finalize every query in input order.
@@ -516,6 +534,8 @@ class PCRAG(BaseRAG):
                 for state in states:
                     if "pcqd_future" in state:
                         state["pcqd_sub_questions"] = state.pop("pcqd_future").result()
+                if evidence_runtime is not None:
+                    evidence_runtime.process_window(states, executor)
                 for state in states:
                     yield state
 
@@ -610,11 +630,20 @@ class PCRAG(BaseRAG):
                     self._increment_counter(self.retrieval_diagnostics["fallback_strategy_counter"], "unknown")
                 noop_stats_a = {}
                 noop_stats_b = {}
+                trace = {"improvement_stage": getattr(self.pcrag_config, "improvement_stage", 0),
+                         "fact_filter": rerank_log, "dense_fallback": fallback_to_dpr,
+                         "assigned_hops": self._query_hop_overrides[q_idx] if self._query_hop_overrides is not None else None}
+                evidence_runtime = getattr(self, "evidence_runtime", None)
+                if evidence_runtime is not None:
+                    sorted_doc_ids, sorted_doc_scores, evidence_trace = evidence_runtime.finalize(
+                        query, sorted_doc_ids, sorted_doc_scores, state.get("base", (None, None, {}))[2], state)
+                    trace["evidence"] = evidence_trace
                 retrieval_results.append(
                     QuerySolution(
                         question=query,
                         docs=[self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]],
                         doc_scores=sorted_doc_scores[:num_to_retrieve],
+                        retrieval_trace=trace,
                     )
                 )
                 self.retrieval_diagnostics["per_query"].append(
@@ -708,15 +737,28 @@ class PCRAG(BaseRAG):
                 ctx=ctx,
             )
             ctx.update(mpce_stats)
-
-
-
+            trace = {"improvement_stage": getattr(self.pcrag_config, "improvement_stage", 0),
+                     "fact_filter": rerank_log, "dense_fallback": False,
+                     "hops": int(ctx["hops"]), "seed_entities": ctx["seed_entities"],
+                     "fact_seed_distribution": ctx.get("fact_seed_distribution", {}),
+                     "static_sub_questions": state.get("static_sub_questions", []),
+                     "pcqd_sub_questions": state.get("pcqd_sub_questions", []),
+                     "pcqd_validation": getattr(self, "_pcqd_diagnostics_by_query", {}).get(query, {}),
+                     "path_hints": state.get("path_hints", ([], 0.0))[0],
+                     "hint_diagnostics": state.get("hint_diagnostics", {}),
+                     "selected_path_candidates": path_stats.get("selected_path_candidates", [])}
+            evidence_runtime = getattr(self, "evidence_runtime", None)
+            if evidence_runtime is not None:
+                sorted_doc_ids, sorted_doc_scores, evidence_trace = evidence_runtime.finalize(
+                    query, sorted_doc_ids, sorted_doc_scores, ctx, state)
+                trace["evidence"] = evidence_trace
             top_docs = [
                 self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"]
                 for idx in sorted_doc_ids[:num_to_retrieve]
             ]
             top_scores = sorted_doc_scores[:num_to_retrieve]
-            retrieval_results.append(QuerySolution(question=query, docs=top_docs, doc_scores=top_scores))
+            retrieval_results.append(QuerySolution(question=query, docs=top_docs, doc_scores=top_scores,
+                                                    retrieval_trace=trace))
 
             hops = int(ctx.get("hops", 2))
             self.retrieval_diagnostics["hop_counter"][str(hops)] += 1
@@ -1246,7 +1288,7 @@ class PCRAG(BaseRAG):
         if not candidates:
             return ""
         best_ent = min(candidates.items(), key=lambda x: (-x[1], x[0]))[0]
-        return self._entity_surface(best_ent)
+        return self._grounded_entity_surface(best_ent)
 
     @staticmethod
     def _rewrite_sub_question_with_anchor(sub_q: str, anchor_surface: str) -> str:
@@ -1443,6 +1485,22 @@ class PCRAG(BaseRAG):
         hops = int(hop_override) if hop_override is not None else self._estimate_query_hops(query, top_k_facts=top_k_facts)
         seed_entities = self._extract_seed_entities_from_facts(top_k_facts)
         seed_distribution = self._build_seed_distribution(query, seed_entities, hops)
+        fact_seed_distribution = {}
+        if getattr(self.pcrag_config, "improvement_stage", 0) >= 2:
+            # Retain relation relevance that the original reset discarded.
+            # Correct for endpoint frequency, normalize, then blend with the
+            # existing semantic entity prior without changing total reset mass.
+            for fact_idx, fact in zip(top_k_fact_indices, top_k_facts):
+                relevance = max(0.0, float(query_fact_scores[int(fact_idx)]))
+                for entity in self._extract_seed_entities_from_facts([fact]):
+                    if entity in seed_distribution:
+                        degree = max(1, len(self.ent_node_to_chunk_ids.get(entity, [])))
+                        fact_seed_distribution[entity] = fact_seed_distribution.get(entity, 0.0) + relevance / math.sqrt(degree)
+            total = sum(fact_seed_distribution.values())
+            if total > 0:
+                fact_seed_distribution = {k: v / total for k, v in fact_seed_distribution.items()}
+                seed_distribution = {k: 0.5 * v + 0.5 * fact_seed_distribution.get(k, 0.0)
+                                     for k, v in seed_distribution.items()}
 
         # QCAPPR reset initialization
         for ent, prob in seed_distribution.items():
@@ -1499,6 +1557,7 @@ class PCRAG(BaseRAG):
             "hops": hops,
             "seed_entities": list(seed_entities),
             "seed_distribution": seed_distribution,
+            "fact_seed_distribution": fact_seed_distribution,
             "bridges_by_seed": bridges_by_seed,
             "bridge_count": bridge_count,
             "iterative_used": False,
@@ -1648,10 +1707,17 @@ class PCRAG(BaseRAG):
             return ""
         return ent_key[7:] if ent_key.startswith("entity-") else ent_key
 
-    @classmethod
-    def _entity_supported_in_evidence(cls, ent_key: str, evidence_text: str) -> bool:
-        ent = cls._normalize_text(cls._entity_surface(ent_key))
-        evidence = cls._normalize_text(evidence_text)
+    def _grounded_entity_surface(self, ent_key: str) -> str:
+        if getattr(self.pcrag_config, "improvement_stage", 0) >= 1:
+            label = self._entity_label(ent_key)
+            if re.fullmatch(r"(?:entity-)?[0-9a-fA-F]{32}", label or ""):
+                return ""
+            return label
+        return self._entity_surface(ent_key)
+
+    def _entity_supported_in_evidence(self, ent_key: str, evidence_text: str) -> bool:
+        ent = self._normalize_text(self._grounded_entity_surface(ent_key))
+        evidence = self._normalize_text(evidence_text)
         if not ent or not evidence:
             return False
         return ent in evidence
@@ -1753,6 +1819,8 @@ class PCRAG(BaseRAG):
         ]
 
         structured_sub_qs: List[Dict[str, Any]] = []
+        raw = ""
+        validation_rejections = []
         try:
             # Avoid response_format=json_object — guided decoding can kill vLLM.
             infer_ret = self.llm_model.infer(
@@ -1797,6 +1865,9 @@ class PCRAG(BaseRAG):
                         sh = item.get("supporting_hint_ids", [])
                         if not isinstance(sh, list):
                             sh = []
+                        invalid_hint_reference = any(
+                            isinstance(x, bool) or not str(x).strip().isdigit()
+                            or int(x) >= len(path_hints) for x in sh)
                         conf = item.get("confidence", 0.5)
                         try:
                             conf = float(conf)
@@ -1807,6 +1878,7 @@ class PCRAG(BaseRAG):
                                 "question": q,
                                 "grounded_entities": [str(x) for x in ge if str(x).strip()],
                                 "supporting_hint_ids": [int(x) for x in sh if str(x).strip().isdigit()],
+                                "invalid_hint_reference": invalid_hint_reference,
                                 "confidence": min(1.0, max(0.0, conf)),
                             }
                         )
@@ -1828,7 +1900,36 @@ class PCRAG(BaseRAG):
                 for q in fallback_qs
             ]
 
+        if getattr(self.pcrag_config, "improvement_stage", 0) >= 1:
+            validated = []
+            for item in structured_sub_qs:
+                ids = item["supporting_hint_ids"]
+                if item.get("invalid_hint_reference") or any(type(i) is not int or i < 0 or i >= len(path_hints) for i in ids):
+                    validation_rejections.append({"question": item["question"], "reason": "invalid_hint_reference"})
+                    continue
+                entities = item["grounded_entities"]
+                if entities and not ids:
+                    # Repair omitted citations only using exact supported labels.
+                    ids = [i for i, h in enumerate(path_hints) if any(
+                        self._normalize_text(ent) in self._normalize_text(str(h.get("evidence", "")))
+                        for ent in entities)]
+                referenced = " ".join(str(path_hints[i].get("evidence", "")) for i in ids)
+                if any(not self._normalize_text(ent) or
+                       self._normalize_text(ent) not in self._normalize_text(referenced)
+                       or re.fullmatch(r"(?:entity-)?[0-9a-fA-F]{32}", ent)
+                       for ent in entities):
+                    validation_rejections.append({"question": item["question"], "reason": "unsupported_entity_binding"})
+                    continue
+                item["supporting_hint_ids"] = ids
+                item["evidence_validated"] = True
+                validated.append(item)
+            structured_sub_qs = validated
         structured_sub_qs = structured_sub_qs[:max_sub_questions]
+        if not hasattr(self, "_pcqd_diagnostics_by_query"):
+            self._pcqd_diagnostics_by_query = {}
+        self._pcqd_diagnostics_by_query[query] = {"raw_response": raw,
+                                                "validation_rejections": validation_rejections,
+                                                "validated_sub_questions": structured_sub_qs}
         if self.pcrag_config.qd_cache_decompositions:
             self._pcqd_cache[cache_key] = structured_sub_qs
         return structured_sub_qs
@@ -1840,6 +1941,9 @@ class PCRAG(BaseRAG):
         seed_distribution: Dict[str, float],
         bridges_by_seed: Dict[str, List[str]],
     ) -> Tuple[List[Dict[str, Any]], float]:
+        corrected = getattr(self.pcrag_config, "improvement_stage", 0) >= 1
+        self._last_pcqd_hint_stats = {"strict_accepted": 0, "relaxed_accepted": 0,
+                                      "unsupported_rejected": 0, "score_rejected": 0}
         if not seed_distribution:
             return [], 0.0
 
@@ -1873,23 +1977,38 @@ class PCRAG(BaseRAG):
         ):
             if strict and not self.pcrag_config.pcqd_disable_path_filtering:
                 if path_score < self.pcrag_config.pcqd_path_score_threshold:
+                    self._last_pcqd_hint_stats["score_rejected"] += 1
                     return
                 if not self._entity_supported_in_evidence(bridge, evidence_text):
+                    self._last_pcqd_hint_stats["unsupported_rejected"] += 1
                     return
+
+            source_label = self._grounded_entity_surface(seed)
+            bridge_label = self._grounded_entity_surface(bridge)
+            if corrected and (not source_label or not bridge_label or
+                              not self._entity_supported_in_evidence(bridge, evidence_text)):
+                self._last_pcqd_hint_stats["unsupported_rejected"] += 1
+                return
+            self._last_pcqd_hint_stats["strict_accepted" if strict else "relaxed_accepted"] += 1
+            snippet = evidence_text[:400]
+            if corrected:
+                location = evidence_text.casefold().find(bridge_label.casefold())
+                if location >= 0:
+                    snippet = evidence_text[max(0, location - 160): location + len(bridge_label) + 240]
 
             key = (seed, bridge)
             if key not in grouped:
                 grouped[key] = {
                     "_seed_key": seed,
                     "_bridge_key": bridge,
-                    "source_entity": self._entity_surface(seed),
-                    "candidate_answer_or_bridge": self._entity_surface(bridge),
-                    "evidence": evidence_text[:400],
+                    "source_entity": source_label,
+                    "candidate_answer_or_bridge": bridge_label,
+                    "evidence": snippet,
                     "confidence": 0.0,
                     "votes": 0,
                     "max_path_score": 0.0,
                     "support_passages": [],
-                    "hint_type": hint_type,
+                    "hint_type": hint_type if strict else "relaxed",
                 }
             grouped[key]["votes"] += 1
             grouped[key]["max_path_score"] = max(grouped[key]["max_path_score"], path_score)
@@ -1942,6 +2061,10 @@ class PCRAG(BaseRAG):
                         _add_hint(seed, bridge, passage_key, evidence_text, path_score, strict=False)
 
         hints = list(grouped.values())
+        pre_vote_bridges = defaultdict(set)
+        for hint in hints:
+            pre_vote_bridges[hint["_seed_key"]].add(hint["_bridge_key"])
+        pre_vote_conflict = sum(len(b) > 1 for b in pre_vote_bridges.values()) / max(1, len(pre_vote_bridges))
         if hints and self.pcrag_config.pcqd_enable_bridge_voting:
             per_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
             for h in hints:
@@ -1988,6 +2111,10 @@ class PCRAG(BaseRAG):
         total_sources = sum(1 for _, bridges in source_to_bridges_selected.items() if len(bridges) >= 1)
         conflict_sources = sum(1 for _, bridges in source_to_bridges_selected.items() if len(bridges) > 1)
         conflict_rate = float(conflict_sources / max(1, total_sources))
+        if corrected:
+            conflict_rate = float(pre_vote_conflict)
+        self._last_pcqd_hint_stats["conflict_before_voting"] = float(pre_vote_conflict)
+        self._last_pcqd_hint_stats["selected_hints"] = len(hints)
         return hints, conflict_rate
 
     def _build_qd_track_ranking(
@@ -2011,6 +2138,7 @@ class PCRAG(BaseRAG):
             }
 
         sub_doc_ids_all: List[int] = []
+        local_doc_weights = defaultdict(float)
         ppr_used_count = 0
         ppr_failed_count = 0
         seq_rewrite_count = 0
@@ -2047,7 +2175,10 @@ class PCRAG(BaseRAG):
                     logger.warning("[QD] DPR failed for sub-question %r: %s", retrieval_q[:60], e)
                     continue
 
-            sub_doc_ids_all.extend(sub_ids[: self.pcrag_config.qd_sub_retrieval_top_k].tolist())
+            local_ids = sub_ids[: self.pcrag_config.qd_sub_retrieval_top_k].tolist()
+            sub_doc_ids_all.extend(local_ids)
+            for rank, doc_id in enumerate(local_ids):
+                local_doc_weights[doc_id] += 1.0 / (1.0 + rank) / len(sub_qs)
             if self.pcrag_config.qd_enable_sequential_dependency:
                 sequential_anchor_surface = self._extract_anchor_entity_from_docs(
                     sub_ids,
@@ -2098,7 +2229,8 @@ class PCRAG(BaseRAG):
         for rank, doc_id in enumerate(sub_doc_ids_unique):
             if doc_id >= len(self.passage_node_keys):
                 continue
-            sub_scores[doc_id] = 1.0 / (1.0 + rank)
+            sub_scores[doc_id] = (local_doc_weights[doc_id] if getattr(self.pcrag_config, "improvement_stage", 0) >= 1
+                                  else 1.0 / (1.0 + rank))
         sub_scores_norm = np.asarray(min_max_normalize(sub_scores), dtype=np.float32)
 
         for doc_id in sub_doc_ids_unique:
@@ -2296,6 +2428,9 @@ class PCRAG(BaseRAG):
         pcqd_scores = None
         pcqd_used = False
         pcqd_stats: Dict[str, Any] = {}
+        if (getattr(self.pcrag_config, "improvement_stage", 0) >= 1
+                and self.pcrag_config.pcqd_rewrite_mode == "append"):
+            pcqd_questions = list(dict.fromkeys(static_sub_questions + pcqd_questions))
         if pcqd_questions:
             pcqd_ids, pcqd_scores, pcqd_stats = self._build_qd_track_ranking(
                 query=query,

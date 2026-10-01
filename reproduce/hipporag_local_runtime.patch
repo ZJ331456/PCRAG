@@ -1,0 +1,986 @@
+diff --git a/main.py b/main.py
+index 4fd53f4..1249522 100644
+--- a/main.py
++++ b/main.py
+@@ -2,18 +2,25 @@ import argparse
+ import json
+ import logging
+ import os
++import sys
++import time
++import random
++from dataclasses import asdict
+ from pathlib import Path
+ from typing import List
+ 
+ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+ os.environ["TOKENIZERS_PARALLELISM"] = "false"
+-
+-from src.hipporag.HippoRAG import HippoRAG
+-from src.hipporag.StandardRAG import StandardRAG
+-from src.hipporag.utils.config_utils import BaseConfig
+-from src.hipporag.utils.misc_utils import string_to_bool
++os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
++os.environ.setdefault("HIPPORAG_KNN_DEVICE", "cpu")
+ 
+ PROJECT_ROOT = Path(__file__).resolve().parent
++sys.path.insert(0, str(PROJECT_ROOT / "src"))
++
++from hipporag.HippoRAG import HippoRAG
++from hipporag.StandardRAG import StandardRAG
++from hipporag.utils.config_utils import BaseConfig
++from hipporag.utils.misc_utils import string_to_bool
+ 
+ 
+ def get_gold_docs(samples: List, dataset_name: str = None) -> List:
+@@ -61,9 +68,10 @@ def parse_args():
+     parser = argparse.ArgumentParser(description="HippoRAG retrieval and QA experiments")
+     parser.add_argument("--dataset", default="musique", help="Dataset name under reproduce/dataset")
+     parser.add_argument("--rag_type", choices=["hipporag", "standard"], default="hipporag", help="Retrieval method; standard reproduces the DPR-style dense baseline")
+-    parser.add_argument("--llm_base_url", default="https://api.openai.com/v1", help="OpenAI-compatible LLM base URL")
+-    parser.add_argument("--llm_name", default="gpt-4o-mini", help="LLM model name")
+-    parser.add_argument("--embedding_name", default="nvidia/NV-Embed-v2", help="Embedding model name")
++    parser.add_argument("--llm_base_url", default="http://127.0.0.1:8035/v1", help="OpenAI-compatible LLM base URL")
++    parser.add_argument("--llm_name", default="qwen3-8b", help="LLM model name")
++    parser.add_argument("--embedding_name", default="/root/models/NV-Embed-v2", help="Embedding model name or local path")
++    parser.add_argument("--embedding_base_url", default=None, help="OpenAI-compatible embedding base URL (TEI/vLLM); unused for in-process nvembed")
+     parser.add_argument("--embedding_provider", choices=["openai", "transformers", "vllm", "gritlm", "nvembed", "contriever", "cohere"], help="Explicit embedding provider; otherwise inferred from the model name")
+     parser.add_argument("--azure_endpoint", help="Azure OpenAI resource endpoint")
+     parser.add_argument("--azure_api_version", help="Azure OpenAI API version for chat completions")
+@@ -71,25 +79,103 @@ def parse_args():
+     parser.add_argument("--azure_embedding_endpoint", help="Azure OpenAI resource endpoint for embeddings")
+     parser.add_argument("--azure_embedding_api_version", help="Azure OpenAI embeddings API version; defaults to --azure_api_version")
+     parser.add_argument("--azure_embedding_deployment", help="Azure OpenAI embedding deployment name; defaults to --embedding_name")
+-    parser.add_argument("--embedding_batch_size", type=int, default=8, help="Embedding batch size")
++    parser.add_argument("--embedding_batch_size", type=int, default=2, help="Embedding batch size (keep small for NV-Embed-v2 on shared GPU)")
+     parser.add_argument("--force_index_from_scratch", default="false", help="Rebuild graph state while reusing compatible stored embeddings/OpenIE")
+     parser.add_argument("--force_openie_from_scratch", default="false", help="Regenerate OpenIE only in a fresh/empty index directory")
+     parser.add_argument("--openie_mode", choices=["online", "offline", "Transformers-offline"], default="online", help="OpenIE execution mode")
+     parser.add_argument("--save_dir", default="outputs", help="Output directory prefix; custom values retain the legacy _<dataset> suffix")
++    parser.add_argument(
++        "--datasets_dir",
++        default=str(Path("/root/datasets") if Path("/root/datasets").is_dir() else PROJECT_ROOT / "reproduce" / "dataset"),
++        help="Directory containing {dataset}.json and {dataset}_corpus.json",
++    )
++    parser.add_argument("--sample_size", type=int, default=0, help="0 = full dataset; >0 = subsample for smoke tests")
++    parser.add_argument("--sample_seed", type=int, default=42)
++    parser.add_argument("--sample_indices_file", help="JSON list or object with selected_indices; original dataset indices")
++    parser.add_argument("--eval_mode", choices=["retrieve", "rag_qa"], default="rag_qa")
++    parser.add_argument("--output", help="Detailed result JSON path; defaults to the legacy metrics path")
++    parser.add_argument("--save_dir_exact", action="store_true", help="Use --save_dir exactly without the legacy dataset suffix")
++    parser.add_argument("--reuse_index", action="store_true", help="Require and retrieve from the existing index without calling index/OpenIE")
++    parser.add_argument("--retrieval_top_k", type=int, default=200)
++    parser.add_argument("--result_top_k", type=int, default=10)
++    parser.add_argument("--candidate_output_top_k", type=int, default=200)
++    parser.add_argument("--llm_prefetch_workers", type=int, choices=range(1, 9), default=8)
++    parser.add_argument("--openie_max_workers", type=int, choices=range(1, 9), default=8)
+     return parser.parse_args()
+ 
+ 
++def select_sample_indices(total, sample_size, sample_seed, indices_file=None):
++    if sample_size < 0:
++        raise ValueError("sample_size must be nonnegative")
++    if indices_file:
++        payload = json.loads(Path(indices_file).read_text(encoding="utf-8"))
++        indices = payload.get("selected_indices") if isinstance(payload, dict) else payload
++        if not isinstance(indices, list) or not indices:
++            raise ValueError("sample_indices_file must contain a non-empty list of original indices")
++        if any(type(index) is not int or not 0 <= index < total for index in indices):
++            raise ValueError("sample_indices_file contains an invalid dataset index")
++        if len(indices) != len(set(indices)):
++            raise ValueError("sample_indices_file contains duplicate indices")
++        if sample_size > 0 and len(indices) != min(sample_size, total):
++            raise ValueError("sample_indices_file length does not match sample_size")
++        return indices
++    if 0 < sample_size < total:
++        return sorted(random.Random(sample_seed).sample(range(total), sample_size))
++    return list(range(total))
++
++
++def detailed_result(solution, sample, query_index, gold_docs, gold_answers, result_top_k=10, candidate_output_top_k=200):
++    """Evaluation metadata is attached after ranking and never enters retrieval."""
++    solution.gold_docs = gold_docs
++    solution.gold_answers = gold_answers
++    row = solution.to_dict(top_k=result_top_k)
++    all_docs = list(solution.docs)
++    gold = list(dict.fromkeys(gold_docs or []))
++    metrics = {
++        f"Recall@{k}": (len(set(all_docs[:k]).intersection(gold)) / len(gold) if gold else 0.0)
++        for k in (1, 2, 5, 10, 20, 200)
++    }
++    ranks = {doc: idx + 1 for idx, doc in reversed(list(enumerate(all_docs)))}
++    decomposition = sample.get("question_decomposition")
++    row.update({
++        "query_index": query_index,
++        "sample_id": sample.get("id", sample.get("_id", query_index)),
++        "benchmark_hops": len(decomposition) if isinstance(decomposition, list) else None,
++        "candidate_docs": all_docs[:candidate_output_top_k],
++        "candidate_doc_scores": (
++            [float(score) for score in solution.doc_scores[:candidate_output_top_k]]
++            if solution.doc_scores is not None else None
++        ),
++        "retrieval_metrics": metrics,
++        "gold_document_ranks": [{"doc": doc, "rank": ranks.get(doc)} for doc in gold],
++        "all_gold_in_top5": bool(gold) and set(gold).issubset(all_docs[:5]),
++        "all_gold_in_top10": bool(gold) and set(gold).issubset(all_docs[:10]),
++        "retrieval_trace": getattr(solution, "retrieval_diagnostics", None) or {},
++    })
++    return row
++
++
+ def main():
+     args = parse_args()
+     if Path(args.dataset).name != args.dataset:
+         raise ValueError("dataset must be a name, not a path")
+-    save_dir = str(PROJECT_ROOT / "outputs" / args.dataset) if args.save_dir == "outputs" else f"{args.save_dir}_{args.dataset}"
+-    dataset_dir = PROJECT_ROOT / "reproduce" / "dataset"
++    if min(args.retrieval_top_k, args.result_top_k, args.candidate_output_top_k) < 1:
++        raise ValueError("retrieval/output top-k values must be positive")
++    if args.result_top_k > args.retrieval_top_k or args.candidate_output_top_k > args.retrieval_top_k:
++        raise ValueError("output top-k values cannot exceed retrieval_top_k")
++    save_dir = (
++        args.save_dir if args.save_dir_exact else
++        str(PROJECT_ROOT / "outputs" / args.dataset) if args.save_dir == "outputs" else f"{args.save_dir}_{args.dataset}"
++    )
++    dataset_dir = Path(args.datasets_dir)
+     with open(dataset_dir / f"{args.dataset}_corpus.json", encoding="utf-8") as file:
+         corpus = json.load(file)
+     with open(dataset_dir / f"{args.dataset}.json", encoding="utf-8") as file:
+         samples = json.load(file)
+ 
++    selected_indices = select_sample_indices(len(samples), args.sample_size, args.sample_seed, args.sample_indices_file)
++    samples = [samples[i] for i in selected_indices]
++
+     docs = [f"{doc['title']}\n{doc['text']}" for doc in corpus]
+     queries = [sample["question"] for sample in samples]
+     gold_answers = get_gold_answers(samples)
+@@ -103,6 +189,7 @@ def main():
+         save_dir=save_dir,
+         llm_base_url=args.llm_base_url,
+         llm_name=args.llm_name,
++        embedding_base_url=args.embedding_base_url,
+         azure_endpoint=args.azure_endpoint,
+         azure_api_version=args.azure_api_version,
+         azure_chat_deployment=args.azure_chat_deployment,
+@@ -115,17 +202,106 @@ def main():
+         force_index_from_scratch=string_to_bool(args.force_index_from_scratch),
+         force_openie_from_scratch=string_to_bool(args.force_openie_from_scratch),
+         rerank_dspy_file_path=str(PROJECT_ROOT / "src" / "hipporag" / "prompts" / "dspy_prompts" / "filter_llama3.3-70B-Instruct.json"),
+-        retrieval_top_k=200,
++        retrieval_top_k=args.retrieval_top_k,
+         linking_top_k=5,
+         qa_top_k=5,
+         embedding_batch_size=args.embedding_batch_size,
++        llm_prefetch_workers=args.llm_prefetch_workers,
++        openie_max_workers=args.openie_max_workers,
++        max_retry_attempts=2,
++        max_new_tokens=2048,
++        temperature=0.0,
+         openie_mode=args.openie_mode,
++        synonymy_edge_topk=50,
++        synonymy_edge_query_batch_size=128,
++        synonymy_edge_key_batch_size=1024,
+     )
++    if args.reuse_index:
++        if config.force_index_from_scratch or config.force_openie_from_scratch:
++            raise ValueError("--reuse_index cannot be combined with rebuild flags")
++        model_dir = f"{config.llm_name.replace('/', '_')}_{config.embedding_model_name.replace('/', '_')}"
++        if not (Path(save_dir) / model_dir / "graph.pickle").is_file():
++            raise FileNotFoundError("--reuse_index requires an existing graph.pickle")
+     logging.basicConfig(level=logging.INFO)
+     rag_class = HippoRAG if args.rag_type == "hipporag" else StandardRAG
++    logging.info(
++        "HippoRAG2 dataset=%s samples=%d docs=%d llm=%s@%s emb=%s@%s save=%s",
++        args.dataset,
++        len(samples),
++        len(docs),
++        args.llm_name,
++        args.llm_base_url,
++        args.embedding_name,
++        args.embedding_base_url,
++        save_dir,
++    )
+     with rag_class(global_config=config) as rag:
+-        rag.index(docs)
+-        rag.rag_qa(queries=queries, gold_docs=gold_docs, gold_answers=gold_answers)
++        if args.reuse_index:
++            indexed_docs = set(rag.chunk_embedding_store.get_all_texts())
++            if indexed_docs != set(docs):
++                raise ValueError("--reuse_index corpus/index mismatch; do not append or rebuild a shared index")
++            logging.info("Reusing existing index (%d passages); OpenIE/index() skipped", len(indexed_docs))
++        else:
++            rag.index(docs)
++        started = time.perf_counter()
++        retrieval_result = rag.retrieve(queries=queries, gold_docs=gold_docs)
++        if gold_docs is not None:
++            solutions, retrieval_metrics = retrieval_result
++        else:
++            solutions, retrieval_metrics = retrieval_result, {}
++        retrieval_seconds = time.perf_counter() - started
++        qa_metrics = {}
++        if args.eval_mode == "rag_qa":
++            qa_result = rag.rag_qa(queries=solutions, gold_docs=gold_docs, gold_answers=gold_answers)
++            solutions = qa_result[0]
++            if len(qa_result) == 5:
++                qa_metrics = qa_result[4]
++        if len(solutions) != len(samples):
++            raise RuntimeError(f"Incomplete retrieval results: {len(solutions)} != {len(samples)}")
++        llm_request_stats = rag.llm_model.get_request_stats() if hasattr(rag.llm_model, "get_request_stats") else {}
++        output_rows = [
++            detailed_result(solution, sample, original_index,
++                            gold_docs[idx] if gold_docs is not None else None, gold_answers[idx],
++                            args.result_top_k, args.candidate_output_top_k)
++            for idx, (solution, sample, original_index) in enumerate(zip(solutions, samples, selected_indices))
++        ]
++
++    metrics = {
++        "dataset": args.dataset,
++        "method": "hipporag2",
++        "n_samples": len(samples),
++        "sample_size_requested": args.sample_size,
++        "sample_size_effective": len(samples),
++        "sample_seed": args.sample_seed,
++        "selected_indices": selected_indices,
++        "n_docs": len(docs),
++        "llm_name": args.llm_name,
++        "llm_base_url": args.llm_base_url,
++        "embedding_name": args.embedding_name,
++        "embedding_base_url": args.embedding_base_url,
++        "eval_mode": args.eval_mode,
++        "reuse_index": args.reuse_index,
++        "result_top_k": args.result_top_k,
++        "candidate_output_top_k": args.candidate_output_top_k,
++        "retrieval_seconds": retrieval_seconds,
++        "runtime_config": asdict(config),
++        "llm_request_stats": llm_request_stats,
++        "results": output_rows,
++        "retrieval_metrics": retrieval_metrics or {},
++        "qa_metrics": qa_metrics or {},
++        "predictions": [
++            {
++                "question": getattr(s, "question", ""),
++                "prediction": getattr(s, "answer", ""),
++            }
++            for s in (solutions or [])
++        ],
++    }
++    out_path = Path(args.output) if args.output else Path(save_dir) / ("metrics_smoke.json" if args.sample_size else "metrics.json")
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
++    print(json.dumps({k: metrics[k] for k in ("dataset", "n_samples", "n_docs", "retrieval_metrics", "qa_metrics")}, indent=2, ensure_ascii=False))
++    print(f"[saved] {out_path}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/hipporag/HippoRAG.py b/src/hipporag/HippoRAG.py
+index 8a87f5f..8ca9957 100644
+--- a/src/hipporag/HippoRAG.py
++++ b/src/hipporag/HippoRAG.py
+@@ -3,6 +3,7 @@ import json
+ import os
+ import logging
+ from dataclasses import asdict
++from concurrent.futures import ThreadPoolExecutor
+ from typing import Union, Optional, List, Set, Dict, Any, Tuple
+ import numpy as np
+ from tqdm import tqdm
+@@ -740,28 +741,39 @@ class HippoRAG:
+ 
+         retrieval_results = []
+ 
+-        for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
+-            rerank_start = time.time()
+-            query_fact_scores = self.get_fact_scores(query)
+-            top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
+-            rerank_end = time.time()
+-
+-            self.rerank_time += rerank_end - rerank_start
+-
+-            if len(top_k_facts) == 0:
+-                logger.info('No facts found after reranking, return DPR results')
+-                sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
+-            else:
+-                sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
+-                                                                                         link_top_k=self.global_config.linking_top_k,
+-                                                                                         query_fact_scores=query_fact_scores,
+-                                                                                         top_k_facts=top_k_facts,
+-                                                                                         top_k_fact_indices=top_k_fact_indices,
+-                                                                                         passage_node_weight=self.global_config.passage_node_weight)
+-
+-            result = self._build_retrieval_result(query, sorted_doc_ids, sorted_doc_scores, num_to_retrieve, top_k_facts)
+-            retrieval_results.append(QuerySolution(question=result.query, docs=result.docs, doc_scores=result.scores,
+-                                                   doc_metadata=result.doc_metadata, graph_seeds=result.graph_seeds))
++        prefetched = self._iter_prefetched_fact_reranks(queries)
++        try:
++            for q_idx, (query, query_fact_scores, top_k_fact_indices, top_k_facts, rerank_log) in tqdm(
++                enumerate(prefetched), desc="Retrieving", total=len(queries)
++            ):
++                graph_start = time.perf_counter()
++                self._last_graph_seed_details = []
++
++                if len(top_k_facts) == 0:
++                    logger.info('No facts found after reranking, return DPR results')
++                    sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
++                else:
++                    sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
++                                                                                             link_top_k=self.global_config.linking_top_k,
++                                                                                             query_fact_scores=query_fact_scores,
++                                                                                             top_k_facts=top_k_facts,
++                                                                                             top_k_fact_indices=top_k_fact_indices,
++                                                                                             passage_node_weight=self.global_config.passage_node_weight)
++
++                result = self._build_retrieval_result(query, sorted_doc_ids, sorted_doc_scores, num_to_retrieve, top_k_facts)
++                retrieval_results.append(QuerySolution(question=result.query, docs=result.docs, doc_scores=result.scores,
++                                                       doc_metadata=result.doc_metadata, graph_seeds=result.graph_seeds,
++                                                       retrieval_diagnostics={
++                                                           **rerank_log,
++                                                           "fallback_to_dense": not bool(top_k_facts),
++                                                           "entity_graph_seeds": self._last_graph_seed_details,
++                                                           "graph_or_dense_seconds": time.perf_counter() - graph_start,
++                                                           "retrieved_count": len(result.docs),
++                                                       }))
++        finally:
++            # Wait for bounded in-flight filters before resource cleanup, even
++            # when an unrelated graph/store operation raises.
++            prefetched.close()
+ 
+         retrieve_end_time = time.time()  # Record end time
+ 
+@@ -2075,6 +2087,17 @@ class HippoRAG:
+                                                                            phrase_weights,
+                                                                            linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
+ 
++        # Diagnostics only: capture the exact entity weights used by the original PPR.
++        self._last_graph_seed_details = [
++            {
++                "entity": phrase,
++                "entity_id": compute_mdhash_id(phrase, "entity-"),
++                "weight": float(score),
++                "document_frequency": len(self.ent_node_to_chunk_ids.get(compute_mdhash_id(phrase, "entity-"), set())),
++            }
++            for phrase, score in sorted(linking_score_map.items(), key=lambda item: item[1], reverse=True)
++        ]
++
+         #Get passage scores according to chosen dense retrieval model
+         dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
+         normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
+@@ -2110,58 +2133,68 @@ class HippoRAG:
+         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
+ 
+ 
+-    def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
+-        """
+-
+-        Args:
+-
+-        Returns:
+-            top_k_fact_indicies:
+-            top_k_facts:
+-            rerank_log (dict): {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
+-                - candidate_facts (list): list of link_top_k facts (each fact is a relation triple in tuple data type).
+-                - top_k_facts:
++    def _prepare_fact_candidates(self, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple]]:
++        """Read embeddings/stores on the caller thread using the original ranking rule."""
++        link_top_k = self.global_config.linking_top_k
++        if link_top_k <= 0 or len(query_fact_scores) == 0 or len(self.fact_node_keys) == 0:
++            return [], []
++        candidate_fact_indices = (
++            np.argsort(query_fact_scores)[::-1].tolist()
++            if len(query_fact_scores) <= link_top_k
++            else np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()
++        )
++        fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
++        fact_rows = self.fact_embedding_store.get_rows(fact_ids)
++        return candidate_fact_indices, [ast.literal_eval(fact_rows[fact_id]["content"]) for fact_id in fact_ids]
++
++    def _filter_fact_candidates(self, query: str, candidate_indices: List[int], candidate_facts: List[Tuple]):
++        """Only the independent recognition-memory LLM call runs in a worker."""
++        started = time.perf_counter()
++        if candidate_facts:
++            indices, facts, details = self.rerank_filter(
++                query, candidate_facts, candidate_indices,
++                len_after_rerank=self.global_config.linking_top_k,
++            )
++        else:
++            indices, facts, details = [], [], {}
++        return indices, facts, {
++            "facts_before_rerank": candidate_facts,
++            "facts_after_rerank": facts,
++            "candidate_fact_indices": candidate_indices,
++            "selected_fact_indices": indices,
++            "fact_filter": details,
++            "fact_filter_seconds": time.perf_counter() - started,
++        }
+ 
++    def _iter_prefetched_fact_reranks(self, queries: List[str]):
++        workers = int(getattr(self.global_config, "llm_prefetch_workers", 1))
++        if not 1 <= workers <= 8:
++            raise ValueError("llm_prefetch_workers must be between 1 and 8.")
++        # At most one window of score arrays and futures exists. Result consumption
++        # follows input order; neither CUDA encoding nor graph state is shared.
++        with ThreadPoolExecutor(max_workers=workers) as executor:
++            for start in range(0, len(queries), workers):
++                pending = []
++                for query in queries[start:start + workers]:
++                    prepared_at = time.perf_counter()
++                    scores = self.get_fact_scores(query)
++                    candidate_indices, candidate_facts = self._prepare_fact_candidates(scores)
++                    candidate_scores = [float(scores[idx]) for idx in candidate_indices]
++                    self.rerank_time += time.perf_counter() - prepared_at
++                    future = executor.submit(self._filter_fact_candidates, query, candidate_indices, candidate_facts)
++                    pending.append((query, scores, candidate_scores, future))
++                for query, scores, candidate_scores, future in pending:
++                    wait_at = time.perf_counter()
++                    indices, facts, details = future.result()
++                    self.rerank_time += time.perf_counter() - wait_at
++                    details["candidate_fact_scores"] = candidate_scores
++                    yield query, scores, indices, facts, details
+ 
+-        """
+-        # load args
+-        link_top_k: int = self.global_config.linking_top_k
+-
+-        if link_top_k <= 0:
+-            return [], [], {'facts_before_rerank': [], 'facts_after_rerank': []}
+-        
+-        # Check if there are any facts to rerank
+-        if len(query_fact_scores) == 0 or len(self.fact_node_keys) == 0:
+-            logger.warning("No facts available for reranking. Returning empty lists.")
+-            return [], [], {'facts_before_rerank': [], 'facts_after_rerank': []}
+-            
+-        try:
+-            # Get the top k facts by score
+-            if len(query_fact_scores) <= link_top_k:
+-                # If we have fewer facts than requested, use all of them
+-                candidate_fact_indices = np.argsort(query_fact_scores)[::-1].tolist()
+-            else:
+-                # Otherwise get the top k
+-                candidate_fact_indices = np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()
+-                
+-            # Get the actual fact IDs
+-            real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
+-            fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
+-            candidate_facts = [ast.literal_eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
+-            
+-            # Rerank the facts
+-            top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter(query,
+-                                                                                candidate_facts,
+-                                                                                candidate_fact_indices,
+-                                                                                len_after_rerank=link_top_k)
+-            
+-            rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
+-            
+-            return top_k_fact_indices, top_k_facts, rerank_log
+-            
+-        except Exception as e:
+-            logger.error(f"Error in rerank_facts: {str(e)}")
+-            return [], [], {'facts_before_rerank': [], 'facts_after_rerank': [], 'error': str(e)}
++    def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
++        indices, facts = self._prepare_fact_candidates(query_fact_scores)
++        selected_indices, selected_facts, details = self._filter_fact_candidates(query, indices, facts)
++        details["candidate_fact_scores"] = [float(query_fact_scores[idx]) for idx in indices]
++        return selected_indices, selected_facts, details
+     
+     def run_ppr(self,
+                 reset_prob: np.ndarray,
+diff --git a/src/hipporag/embedding_model/Transformers.py b/src/hipporag/embedding_model/Transformers.py
+index 976d2db..bc79410 100644
+--- a/src/hipporag/embedding_model/Transformers.py
++++ b/src/hipporag/embedding_model/Transformers.py
+@@ -1,49 +1,83 @@
+-from typing import List
+-import json
++from typing import List, Optional
+ 
+-import torch
+ import numpy as np
++import torch
+ from tqdm import tqdm
++from sentence_transformers import SentenceTransformer
+ 
+ from .base import BaseEmbeddingModel
+ from ..utils.config_utils import BaseConfig
+ from ..prompts.linking import get_query_instruction
+-from sentence_transformers import SentenceTransformer
++
+ 
+ class TransformersEmbeddingModel(BaseEmbeddingModel):
+     """
+-    To select this implementation you can initialise HippoRAG with:
+-        embedding_model_name starts with "Transformers/"
++    In-process SentenceTransformer backend (Qwen3-Embedding etc.).
++
++    Select via embedding_provider=transformers, or embedding_model_name
++    starting with ``Transformers/``, or a path containing ``Qwen3-Embedding``.
+     """
+-    def __init__(self, global_config:BaseConfig, embedding_model_name:str) -> None:
++
++    query_instruction_mode = "distinct"
++
++    def __init__(self, global_config: Optional[BaseConfig] = None, embedding_model_name: Optional[str] = None) -> None:
+         super().__init__(global_config=global_config)
+ 
+-        self.model_id = embedding_model_name.removeprefix("Transformers/")
+-        self.embedding_type = 'float'
+-        self.batch_size = global_config.embedding_batch_size
++        raw = embedding_model_name or self.embedding_model_name
++        self.model_id = raw.removeprefix("Transformers/").removeprefix("transformers/")
++        self.embedding_type = "float"
++        self.batch_size = int(getattr(self.global_config, "embedding_batch_size", 2) or 2)
++        self.normalize = bool(getattr(self.global_config, "embedding_return_as_normalized", True))
++        max_seq = int(getattr(self.global_config, "embedding_max_seq_len", 2048) or 2048)
+ 
+-        self.model = SentenceTransformer(self.model_id, device = "cuda" if torch.cuda.is_available() else "cpu")
++        dtype_name = str(getattr(self.global_config, "embedding_model_dtype", "auto") or "auto")
++        if dtype_name in ("float16", "fp16"):
++            torch_dtype = torch.float16
++        else:
++            torch_dtype = torch.bfloat16
+ 
+-        self.search_query_instr = set([
+-            get_query_instruction('query_to_fact'),
+-            get_query_instruction('query_to_passage')
+-        ])
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++        self.model = SentenceTransformer(
++            self.model_id,
++            device=device,
++            trust_remote_code=True,
++            model_kwargs={"torch_dtype": torch_dtype},
++        )
++        self.model.max_seq_length = max_seq
+ 
+-    def encode(self, texts: List[str]) -> None:
+-        try:
+-            response = self.model.encode(texts, batch_size=self.batch_size, normalize_embeddings=self.global_config.embedding_return_as_normalized)
+-        except Exception as err:
+-            raise Exception(f"An error occurred: {err}")
+-        return np.array(response)
++        self.search_query_instr = set(
++            [
++                get_query_instruction("query_to_fact"),
++                get_query_instruction("query_to_passage"),
++            ]
++        )
++        self._is_qwen3_embedding = "qwen3-embedding" in self.model_id.lower()
+ 
+-    def batch_encode(self, texts: List[str], **kwargs) -> None:
++    def encode(self, texts: List[str], instruction: str = "") -> np.ndarray:
++        encode_kwargs = {
++            "batch_size": self.batch_size,
++            "normalize_embeddings": self.normalize,
++            "show_progress_bar": False,
++        }
++        # Qwen3-Embedding is instruction-aware: inject Hippo's task prompt
++        # (query_to_fact / query_to_passage / ...), do NOT use the fixed
++        # prompt_name="query" web-search template.
++        if instruction:
++            if self._is_qwen3_embedding:
++                encode_kwargs["prompt"] = f"Instruct: {instruction}\nQuery:"
++            else:
++                texts = [f"Instruct: {instruction}\nQuery: {t}" for t in texts]
++        return np.asarray(self.model.encode(texts, **encode_kwargs))
++
++    def batch_encode(self, texts: List[str], **kwargs) -> np.ndarray:
+         if isinstance(texts, str):
+             texts = [texts]
+-        if len(texts) < self.batch_size:
+-            return self.encode(texts)
+-        
++        instruction = kwargs.get("instruction", "") or ""
++        if len(texts) <= self.batch_size:
++            return self.encode(texts, instruction=instruction)
++
+         results = []
+         batch_indexes = list(range(0, len(texts), self.batch_size))
+         for i in tqdm(batch_indexes, desc="Batch Encoding"):
+-            results.append(self.encode(texts[i:i + self.batch_size]))
+-        return np.concatenate(results)
++            results.append(self.encode(texts[i : i + self.batch_size], instruction=instruction))
++        return np.concatenate(results, axis=0)
+diff --git a/src/hipporag/embedding_model/__init__.py b/src/hipporag/embedding_model/__init__.py
+index 9a04dd3..d36f991 100644
+--- a/src/hipporag/embedding_model/__init__.py
++++ b/src/hipporag/embedding_model/__init__.py
+@@ -40,7 +40,7 @@ def _get_embedding_model_class(embedding_model_name: str = "nvidia/NV-Embed-v2",
+         class_name = _PROVIDER_CLASSES.get(provider)
+         if class_name is None:
+             raise ValueError(f"Unknown embedding provider: {provider}")
+-    elif embedding_model_name.startswith("Transformers/"):
++    elif embedding_model_name.startswith("Transformers/") or "Qwen3-Embedding" in embedding_model_name:
+         class_name = "TransformersEmbeddingModel"
+     elif embedding_model_name.startswith("VLLM/"):
+         class_name = "VLLMEmbeddingModel"
+diff --git a/src/hipporag/information_extraction/openie_openai.py b/src/hipporag/information_extraction/openie_openai.py
+index e7ca0d9..565fefc 100644
+--- a/src/hipporag/information_extraction/openie_openai.py
++++ b/src/hipporag/information_extraction/openie_openai.py
+@@ -66,23 +66,47 @@ class OpenIE:
+         ner_input_message = self.prompt_template_manager.render(name='ner', passage=passage)
+         raw_response = ""
+         metadata = {}
++        # Retry once with a higher cap when default 512 truncates dense entity lists.
++        token_budgets = [self.ner_max_tokens]
++        if self.ner_max_tokens < 1024:
++            token_budgets.append(1024)
+         try:
+-            # LLM INFERENCE
+-            inference_kwargs = {"max_new_tokens": self.ner_max_tokens}
++            last_error = None
++            unique_entities = []
+             response_format = getattr(getattr(self.llm_model, "global_config", None), "response_format", None)
+-            if response_format is not None:
+-                inference_kwargs["response_format"] = response_format
+-            raw_response, metadata, cache_hit = self.llm_model.infer(
+-                messages=ner_input_message,
+-                **inference_kwargs,
+-            )
+-            metadata['cache_hit'] = cache_hit
+-            if metadata.get('finish_reason') == 'length':
+-                real_response = fix_broken_generated_json(raw_response)
+-            else:
+-                real_response = raw_response
+-            extracted_entities = _extract_ner_from_response(real_response)
+-            unique_entities = list(dict.fromkeys(extracted_entities))
++            for attempt, max_new_tokens in enumerate(token_budgets):
++                inference_kwargs = {"max_new_tokens": max_new_tokens}
++                if response_format is not None:
++                    inference_kwargs["response_format"] = response_format
++                raw_response, metadata, cache_hit = self.llm_model.infer(
++                    messages=ner_input_message,
++                    **inference_kwargs,
++                )
++                metadata['cache_hit'] = cache_hit
++                metadata['ner_max_tokens_used'] = max_new_tokens
++                if metadata.get('finish_reason') == 'length':
++                    real_response = fix_broken_generated_json(raw_response)
++                else:
++                    real_response = raw_response
++                try:
++                    extracted_entities = _extract_ner_from_response(real_response)
++                    unique_entities = list(dict.fromkeys(extracted_entities))
++                    last_error = None
++                    break
++                except Exception as parse_error:
++                    last_error = parse_error
++                    if attempt + 1 < len(token_budgets):
++                        logger.warning(
++                            "NER parse failed for %s with max_new_tokens=%s (%s); retrying with %s",
++                            chunk_key,
++                            max_new_tokens,
++                            parse_error,
++                            token_budgets[attempt + 1],
++                        )
++                        continue
++                    raise
++            if last_error is not None:
++                raise last_error
+ 
+         except Exception as e:
+             # For any other unexpected exceptions, log them and return with the error message
+diff --git a/src/hipporag/llm/openai_gpt.py b/src/hipporag/llm/openai_gpt.py
+index 69194f3..3de271a 100644
+--- a/src/hipporag/llm/openai_gpt.py
++++ b/src/hipporag/llm/openai_gpt.py
+@@ -3,10 +3,13 @@ import hashlib
+ import json
+ import os
+ import sqlite3
++import threading
++import time
+ from typing import List, Tuple
+ 
+ from filelock import FileLock
+ from openai import AzureOpenAI, DefaultHttpxClient, OpenAI
++import openai
+ 
+ from ..utils.config_utils import BaseConfig
+ from ..utils.llm_utils import (
+@@ -19,6 +22,59 @@ from .base import BaseLLM, LLMConfig, normalize_generation_token_params
+ logger = get_logger(__name__)
+ 
+ 
++def _max_in_flight() -> int:
++    raw = os.getenv("HIPPORAG_LLM_MAX_IN_FLIGHT", os.getenv("PATHCONDRAG_LLM_MAX_IN_FLIGHT", "8"))
++    try:
++        value = int(raw)
++    except ValueError:
++        value = 8
++    if not 1 <= value <= 8:
++        raise ValueError("LLM HTTP concurrency must be between 1 and 8.")
++    return value
++
++
++LLM_MAX_IN_FLIGHT = _max_in_flight()
++_LLM_HTTP_SEMAPHORE = threading.BoundedSemaphore(LLM_MAX_IN_FLIGHT)
++
++
++def _increment_stat(self, name: str) -> None:
++    with self._llm_stats_lock:
++        self._llm_stats[name] += 1
++
++
++def _generation_params(self, kwargs, target_token_key):
++    params = normalize_generation_token_params(self.llm_config.generate_params, kwargs, target_token_key)
++    if "qwen3" in str(params.get("model", "")).lower() or "qwen3" in str(self.llm_name).lower():
++        extra_body = dict(params.get("extra_body") or {})
++        chat_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
++        chat_kwargs["enable_thinking"] = False
++        extra_body["chat_template_kwargs"] = chat_kwargs
++        params["extra_body"] = extra_body
++    return params
++
++
++def bounded_retry(func):
++    @functools.wraps(func)
++    def wrapper(self, *args, **kwargs):
++        max_attempts = max(1, self.max_retries + 1)
++        for attempt in range(max_attempts):
++            try:
++                return func(self, *args, **kwargs)
++            except Exception as exc:
++                retryable = isinstance(exc, openai.APIConnectionError) or (
++                    isinstance(exc, openai.APIStatusError)
++                    and (exc.status_code in (408, 409, 429) or exc.status_code >= 500)
++                )
++                if not retryable or attempt + 1 == max_attempts:
++                    _increment_stat(self, "failures")
++                    raise
++                _increment_stat(self, "retries")
++                delay = min(16.0, 2.0 ** attempt)
++                logger.warning("Retryable LLM error (attempt %s/%s, sleep %.1fs): %s", attempt + 1, max_attempts, delay, exc)
++                time.sleep(delay)
++    return wrapper
++
++
+ def _validate_azure_request_model(global_config, request_model_name, params) -> None:
+     if getattr(global_config, "azure_endpoint", None) is None:
+         return
+@@ -42,8 +98,7 @@ def cache_response(func):
+             raise ValueError("Missing required 'messages' parameter for caching.")
+ 
+         # Include every generation parameter because any of them can change the response.
+-        gen_params = getattr(self, "llm_config", {}).generate_params if hasattr(self, "llm_config") else {}
+-        key_data = normalize_generation_token_params(gen_params, kwargs, "_max_tokens")
++        key_data = _generation_params(self, kwargs, "_max_tokens")
+         _validate_azure_request_model(global_config, request_model_name, key_data)
+         key_data["messages"] = messages
+         key_data["_cache_schema"] = 3
+@@ -52,6 +107,7 @@ def cache_response(func):
+         key_data["_azure_api_version"] = getattr(global_config, "azure_api_version", None)
+         key_data["_azure_chat_deployment"] = getattr(global_config, "azure_chat_deployment", None)
+         if key_data.get("store") is True:
++            _increment_stat(self, "cache_misses")
+             message, metadata = func(self, *args, **kwargs)
+             return message, metadata, False
+         key_str = json.dumps(key_data, sort_keys=True, default=str)
+@@ -74,8 +130,10 @@ def cache_response(func):
+                     row = cursor.fetchone()
+             if row is not None:
+                 message, metadata_str = row
++                _increment_stat(self, "cache_hits")
+                 return message, json.loads(metadata_str), True
+ 
++            _increment_stat(self, "cache_misses")
+             message, metadata = func(self, *args, **kwargs)
+ 
+             with FileLock(database_lock_file):
+@@ -113,6 +171,8 @@ class CacheOpenAI(BaseLLM):
+         self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
+ 
+         self.max_retries = kwargs.get("max_retries", 2)
++        self._llm_stats_lock = threading.Lock()
++        self._llm_stats = dict(cache_hits=0, cache_misses=0, http_attempts=0, retries=0, failures=0)
+         azure_settings = None
+         self.request_model_name = self.llm_name
+         if self.global_config.azure_endpoint is not None:
+@@ -134,7 +194,7 @@ class CacheOpenAI(BaseLLM):
+                     api_key=local_openai_api_key(self.llm_base_url),
+                     base_url=self.llm_base_url,
+                     http_client=client,
+-                    max_retries=self.max_retries,
++                    max_retries=0,
+                 )
+             else:
+                 self.openai_client = AzureOpenAI(
+@@ -142,7 +202,7 @@ class CacheOpenAI(BaseLLM):
+                     azure_endpoint=azure_settings.endpoint,
+                     azure_deployment=azure_settings.deployment,
+                     http_client=client,
+-                    max_retries=self.max_retries,
++                    max_retries=0,
+                 )
+         except Exception:
+             if client is not None:
+@@ -159,6 +219,13 @@ class CacheOpenAI(BaseLLM):
+             generate_params["seed"] = self.global_config.seed
+         if self.global_config.temperature is not None:
+             generate_params["temperature"] = self.global_config.temperature
++        # Qwen3 defaults to thinking mode; disable for OpenIE/QA JSON reliability & latency.
++        if "qwen3" in (self.global_config.llm_name or "").lower():
++            extra_body = dict(generate_params.get("extra_body") or {})
++            chat_kwargs = dict(extra_body.get("chat_template_kwargs") or {})
++            chat_kwargs.setdefault("enable_thinking", False)
++            extra_body["chat_template_kwargs"] = chat_kwargs
++            generate_params["extra_body"] = extra_body
+         config_dict = {
+             'llm_name': self.global_config.llm_name,
+             'llm_base_url': self.global_config.llm_base_url,
+@@ -169,6 +236,7 @@ class CacheOpenAI(BaseLLM):
+         logger.debug(f"Init {self.__class__.__name__}'s llm_config: {self.llm_config}")
+ 
+     @cache_response
++    @bounded_retry
+     def infer(
+         self,
+         messages: List[TextChatMessage],
+@@ -179,12 +247,14 @@ class CacheOpenAI(BaseLLM):
+             base_url = self.global_config.llm_base_url or "https://api.openai.com/v1"
+             supports_max_completion_tokens = self.global_config.azure_endpoint is not None or "api.openai.com" in base_url
+         target_token_key = "max_completion_tokens" if supports_max_completion_tokens else "max_tokens"
+-        params = normalize_generation_token_params(self.llm_config.generate_params, kwargs, target_token_key)
++        params = _generation_params(self, kwargs, target_token_key)
+         _validate_azure_request_model(self.global_config, getattr(self, "request_model_name", getattr(self, "llm_name", None)), params)
+         params["messages"] = messages
+         logger.debug(f"Calling OpenAI GPT API with:\n{params}")
+ 
+-        response = self.openai_client.chat.completions.create(**params)
++        with _LLM_HTTP_SEMAPHORE:
++            _increment_stat(self, "http_attempts")
++            response = self.openai_client.chat.completions.create(**params)
+         if len(response.choices) != 1:
+             raise ValueError(f"HippoRAG expected exactly one OpenAI choice, received {len(response.choices)}.")
+         choice = response.choices[0]
+@@ -219,3 +289,7 @@ class CacheOpenAI(BaseLLM):
+ 
+     def close(self) -> None:
+         self.openai_client.close()
++
++    def get_request_stats(self):
++        with self._llm_stats_lock:
++            return {**self._llm_stats, "max_in_flight": LLM_MAX_IN_FLIGHT}
+diff --git a/src/hipporag/rerank.py b/src/hipporag/rerank.py
+index 6558479..9a5d789 100644
+--- a/src/hipporag/rerank.py
++++ b/src/hipporag/rerank.py
+@@ -82,7 +82,7 @@ class DSPyFilter:
+ 
+         return parsed
+ 
+-    def llm_call(self, question, fact_before_filter):
++    def llm_call(self, question, fact_before_filter, with_metadata=False):
+         # make prompt
+         messages = deepcopy(self.message_template)
+         messages.append({"role": "user", "content": self.one_input_template.format(question=question, fact_before_filter=fact_before_filter)})
+@@ -93,6 +93,8 @@ class DSPyFilter:
+             **self.default_gen_kwargs
+         )
+ 
++        if with_metadata:
++            return response
+         if len(response) > 1:
+             return response[0]
+         return response
+@@ -106,13 +108,9 @@ class DSPyFilter:
+                candidate_indices: List[int],
+                len_after_rerank: int =None) -> Tuple[List[int], List[Tuple], dict]:
+         fact_before_filter = {"fact": [list(candidate_item) for candidate_item in candidate_items]}
+-        try:
+-            # prediction = self.program(question=query, fact_before_filter=json.dumps(fact_before_filter))
+-            response = self.llm_call(query, json.dumps(fact_before_filter))
+-            generated_facts = self.parse_filter(response)
+-        except Exception as e:
+-            print('exception', e)
+-            generated_facts = []
++        # HTTP failures must fail the experiment, rather than silently selecting DPR.
++        response, metadata, cache_hit = self.llm_call(query, json.dumps(fact_before_filter), with_metadata=True)
++        generated_facts = self.parse_filter(response)
+         result_indices = []
+         for generated_fact in generated_facts:
+             closest_matched_fact = difflib.get_close_matches(str(generated_fact), [str(i) for i in candidate_items], n=1, cutoff=0.0)[0]
+@@ -123,4 +121,10 @@ class DSPyFilter:
+ 
+         sorted_candidate_indices = [candidate_indices[i] for i in result_indices]
+         sorted_candidate_items = [candidate_items[i] for i in result_indices]
+-        return sorted_candidate_indices[:len_after_rerank], sorted_candidate_items[:len_after_rerank], {'confidence': None}
++        return sorted_candidate_indices[:len_after_rerank], sorted_candidate_items[:len_after_rerank], {
++            'confidence': None,
++            'response': response,
++            'metadata': metadata,
++            'cache_hit': cache_hit,
++            'generated_facts': generated_facts,
++        }
+diff --git a/src/hipporag/utils/config_utils.py b/src/hipporag/utils/config_utils.py
+index e96e751..5a0d76e 100644
+--- a/src/hipporag/utils/config_utils.py
++++ b/src/hipporag/utils/config_utils.py
+@@ -332,6 +332,10 @@ class BaseConfig:
+         default=None,
+         metadata={"help": "Stable, unique index namespace for vector database collections. Defaults to a fingerprint of the working directory."}
+     )
++    llm_prefetch_workers: int = field(
++        default=8,
++        metadata={"help": "Concurrent independent recognition-memory LLM calls; embeddings and graph search remain on the main thread."},
++    )
+     
+     
+     def __post_init__(self):
+@@ -356,6 +360,8 @@ class BaseConfig:
+             raise ValueError("azure_embedding_endpoint is required when Azure embedding settings are configured.")
+         if self.openie_max_workers < 1:
+             raise ValueError("openie_max_workers must be at least 1.")
++        if not 1 <= self.llm_prefetch_workers <= 8:
++            raise ValueError("llm_prefetch_workers must be between 1 and 8.")
+         if self.openie_ner_max_tokens < 1 or self.openie_triple_max_tokens < 1:
+             raise ValueError("OpenIE token limits must be at least 1.")
+         if self.num_gen_choices != 1:
+diff --git a/src/hipporag/utils/embed_utils.py b/src/hipporag/utils/embed_utils.py
+index 1ac042f..ed4862a 100644
+--- a/src/hipporag/utils/embed_utils.py
++++ b/src/hipporag/utils/embed_utils.py
+@@ -17,7 +17,13 @@ def retrieve_knn(query_ids: List[str], key_ids: List[str], query_vecs, key_vecs,
+     Returns:
+ 
+     """
+-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    # Prefer HIPPORAG_KNN_DEVICE when sharing GPU with a remote vLLM/TEI server.
++    import os
++    knn_device = os.environ.get("HIPPORAG_KNN_DEVICE", "").strip().lower()
++    if knn_device in ("cpu", "cuda"):
++        device = torch.device(knn_device)
++    else:
++        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ 
+     if len(key_vecs) == 0: return {}
+ 
+diff --git a/src/hipporag/utils/misc_utils.py b/src/hipporag/utils/misc_utils.py
+index 50a1d5d..4906ac0 100644
+--- a/src/hipporag/utils/misc_utils.py
++++ b/src/hipporag/utils/misc_utils.py
+@@ -60,18 +60,22 @@ class QuerySolution:
+     thoughts: Optional[List[str]] = None
+     doc_metadata: Optional[List[Dict[str, Any]]] = None
+     graph_seeds: Optional[List[Tuple]] = None
++    retrieval_diagnostics: Optional[Dict[str, Any]] = None
+ 
+ 
+-    def to_dict(self):
++    def to_dict(self, top_k: int = 10):
++        if not isinstance(top_k, int) or top_k < 1:
++            raise ValueError("top_k must be a positive integer.")
+         result = {
+             "question": self.question,
+             "answer": self.answer,
+             "gold_answers": self.gold_answers,
+-            "docs": self.docs[:5],
+-            "doc_scores": [round(v, 4) for v in self.doc_scores.tolist()[:5]]  if self.doc_scores is not None else None,
++            "docs": self.docs[:top_k],
++            "doc_scores": [round(float(v), 4) for v in np.asarray(self.doc_scores).tolist()[:top_k]]  if self.doc_scores is not None else None,
+             "gold_docs": self.gold_docs,
+-            "doc_metadata": self.doc_metadata[:5] if self.doc_metadata is not None else None,
++            "doc_metadata": self.doc_metadata[:top_k] if self.doc_metadata is not None else None,
+             "graph_seeds": self.graph_seeds,
++            "retrieval_diagnostics": self.retrieval_diagnostics or {},
+         }
+         if self.thoughts is not None:
+             result["thoughts"] = self.thoughts

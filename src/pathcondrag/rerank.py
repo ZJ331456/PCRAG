@@ -209,12 +209,15 @@ class DSPyFilter:
         messages.append({"role": "user", "content": self.one_input_template.format(question=question, fact_before_filter=fact_before_filter)})
         # call openai
 
-        self.default_gen_kwargs['max_completion_tokens'] = 512
+        # Independent query workers share this filter instance. Build request
+        # kwargs locally so a call cannot mutate another call's defaults.
+        generation_kwargs = deepcopy(self.default_gen_kwargs)
+        generation_kwargs['max_completion_tokens'] = 512
 
         response = self.llm_infer_fn(
             messages=messages,
             model=self.model_name,
-            **self.default_gen_kwargs
+            **generation_kwargs
         )
         response_text = response
         metadata = {}
@@ -262,14 +265,17 @@ class DSPyFilter:
             "exception": None,
         }
         fact_before_filter = {"fact": [list(candidate_item) for candidate_item in candidate_items]}
+        # Terminal transport/provider failures must abort the run. Only semantic
+        # parsing failures below may produce the original empty-facts fallback.
+        response, llm_meta = self.llm_call(query, json.dumps(fact_before_filter))
+        rerank_info["response"] = response
+        rerank_info["llm_metadata"] = llm_meta
+        rerank_info["response_chars"] = len(response)
+        rerank_info["cache_hit"] = llm_meta.get("cache_hit")
+        rerank_info["llm_finish_reason"] = llm_meta.get("finish_reason")
+        rerank_info["llm_prompt_tokens"] = llm_meta.get("prompt_tokens")
+        rerank_info["llm_completion_tokens"] = llm_meta.get("completion_tokens")
         try:
-            # prediction = self.program(question=query, fact_before_filter=json.dumps(fact_before_filter))
-            response, llm_meta = self.llm_call(query, json.dumps(fact_before_filter))
-            rerank_info["response_chars"] = len(response)
-            rerank_info["cache_hit"] = llm_meta.get("cache_hit")
-            rerank_info["llm_finish_reason"] = llm_meta.get("finish_reason")
-            rerank_info["llm_prompt_tokens"] = llm_meta.get("prompt_tokens")
-            rerank_info["llm_completion_tokens"] = llm_meta.get("completion_tokens")
             generated_facts, parse_diag = self.parse_filter(response, return_diagnostics=True)
             rerank_info["parse_diagnostics"] = parse_diag
             rerank_info["generated_facts_count"] = len(generated_facts)
@@ -277,7 +283,9 @@ class DSPyFilter:
             rerank_info["exception"] = str(e)
             logger.error("rerank exception: %s", e)
             generated_facts = []
-            rerank_info["no_facts_reason"] = "llm_call_or_parse_exception"
+            rerank_info["no_facts_reason"] = "parse_exception"
+
+        rerank_info["generated_facts"] = generated_facts
 
         result_indices = []
         for generated_fact in generated_facts:

@@ -1709,22 +1709,10 @@ class BaseRAG:
             
         except Exception as e:
             logger.error(f"Error in rerank_facts: {str(e)}")
-            return [], [], {
-                'facts_before_rerank': [],
-                'facts_after_rerank': [],
-                'candidate_fact_indices': [],
-                'selected_fact_indices': [],
-                'error': str(e),
-                'no_facts_reason': 'rerank_facts_exception',
-                'reranker_info': {
-                    'candidate_count': 0,
-                    'cache_hit': None,
-                    'generated_facts_count': 0,
-                    'selected_facts_count': 0,
-                    'no_facts_reason': 'rerank_facts_exception',
-                    'exception': str(e),
-                },
-            }
+            # DSPyFilter handles malformed/empty semantic output itself. An
+            # exception escaping it means transport or index state failed; a
+            # silent DPR substitution would invalidate the experiment.
+            raise
     
     def run_ppr(self,
                 reset_prob: np.ndarray,

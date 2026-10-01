@@ -8,6 +8,19 @@ from .utils.config_utils import BaseConfig
 class PCRAGConfig(BaseConfig):
     """Configuration for Path-Centric RAG (PC3 + optional MPCE)."""
 
+    # Cumulative experimental stages; 0 preserves the original algorithm.
+    improvement_stage: int = 0
+    evidence_candidate_top_k: int = 20
+    evidence_pool_size: int = 80
+    evidence_budget: int = 5
+    evidence_beam_width: int = 3
+    evidence_max_searches: int = 20
+    evidence_local_rank_constant: float = 10.0
+    evidence_base_weight: float = 0.4
+    evidence_coverage_weight: float = 0.45
+    evidence_relation_weight: float = 0.25
+    evidence_redundancy_weight: float = 0.15
+
     # Hop estimation
     use_enhanced_hop_estimation: bool = field(default=True)
     hop_force_max: int = field(default=3)
@@ -126,6 +139,13 @@ class PCRAGConfig(BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.improvement_stage not in range(6):
+            raise ValueError("improvement_stage must be 0 through 5")
+        self.evidence_candidate_top_k = max(1, int(self.evidence_candidate_top_k))
+        self.evidence_pool_size = max(5, int(self.evidence_pool_size))
+        self.evidence_budget = min(5, max(1, int(self.evidence_budget)))
+        self.evidence_beam_width = min(3, max(1, int(self.evidence_beam_width)))
+        self.evidence_max_searches = max(1, int(self.evidence_max_searches))
         self.qcappr_hub_penalty_gamma = max(0.0, float(self.qcappr_hub_penalty_gamma))
         self.eba_bridge_weight = max(0.0, float(self.eba_bridge_weight))
         self.hop_force_max = min(4, max(1, int(self.hop_force_max)))

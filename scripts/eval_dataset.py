@@ -19,6 +19,7 @@ PROJECT_ROOT = os.path.dirname(PCRAG_ROOT)
 sys.path.insert(0, os.path.join(PCRAG_ROOT, "src"))
 
 from pathcondrag import PathCondRAG, PathCondRAGConfig, PCRAG, PCRAGConfig
+from pathcondrag.evaluation.result_export import detailed_result
 from eval_utils import (
     build_docs_from_full_corpus,
     build_docs_from_samples,
@@ -38,9 +39,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("pathcondrag.eval")
 
 
-def _select_samples(samples: List[Dict[str, Any]], sample_size: int, sample_seed: int, sample_index: int):
+def _select_samples(samples: List[Dict[str, Any]], sample_size: int, sample_seed: int, sample_index: int,
+                    sample_indices_file: str = ""):
     total = len(samples)
-    if sample_index >= 0:
+    if sample_indices_file:
+        selected_indices = load_json(sample_indices_file)
+        if isinstance(selected_indices, dict):
+            selected_indices = selected_indices.get("selected_indices")
+        if (not isinstance(selected_indices, list) or not selected_indices
+                or any(type(i) is not int or not 0 <= i < total for i in selected_indices)
+                or len(set(selected_indices)) != len(selected_indices)):
+            raise ValueError("sample_indices_file must contain unique valid integer indices")
+        if sample_size > 0 and len(selected_indices) != sample_size:
+            raise ValueError("sample_size and sample_indices_file count differ")
+    elif sample_index >= 0:
         if sample_index >= total:
             raise ValueError(f"sample_index={sample_index} out of range (total={total})")
         selected_indices = [sample_index]
@@ -80,6 +92,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         sample_size=max(0, int(args.sample_size)),
         sample_seed=int(args.sample_seed),
         sample_index=int(args.sample_index),
+        sample_indices_file=getattr(args, "sample_indices_file", ""),
     )
 
     queries = [s["question"] for s in samples]
@@ -156,6 +169,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         embedding_batch_size=int(args.embedding_batch_size),
         openie_max_workers=getattr(args, "openie_max_workers", None),
         llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 8)),
+        improvement_stage=int(getattr(args, "improvement_stage", 0)),
         use_enhanced_hop_estimation=not args.no_enhanced_hop_estimation,
         use_iterative_retrieval=bool(args.use_iterative_retrieval),
         use_qcappr=not args.no_qcappr,
@@ -339,7 +353,16 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
 
     logger.info("[2/4] Building index")
     rag = PathCondRAG(global_config=config)
-    rag.index(docs=docs)
+    if getattr(args, "reuse_index", False):
+        if set(rag.chunk_embedding_store.get_all_texts()) != set(docs):
+            raise ValueError("Shared index passages differ from the evaluation corpus")
+        if not os.path.isfile(os.path.join(rag.working_dir, "graph.pickle")):
+            raise ValueError("reuse_index requires an existing graph")
+        rag.prepare_retrieval_objects()
+        rag._build_index_side_artifacts()
+        logger.info("Reused existing graph/vectors; built only PathCondRAG side artifacts")
+    else:
+        rag.index(docs=docs)
     if benchmark_hops is not None:
         rag.set_query_hop_overrides(hops=benchmark_hops, source="benchmark")
         logger.info("Benchmark hop policy: %s; selected distribution=%s", hop_provenance,
@@ -368,7 +391,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
                 gold_docs=gold_docs,
                 gold_answers=gold_answers,
             )
-        output_rows = [q.to_dict() for q in query_solutions]
+        solutions = query_solutions
         predicted_answers_for_stratified = [q.answer if q.answer is not None else "" for q in query_solutions]
     else:
         retrieval_results, retrieval_metrics = rag.retrieve(
@@ -376,7 +399,14 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
             num_to_retrieve=int(args.retrieval_top_k),
             gold_docs=gold_docs,
         )
-        output_rows = [r.to_dict() for r in retrieval_results]
+        solutions = retrieval_results
+
+    output_rows = [
+        detailed_result(solution, samples[i], selected_indices[i], gold_docs[i],
+                        benchmark_hops[i] if benchmark_hops is not None else None,
+                        getattr(args, "result_top_k", 10), getattr(args, "candidate_output_top_k", 200))
+        for i, solution in enumerate(solutions)
+    ]
 
     out_path = args.output or os.path.join(save_dir, "evaluation_results.json")
 
@@ -433,6 +463,8 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
                 "sample_index": int(args.sample_index),
                 "sample_size_effective": len(samples),
                 "selected_indices": selected_indices,
+                "result_top_k": getattr(args, "result_top_k", 10),
+                "candidate_output_top_k": getattr(args, "candidate_output_top_k", 200),
                 "corpus_mode": args.corpus_mode,
                 "indexed_docs": len(docs),
                 "eval_mode": args.eval_mode,
@@ -486,6 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample_size", type=int, default=0, help="0 means all")
     parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--sample_index", type=int, default=-1)
+    parser.add_argument("--sample_indices_file", default="")
+    parser.add_argument("--reuse_index", action="store_true")
+    parser.add_argument("--improvement_stage", type=int, choices=range(6), default=0)
 
     parser.add_argument("--corpus_mode", choices=["full", "sample_only"], default="full")
     parser.add_argument("--max_corpus_docs", type=int, default=0)
@@ -500,6 +535,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="rag_qa path: full=graph-enhanced rag_qa(); dpr_only=dense passage retrieval + QA (rag_qa_dpr).",
     )
     parser.add_argument("--retrieval_top_k", type=int, default=200)
+    parser.add_argument("--result_top_k", type=int, default=10)
+    parser.add_argument("--candidate_output_top_k", type=int, default=200)
     parser.add_argument("--linking_top_k", type=int, default=5)
     parser.add_argument("--qa_top_k", type=int, default=5)
     parser.add_argument("--max_qa_steps", type=int, default=1)
