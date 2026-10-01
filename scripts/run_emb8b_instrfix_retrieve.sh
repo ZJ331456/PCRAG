@@ -65,73 +65,11 @@ fi
 # ---------- 1) HippoRAG2 retrieve-only ----------
 echo ""
 echo "[1/2] HippoRAG2 retrieve-only -> ${HIPPO_DIR}/metrics_retrieve.json"
-conda run --no-capture-output -n "${CONDA_ENV}" python -u - <<PY
-import json, logging, os, sys
-from pathlib import Path
-
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
-os.environ.setdefault("HIPPORAG_KNN_DEVICE", "cpu")
-
-HIPPO_ROOT = Path("${HIPPO_ROOT}")
-sys.path.insert(0, str(HIPPO_ROOT / "src"))
-sys.path.insert(0, str(HIPPO_ROOT))
-
-from main import get_gold_docs, get_gold_answers
-from hipporag.HippoRAG import HippoRAG
-from hipporag.utils.config_utils import BaseConfig
-
-logging.basicConfig(level=logging.INFO)
-dataset_dir = Path("${DATASETS_DIR}")
-samples = json.loads((dataset_dir / "musique.json").read_text())
-corpus = json.loads((dataset_dir / "musique_corpus.json").read_text())
-docs = [f"{d['title']}\n{d['text']}" for d in corpus]
-queries = [s["question"] for s in samples]
-gold_docs = get_gold_docs(samples, "musique")
-
-save_dir = "${HIPPO_DIR}"
-config = BaseConfig(
-    save_dir=save_dir,
-    dataset="musique",
-    llm_name="${LLM_NAME}",
-    llm_base_url="${LLM_BASE_URL}",
-    embedding_model_name="${EMB_PATH}",
-    embedding_provider="transformers",
-    embedding_batch_size=int("${EMBEDDING_BATCH_SIZE}"),
-    force_index_from_scratch=False,
-    force_openie_from_scratch=False,
-    retrieval_top_k=200,
-    linking_top_k=5,
-    qa_top_k=5,
-    max_new_tokens=2048,
-    temperature=0.0,
-    openie_mode="online",
-    synonymy_edge_topk=50,
-    synonymy_edge_query_batch_size=128,
-    synonymy_edge_key_batch_size=1024,
-    rerank_dspy_file_path=str(HIPPO_ROOT / "src" / "hipporag" / "prompts" / "dspy_prompts" / "filter_llama3.3-70B-Instruct.json"),
-)
-with HippoRAG(global_config=config) as rag:
-    rag.index(docs)  # reuse existing graph/embeddings
-    retrieval_results, retrieval_metrics = rag.retrieve(queries=queries, gold_docs=gold_docs)
-
-metrics = {
-    "dataset": "musique",
-    "method": "hipporag2",
-    "eval_mode": "retrieve",
-    "note": "instrfix: Qwen3 uses Hippo task prompts via ST prompt=",
-    "n_samples": len(samples),
-    "n_docs": len(docs),
-    "llm_name": "${LLM_NAME}",
-    "embedding_name": "${EMB_PATH}",
-    "retrieval_metrics": retrieval_metrics or {},
-}
-out = Path(save_dir) / "metrics_retrieve.json"
-out.write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
-print("[hippo]", json.dumps(retrieval_metrics, indent=2, ensure_ascii=False))
-print(f"[saved] {out}")
-PY
+conda run --no-capture-output -n "${CONDA_ENV}" \
+  python -u "${ROOT}/scripts/experiment_tools.py" embedding-eval-hippo-instrfix \
+  --hippo-root "${HIPPO_ROOT}" --datasets-dir "${DATASETS_DIR}" \
+  --save-dir "${HIPPO_DIR}" --llm "${LLM_NAME}" --llm-base-url "${LLM_BASE_URL}" \
+  --embedding "${EMB_PATH}" --embedding-batch-size "${EMBEDDING_BATCH_SIZE}"
 
 # ---------- 2) PathCondRAG-PC3 retrieve-only, reuse same Hippo index ----------
 echo ""
@@ -179,30 +117,9 @@ conda run --no-capture-output -n "${CONDA_ENV}" \
   --stratified_eval --stratified_output "${PCR_DIR}/stratified.json" \
   "${PC3_ARGS[@]}"
 
-python - <<PY
-import json
-from pathlib import Path
-out = Path("${OUT_ROOT}")
-h = json.loads((out / "hipporag2_musique" / "metrics_retrieve.json").read_text())
-p = json.loads((out / "pathcondrag" / "result.json").read_text())
-old = {}
-old_path = Path("${SRC_HIPPO}").parent / "pair_summary.json"
-if old_path.is_file():
-    old = json.loads(old_path.read_text())
-summary = {
-    "note": "instrfix retrieve-only; index reused from emb_ablation_qwen3emb8b_full",
-    "embedding": "${EMB_PATH}",
-    "llm": "${LLM_NAME}",
-    "hipporag2_retrieve": h.get("retrieval_metrics"),
-    "pathcondrag_pc3_retrieve": p.get("retrieval_metrics"),
-    "baseline_before_fix": {
-        "hipporag2": (old.get("hipporag2") or {}).get("retrieval"),
-        "pathcondrag_pc3": (old.get("pathcondrag_pc3") or {}).get("retrieval"),
-    },
-}
-(out / "pair_summary_retrieve.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-print("[summary]", json.dumps(summary, indent=2, ensure_ascii=False))
-PY
+python "${ROOT}/scripts/experiment_tools.py" embedding-instrfix-summary \
+  --output-dir "${OUT_ROOT}" --source-hippo "${SRC_HIPPO}" \
+  --embedding "${EMB_PATH}" --llm "${LLM_NAME}"
 
 echo "[done] ${OUT_ROOT}"
 echo "LOG=${LOG}"

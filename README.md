@@ -24,6 +24,9 @@ src/pathcondrag/
 scripts/
   eval_dataset.py
   run_pc3.sh           # USE_MPCE=0|1
+  run_*.sh            # experiment settings, execution order, logs
+  experiment_tools.py # CLI for shell runner helpers
+  utils/              # data preparation, validation, result reports
 ```
 
 ## Usage
@@ -41,6 +44,24 @@ SAMPLE_SIZE=2 CORPUS_MODE=sample_only EVAL_MODE=retrieve \
 ```
 
 Default models: Qwen3-8B (`qwen3-8b` @ :8035) + NV-Embed-v2 (`/root/models/NV-Embed-v2`).
+
+## Experiment script helpers
+
+The `run_*.sh` scripts keep their existing environment variables and launch
+commands. Their Python logic lives in `scripts/utils/`: `embedding.py` prepares
+smoke samples and paired reports, `ablations.py` validates component ablations,
+and `prefetch.py` / `safe_prefetch.py` check and summarize LLM concurrency runs.
+`common.py` shares JSON and vLLM log readers. Shell scripts pass explicit,
+quoted arguments through one entry point:
+
+```bash
+python scripts/experiment_tools.py --help
+python scripts/experiment_tools.py prefetch-summary --help
+```
+
+Report and validation commands use the Python standard library. Model-related
+dependencies load only when a command runs an evaluation or GPU cleanup.
+Existing result filenames, JSON fields, and validation rules are preserved.
 
 ## Local Qwen3 concurrency and reproducibility
 

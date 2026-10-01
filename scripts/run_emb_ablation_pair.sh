@@ -72,31 +72,10 @@ SMOKE_DATA_DIR="${OUT_ROOT}/smoke_data"
 
 prepare_smoke_data() {
   mkdir -p "${SMOKE_DATA_DIR}"
-  conda run --no-capture-output -n "${CONDA_ENV}" python - <<PY
-import json, random
-from pathlib import Path
-src = Path("${DATASETS_DIR}")
-out = Path("${SMOKE_DATA_DIR}")
-n = int("${SAMPLE_SIZE}")
-seed = int("${SAMPLE_SEED}")
-samples = json.loads((src/"musique.json").read_text())
-rng = random.Random(seed)
-idxs = sorted(rng.sample(range(len(samples)), k=min(n, len(samples))))
-sel = [samples[i] for i in idxs]
-# Build a small corpus from selected samples' paragraphs (MuSiQue style).
-docs = {}
-for s in sel:
-    for p in s.get("paragraphs") or []:
-        title = p.get("title") or ""
-        text = p.get("text") or p.get("paragraph_text") or ""
-        key = title + "\n" + text
-        docs[key] = {"title": title, "text": text}
-corpus = list(docs.values())
-(out/"musique.json").write_text(json.dumps(sel, ensure_ascii=False, indent=2))
-(out/"musique_corpus.json").write_text(json.dumps(corpus, ensure_ascii=False, indent=2))
-(out/"selected_indices.json").write_text(json.dumps(idxs))
-print(f"[smoke-data] samples={len(sel)} corpus={len(corpus)} idxs={idxs}")
-PY
+  conda run --no-capture-output -n "${CONDA_ENV}" \
+    python "${ROOT}/scripts/experiment_tools.py" embedding-prepare-smoke \
+    --datasets-dir "${DATASETS_DIR}" --output-dir "${SMOKE_DATA_DIR}" \
+    --sample-size "${SAMPLE_SIZE}" --sample-seed "${SAMPLE_SEED}"
 }
 
 echo "================================================================="
@@ -137,14 +116,8 @@ conda run --no-capture-output -n "${CONDA_ENV}" \
   --sample_size 0 \
   --save_dir "${HIPPO_SAVE_PREFIX}"
 
-python - <<PY
-import json
-from pathlib import Path
-p=Path("${HIPPO_DIR}")/"metrics.json"
-d=json.loads(p.read_text())
-print("[hippo]", d.get("retrieval_metrics"), d.get("qa_metrics"))
-print("[hippo] emb", d.get("embedding_name"), "n", d.get("n_samples"), "docs", d.get("n_docs"))
-PY
+python "${ROOT}/scripts/experiment_tools.py" embedding-print-metrics \
+  --result "${HIPPO_DIR}/metrics.json" --method hippo
 
 # ---------- 2) PathCondRAG PC3 reuse Hippo index ----------
 echo ""
@@ -205,33 +178,13 @@ conda run --no-capture-output -n "${CONDA_ENV}" \
   --stratified_eval --stratified_output "${PCR_DIR}/stratified.json" \
   "${PC3_ARGS[@]}"
 
-python - <<PY
-import json
-from pathlib import Path
-p=Path("${PCR_DIR}")/"result.json"
-d=json.loads(p.read_text())
-print("[pcr]", d.get("retrieval_metrics"), d.get("qa_metrics"))
-PY
+python "${ROOT}/scripts/experiment_tools.py" embedding-print-metrics \
+  --result "${PCR_DIR}/result.json" --method pcr
 
 # drop a pair summary
-python - <<PY
-import json
-from pathlib import Path
-out=Path("${OUT_ROOT}")
-h=json.loads((out/"hipporag2_musique"/"metrics.json").read_text())
-p=json.loads((out/"pathcondrag"/"result.json").read_text())
-summary={
-  "mode": "${MODE}",
-  "tag": "${TAG}",
-  "embedding": "${EMB_PATH}",
-  "llm": "${LLM_NAME}",
-  "embedding_batch_size": int("${EMBEDDING_BATCH_SIZE}"),
-  "embedding_max_seq_len": 2048,
-  "hipporag2": {"retrieval": h.get("retrieval_metrics"), "qa": h.get("qa_metrics"), "n_docs": h.get("n_docs"), "n_samples": h.get("n_samples")},
-  "pathcondrag_pc3": {"retrieval": p.get("retrieval_metrics"), "qa": p.get("qa_metrics")},
-}
-(out/"pair_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-print("[summary]", json.dumps(summary, indent=2))
-PY
+python "${ROOT}/scripts/experiment_tools.py" embedding-pair-summary \
+  --output-dir "${OUT_ROOT}" --mode "${MODE}" --tag "${TAG}" \
+  --embedding "${EMB_PATH}" --llm "${LLM_NAME}" \
+  --embedding-batch-size "${EMBEDDING_BATCH_SIZE}"
 
 echo "[done] pair ${TAG}/${MODE} -> ${OUT_ROOT}"

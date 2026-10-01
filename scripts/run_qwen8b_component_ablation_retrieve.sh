@@ -30,38 +30,9 @@ if ! curl -sf -o /dev/null "${LLM_BASE_URL}/models"; then
   exit 1
 fi
 
-SOURCE_RESULT="${SOURCE_RESULT}" SOURCE_INDEX="${SOURCE_INDEX}" EMBEDDING_MODEL="${EMBEDDING_MODEL}" python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-d = json.loads(Path(os.environ["SOURCE_RESULT"]).read_text())
-c = d["runtime_config"]
-expected = {
-    "embedding_model_name": os.environ["EMBEDDING_MODEL"],
-    "embedding_batch_size": 4,
-    "retrieval_top_k": 200,
-    "hop_force_max": 2,
-    "hop_multi_min_signals": 2,
-    "use_qcappr": True,
-    "use_eba": True,
-    "use_entity_idf_index": True,
-    "use_bridge_cache_index": True,
-    "use_iterative_retrieval": True,
-    "use_query_decomposition": True,
-    "use_path_conditioned_qd": True,
-    "use_path_set_optimization": True,
-}
-for key, value in expected.items():
-    if c.get(key) != value:
-        raise SystemExit(f"Source result mismatch: {key}={c.get(key)!r}, expected {value!r}")
-if d.get("sample_size_effective") != 1000 or d.get("indexed_docs") != 11656:
-    raise SystemExit("Source result is not the completed 1000-question full-corpus run")
-manifest = json.loads((Path(os.environ["SOURCE_INDEX"]) / "qwen3-8b__root_models_Qwen3-Embedding-8B" / "index_manifest.json").read_text())
-if manifest["embedding"]["model_name"] != os.environ["EMBEDDING_MODEL"]:
-    raise SystemExit("Source index embedding does not match the requested Qwen3-Embedding-8B")
-print("[verified] Existing PathCondRAG Qwen3 index and full-run configuration")
-PY
+python "${ROOT}/scripts/experiment_tools.py" ablation-qwen-validate-source \
+  --source-result "${SOURCE_RESULT}" --source-index "${SOURCE_INDEX}" \
+  --embedding-model "${EMBEDDING_MODEL}"
 
 SOURCE_GRAPH_SHA="$(sha256sum "${SOURCE_INDEX}/${MODEL_DIR}/graph.pickle" | cut -d' ' -f1)"
 printf '%s\n' "${SOURCE_GRAPH_SHA}" > "${OUT_ROOT}/source_graph.sha256"
@@ -91,19 +62,8 @@ run_case() {
   local result="${OUT_ROOT}/results/${name}.json"
   local index="${OUT_ROOT}/indexes/${name}"
 
-  if [[ -f "${result}" ]] && RESULT="${result}" NAME="${name}" python - <<'PY'
-import json
-import os
-from pathlib import Path
-d = json.loads(Path(os.environ["RESULT"]).read_text())
-c = d.get("runtime_config", {})
-ok = (d.get("sample_size_effective") == 1000
-      and d.get("eval_mode") == "retrieve"
-      and d.get("retrieval_metrics", {}).get("Recall@20") is not None
-      and c.get("embedding_batch_size") == 4
-      and c.get("embedding_model_name") == "/root/models/Qwen3-Embedding-8B")
-raise SystemExit(0 if ok else 1)
-PY
+  if [[ -f "${result}" ]] && python "${ROOT}/scripts/experiment_tools.py" \
+    ablation-qwen-result-complete --result "${result}"
   then
     echo "[skip] ${name}: completed result exists"
     return 0
@@ -123,20 +83,8 @@ PY
   conda run --no-capture-output -n "${CONDA_ENV}" python -u "${ROOT}/scripts/eval_dataset.py" \
     "${COMMON[@]}" --save_dir "${index}" --output "${result}" "$@"
 
-  RESULT="${result}" NAME="${name}" python - <<'PY'
-import json
-import os
-from pathlib import Path
-d = json.loads(Path(os.environ["RESULT"]).read_text())
-r = d["retrieval_metrics"]
-c = d["runtime_config"]
-keys = ("Recall@1", "Recall@2", "Recall@5", "Recall@10", "Recall@20")
-print("[done]", os.environ["NAME"], {k: r.get(k) for k in keys},
-      "active=", {k: c[k] for k in ("use_qcappr", "use_eba", "use_entity_idf_index",
-                                     "use_iterative_retrieval", "use_query_decomposition",
-                                     "use_path_conditioned_qd", "use_path_set_optimization")},
-      flush=True)
-PY
+  python "${ROOT}/scripts/experiment_tools.py" ablation-qwen-print-result \
+    --result "${result}" --name "${name}"
 }
 
 echo "[source] ${SOURCE_INDEX}"
@@ -151,31 +99,5 @@ run_case wo_qd --use_iterative_retrieval
 run_case wo_pcqd --use_iterative_retrieval --use_query_decomposition
 run_case wo_pathset --use_iterative_retrieval --use_query_decomposition --use_path_conditioned_qd --no_path_set_opt
 
-OUT_ROOT="${OUT_ROOT}" SOURCE_RESULT="${SOURCE_RESULT}" python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-root = Path(os.environ["OUT_ROOT"])
-full = json.loads(Path(os.environ["SOURCE_RESULT"]).read_text())
-keys = ["Recall@1", "Recall@2", "Recall@5", "Recall@10", "Recall@20"]
-summary = {
-    "source_index": str(root.parent / "pathcondrag" / "index"),
-    "embedding_model": "/root/models/Qwen3-Embedding-8B",
-    "embedding_batch_size": 4,
-    "full_reference_existing_result": {k: full["retrieval_metrics"].get(k) for k in keys},
-    "ablations": {},
-}
-for name in ("wo_qcappr", "wo_eba", "wo_idf", "wo_iter", "wo_qd", "wo_pcqd", "wo_pathset"):
-    d = json.loads((root / "results" / f"{name}.json").read_text())
-    summary["ablations"][name] = {
-        "retrieval": {k: d["retrieval_metrics"].get(k) for k in keys},
-        "delta_vs_existing_full": {
-            k: round(d["retrieval_metrics"][k] - full["retrieval_metrics"][k], 4) for k in keys
-        },
-        "module_usage": d.get("retrieval_diagnostics", {}).get("module_usage", {}),
-    }
-path = root / "summary.json"
-path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-print(f"[summary] {path}", flush=True)
-PY
+python "${ROOT}/scripts/experiment_tools.py" ablation-qwen-summary \
+  --out-root "${OUT_ROOT}" --source-result "${SOURCE_RESULT}"

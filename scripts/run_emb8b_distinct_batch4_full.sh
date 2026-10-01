@@ -76,26 +76,5 @@ conda run --no-capture-output -n rag python -u "${ROOT}/scripts/eval_dataset.py"
   --pcqd_path_score_threshold 0.60 \
   --pcqd_weight_base 0.40 --pcqd_weight_static 0.20 --pcqd_weight_path 0.40
 
-OUT_ROOT="${OUT_ROOT}" python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-root = Path(os.environ["OUT_ROOT"])
-hippo = json.loads((root / "hipporag2_musique" / "metrics.json").read_text())
-path = json.loads((root / "pathcondrag" / "result.json").read_text())
-summary = {
-    "embedding": "/root/models/Qwen3-Embedding-8B",
-    "embedding_batch_size": 4,
-    "hipporag2": {
-        "retrieval": hippo["retrieval_metrics"],
-        "qa": hippo["qa_metrics"],
-    },
-    "pathcondrag_pc3": {
-        "retrieval": path["retrieval_metrics"],
-        "qa": path["qa_metrics"],
-    },
-}
-(root / "pair_summary.json").write_text(json.dumps(summary, indent=2))
-print(json.dumps(summary, indent=2))
-PY
+python "${ROOT}/scripts/experiment_tools.py" embedding-distinct-summary \
+  --output-dir "${OUT_ROOT}"

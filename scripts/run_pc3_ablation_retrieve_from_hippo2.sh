@@ -83,13 +83,8 @@ run_case() {
   fi
   local out="${RESULT_DIR}/${name}.json"
   if [[ "${SKIP_EXISTING:-1}" == "1" && -f "${out}" ]]; then
-    if python - "${out}" <<'PY'
-import json, sys
-from pathlib import Path
-d=json.loads(Path(sys.argv[1]).read_text())
-r=d.get("retrieval_metrics") or {}
-sys.exit(0 if r.get("Recall@5") is not None else 1)
-PY
+    if python "${ROOT}/scripts/experiment_tools.py" ablation-pc3-result-complete \
+      --result "${out}"
     then
       echo "[skip] ${name} already has retrieval_metrics -> ${out}"
       return 0
@@ -104,15 +99,8 @@ PY
   conda run --no-capture-output -n "${CONDA_ENV}" \
     python "${ROOT}/scripts/eval_dataset.py" \
     "${COMMON[@]}" --output "${out}" "$@"
-  python - <<PY
-import json
-from pathlib import Path
-p=Path(${out@Q})
-d=json.loads(p.read_text())
-r=d.get("retrieval_metrics") or {}
-keys=["Recall@1","Recall@2","Recall@5","Recall@10","Recall@20"]
-print("[metrics]", ${name@Q}, {k:r.get(k) for k in keys})
-PY
+  python "${ROOT}/scripts/experiment_tools.py" ablation-pc3-print-result \
+    --result "${out}" --name "${name}"
 }
 
 echo "================================================================="
@@ -160,25 +148,7 @@ run_case abl_pc3 \
   "${PC3_FULL[@]}"
 
 # summary table
-RESULT_DIR="${RESULT_DIR}" python - <<'PY'
-import json, os
-from pathlib import Path
-result_dir = Path(os.environ["RESULT_DIR"])
-keys = ["Recall@1", "Recall@2", "Recall@5", "Recall@10", "Recall@20"]
-rows = []
-for p in sorted(result_dir.glob("*.json")):
-    d = json.loads(p.read_text())
-    r = d.get("retrieval_metrics") or {}
-    rows.append((p.stem, {k: r.get(k) for k in keys}))
-print("\n===== ABLATION SUMMARY (retrieve) =====")
-hdr = f"{'case':20} " + " ".join(f"{k:>10}" for k in keys)
-print(hdr)
-print("-" * len(hdr))
-for name, r in rows:
-    print(f"{name:20} " + " ".join(f"{(r[k] if r[k] is not None else float('nan')):10.4f}" for k in keys))
-out = result_dir.parent / "summary.json"
-out.write_text(json.dumps([{"case": n, "retrieval": r} for n, r in rows], indent=2))
-print(f"\n[saved] {out}")
-PY
+python "${ROOT}/scripts/experiment_tools.py" ablation-pc3-summary \
+  --result-dir "${RESULT_DIR}"
 
 echo "[done] results=${RESULT_DIR}"

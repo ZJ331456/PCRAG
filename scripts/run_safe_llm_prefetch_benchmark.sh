@@ -79,98 +79,11 @@ for workers in ${WORKER_LEVELS}; do
     --save_dir "${index_dir}" --output "${result_path}"
   end_ts="$(date +%s)"
   log_end="$(stat -c %s "${VLLM_LOG}")"
-  RUN_RESULT="${result_path}" RUN_CASE="${case_dir}" RUN_ELAPSED="$((end_ts-start_ts))" \
-    VLLM_LOG="${VLLM_LOG}" LOG_START="${log_start}" LOG_END="${log_end}" python - <<'PY'
-import json
-import os
-import re
-from pathlib import Path
-
-result = json.loads(Path(os.environ["RUN_RESULT"]).read_text())
-expected = int(os.environ.get("SAMPLE_SIZE", "24"))
-if not (len(result["results"]) == len(result["selected_indices"]) == result["sample_size_effective"] == expected):
-    raise SystemExit(f"Unexpected completed sample count: {result['sample_size_effective']} != {expected}")
-if result.get("hop_source") != "benchmark":
-    raise SystemExit("Benchmark hop source was not recorded")
-with open(os.environ["VLLM_LOG"], "rb") as f:
-    f.seek(int(os.environ["LOG_START"]))
-    log = f.read(int(os.environ["LOG_END"]) - int(os.environ["LOG_START"])).decode("utf-8", "replace")
-status = {}
-for code in re.findall(r'POST /v1/chat/completions HTTP/1\.1" (\d{3})', log):
-    status[code] = status.get(code, 0) + 1
-report = {
-    "seconds": int(os.environ["RUN_ELAPSED"]),
-    "retrieval_seconds": result.get("retrieval_seconds"),
-    "llm_request_stats": result.get("llm_request_stats", {}),
-    "retrieval_metrics": result["retrieval_metrics"],
-    "hop_distribution": result.get("hop_distribution"),
-    "hop_counter": result["retrieval_diagnostics"].get("hop_counter"),
-    "qd_used": result["retrieval_diagnostics"].get("qd_used_count"),
-    "pcqd_used": result["retrieval_diagnostics"].get("pcqd_used_count"),
-    "http_status_in_log": status,
-}
-Path(os.environ["RUN_CASE"], "report.json").write_text(json.dumps(report, indent=2))
-print("[done]", Path(os.environ["RUN_CASE"]).name, report, flush=True)
-if any(code != "200" for code in status):
-    raise SystemExit("Non-200 LLM response detected in vLLM log")
-if report["llm_request_stats"].get("failures", 0):
-    raise SystemExit("Client reported terminal LLM request failure")
-if report["llm_request_stats"].get("http_attempts", 0) > 0 and not status:
-    raise SystemExit("Client made LLM requests but no HTTP statuses were found in the vLLM log")
-PY
+  python "${ROOT}/scripts/experiment_tools.py" safe-prefetch-report \
+    --result "${result_path}" --case-dir "${case_dir}" \
+    --elapsed "$((end_ts-start_ts))" --sample-size "${SAMPLE_SIZE}" \
+    --vllm-log "${VLLM_LOG}" --log-start "${log_start}" --log-end "${log_end}"
 done
 
-RUN_ROOT="${RUN_ROOT}" python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-root = Path(os.environ["RUN_ROOT"])
-cases = sorted(root.glob("workers_*/result.json"))
-summary = {}
-baseline_path = root / "workers_1" / "result.json"
-if not baseline_path.exists():
-    raise SystemExit("Missing workers_1 baseline")
-baseline = json.loads(baseline_path.read_text())
-samples = json.loads(Path("/root/datasets/musique.json").read_text())
-for path in cases:
-    result = json.loads(path.read_text())
-    if not (len(result["results"]) == len(result["selected_indices"]) == result["sample_size_effective"]):
-        raise SystemExit(f"Invalid result length: {path}")
-    all_gold_top5 = 0
-    for row, sample_index in zip(result["results"], result["selected_indices"]):
-        sample = samples[sample_index]
-        gold = {
-            p["title"] + "\n" + (p.get("text") or p.get("paragraph_text", ""))
-            for p in sample["paragraphs"] if p.get("is_supporting") is not False
-        }
-        all_gold_top5 += int(bool(gold) and gold.issubset(set(row["docs"][:5])))
-    summary[path.parent.name] = {
-        "seconds": json.loads((path.parent / "report.json").read_text())["seconds"],
-        "retrieval_seconds": result.get("retrieval_seconds"),
-        "Recall@1": result["retrieval_metrics"]["Recall@1"],
-        "Recall@2": result["retrieval_metrics"]["Recall@2"],
-        "Recall@5": result["retrieval_metrics"]["Recall@5"],
-        "Recall@10": result["retrieval_metrics"]["Recall@10"],
-        "all_gold_top5": all_gold_top5 / len(result["results"]),
-        "qd_used": result["retrieval_diagnostics"].get("qd_used_count"),
-        "pcqd_used": result["retrieval_diagnostics"].get("pcqd_used_count"),
-        "llm_request_stats": result.get("llm_request_stats", {}),
-    }
-    if result["selected_indices"] != baseline["selected_indices"]:
-        raise SystemExit("Cases used different question subsets")
-    summary[path.parent.name]["same_ordered_top5_vs_workers_1"] = sum(
-        a["docs"][:5] == b["docs"][:5]
-        for a, b in zip(result["results"], baseline["results"])
-    )
-    summary[path.parent.name]["same_top5_scores_vs_workers_1"] = sum(
-        a["doc_scores"][:5] == b["doc_scores"][:5]
-        for a, b in zip(result["results"], baseline["results"])
-    )
-    summary[path.parent.name]["different_question_indices_vs_workers_1"] = [
-        idx for idx, (a, b) in enumerate(zip(result["results"], baseline["results"]))
-        if a["docs"][:5] != b["docs"][:5]
-    ]
-(root / "comparison.json").write_text(json.dumps(summary, indent=2))
-print("[comparison]", summary, flush=True)
-PY
+python "${ROOT}/scripts/experiment_tools.py" safe-prefetch-compare \
+  --run-root "${RUN_ROOT}" --samples "/root/datasets/musique.json"

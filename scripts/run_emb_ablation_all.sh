@@ -18,8 +18,8 @@ run_pair() {
   MODE="${mode}" EMB_TAG="${tag}" \
     bash "${ROOT}/scripts/run_emb_ablation_pair.sh"
   # encourage GPU release between pairs
-  conda run --no-capture-output -n rag python -c 'import gc,torch; gc.collect();
-import torch; torch.cuda.empty_cache() if torch.cuda.is_available() else None; print("[gpu] cleared")' || true
+  conda run --no-capture-output -n rag \
+    python "${ROOT}/scripts/experiment_tools.py" embedding-release-memory || true
 }
 
 echo "Master log: ${MASTER_LOG}"
