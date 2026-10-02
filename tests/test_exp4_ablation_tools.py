@@ -43,6 +43,7 @@ class Exp4AblationToolsTests(unittest.TestCase):
             row["retrieval_trace"] = {"evidence": {"ablation": {
                 "mode": mode, "binding_mode": binding, "selection_mode": selection,
                 "llm_calls": 3, "call_budget": 3,
+                "global_query_index": row["query_index"],
                 "selection_shared_branches": mode == "selection", "shared_beam_width": 3}}}
             if selection in ("ancestor", "joint"):
                 row["retrieval_trace"]["evidence"]["selection_diagnostics"] = {
@@ -56,6 +57,19 @@ class Exp4AblationToolsTests(unittest.TestCase):
             self.assertEqual(record["evidence_call_budget"], 3)
             self.assertEqual(len(record["pool"]), 200)
         self.assertNotIn("GOLD LEAK", (self.out / "ablation_inputs.json").read_text())
+
+    def test_duplicate_question_text_preserves_distinct_sample_identity(self):
+        data = self.fixture.data
+        data[1]["question"] = data[0]["question"]
+        pool = self.fixture.result(3)
+        budget = self.fixture.result(4)
+        for index, row in enumerate(budget["results"]):
+            row["retrieval_trace"]["evidence"] = {"llm_plan_calls": 1, "llm_verification_calls": index + 1}
+        records = controls.freeze_records(pool, budget, data, [0, 1, 2],
+            {shared.passage_text(p) for p in self.fixture.corpus})["records"]
+        self.assertEqual(records[0]["question"], records[1]["question"])
+        self.assertNotEqual(records[0]["sample_id"], records[1]["sample_id"])
+        self.assertEqual([r["evidence_call_budget"] for r in records[:2]], [2, 3])
 
     def test_hardlinks_only_immutable_assets_and_cache_isolation(self):
         name = "exp4_abla3_literal"
@@ -89,6 +103,10 @@ class Exp4AblationToolsTests(unittest.TestCase):
             controls.validate_controls(result, manifest, name, inputs)
         control["llm_calls"] = 2
         with self.assertRaisesRegex(ValueError, "query-generation"):
+            controls.validate_controls(result, manifest, name, inputs)
+        control["llm_calls"] = 3
+        control["global_query_index"] = 999
+        with self.assertRaisesRegex(ValueError, "sample identity"):
             controls.validate_controls(result, manifest, name, inputs)
 
     def test_missing_ancestor_check_and_wrong_variant_cannot_validate(self):

@@ -99,8 +99,8 @@ class FakeRAG:
         return str(response)
 
 
-def state(question="Where was the writer of Work X born?"):
-    return {"query": question, "query_idx": 0,
+def state(question="Where was the writer of Work X born?", query_idx=0):
+    return {"query": question, "query_idx": query_idx,
             "base": (np.arange(4), np.asarray([.9, .8, .7, .6]), {"hops": 2}),
             "static_sub_questions": [], "pcqd_sub_questions": []}
 
@@ -213,7 +213,7 @@ class EvidenceAblationTests(unittest.TestCase):
         for mode in ("budget_qd", "budget_iterative"):
             with self.subTest(mode=mode):
                 rag = FakeRAG(mode=mode, responder=lambda _: {"queries": ["Who wrote Work X?"]})
-                states = [state("Question A?"), state("Question B?")]
+                states = [state("Question A?"), state("Question B?", query_idx=1)]
                 engine = engine_with_inputs(rag, inputs(rag, {"Question A?": 1, "Question B?": 3}))
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     engine.process_window(states, executor)
@@ -224,6 +224,62 @@ class EvidenceAblationTests(unittest.TestCase):
                     self.assertTrue(any("Retrieved passages" in str(call) for call in rag.llm_model.calls))
                 else:
                     self.assertFalse(any("Retrieved passages" in str(call) for call in rag.llm_model.calls))
+
+    def test_duplicate_question_samples_keep_independent_call_budgets(self):
+        question = "Identical benchmark question?"
+        rag = FakeRAG(mode="budget_qd", responder=lambda _: {"queries": ["Who wrote Work X?"]})
+        payload = {"schema_version": 1, "records": [
+            {"question": question, "sample_id": "row176", "query_index": 176,
+             "pool": [], "evidence_call_budget": 1},
+            {"question": question, "sample_id": "row525", "query_index": 525,
+             "pool": [], "evidence_call_budget": 3}]}
+        engine = engine_with_inputs(rag, payload)
+        states = [state(question, query_idx=0), state(question, query_idx=1)]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            engine.process_window(states, executor)
+        self.assertEqual([s["evidence_trace"]["ablation"]["llm_calls"] for s in states], [1, 3])
+        self.assertEqual([s["evidence_trace"]["ablation"]["global_query_index"] for s in states], [176, 525])
+        ambiguous = state(question)
+        del ambiguous["query_idx"]
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            engine._record(ambiguous)
+        with self.assertRaisesRegex(ValueError, "text does not match"):
+            engine._record(state("Another question?", query_idx=0))
+
+    def test_duplicate_question_dag_diagnostics_do_not_overwrite_other_sample(self):
+        rag = FakeRAG(mode="budget_dag", responses=[PLAN, ALPHA, ROME])
+        question = state()["query"]
+        payload = {"schema_version": 1, "records": [
+            {"question": question, "sample_id": "row176", "query_index": 176,
+             "pool": [], "evidence_call_budget": 0},
+            {"question": question, "sample_id": "row525", "query_index": 525,
+             "pool": [], "evidence_call_budget": 3}]}
+        engine = engine_with_inputs(rag, payload)
+        states = [state(question, query_idx=0), state(question, query_idx=1)]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            engine.process_window(states, executor)
+        self.assertEqual([s["evidence_trace"]["llm_plan_calls"] for s in states], [0, 1])
+        self.assertEqual(states[0]["evidence_trace"]["planning_outputs"]["outputs"], [])
+        self.assertEqual(states[1]["evidence_trace"]["plan"], PLAN["nodes"])
+        self.assertEqual(states[1]["evidence_trace"]["bindings"], {"s1": "Alpha", "s2": "Rome"})
+        self.assertIsNot(states[0]["_ablation_plan_diagnostic"], states[1]["_ablation_plan_diagnostic"])
+
+    def test_duplicate_question_frozen_pools_are_keyed_by_global_sample_identity(self):
+        rag = FakeRAG(mode="fixed_pool", stage=3, count=201)
+        question = state()["query"]
+        payload = {"schema_version": 1, "records": [
+            {"question": question, "sample_id": str(global_index), "query_index": global_index,
+             "evidence_call_budget": 1, "pool": [
+                 {"doc_hash": key, "score": 1. - i / 200.}
+                 for i, key in enumerate(rag.passage_node_keys[start:start + 200])]}
+            for start, global_index in [(0, 176), (1, 525)]]}
+        engine = engine_with_inputs(rag, payload)
+        states = [state(question, query_idx=0), state(question, query_idx=1)]
+        engine.process_window(states)
+        outputs = [engine.finalize(question, np.arange(201), np.ones(201), {}, s)[0] for s in states]
+        self.assertEqual(set(outputs[0].tolist()), set(range(200)))
+        self.assertEqual(set(outputs[1].tolist()), set(range(1, 201)))
+        self.assertEqual(set(engine._frozen_pools), {176, 525})
 
     def test_invalid_json_calls_are_productive_retries_within_budget(self):
         rag = FakeRAG(mode="budget_qd", responses=["bad json", {"queries": ["Find the writer"]}])

@@ -39,8 +39,11 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
         self._local = threading.local()
         self._single_flight_registry_lock = threading.Lock()
         self._single_flight_prompt_locks = {}
-        self.query_inputs: Dict[str, dict] = {}
-        self._frozen_pools: Dict[str, tuple] = {}
+        self._planning_query_locks = {}
+        self.query_inputs: Dict[int, dict] = {}
+        self._ordered_inputs: List[dict] = []
+        self._inputs_by_question: Dict[str, List[dict]] = {}
+        self._frozen_pools: Dict[int, tuple] = {}
         # BaseRAG constructs passage_node_keys when retrieval is prepared, after
         # the evidence runtime itself is instantiated.
         self._chunk_to_id = None
@@ -63,14 +66,19 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
         if not isinstance(records, list):
             raise ValueError("Ablation records must be a list")
         inputs = {}
+        by_question = {}
         for record in records:
             allowed = {"question", "sample_id", "query_index", "pool", "evidence_call_budget"}
             if not isinstance(record, dict) or set(record) - allowed:
                 raise ValueError("Ablation records must contain only question/candidates/call counts")
             question = record.get("question")
+            query_index = record.get("query_index")
             budget = record.get("evidence_call_budget")
-            if not isinstance(question, str) or not question.strip() or question in inputs:
-                raise ValueError("Missing or duplicate question in ablation inputs")
+            if not isinstance(question, str) or not question.strip():
+                raise ValueError("Missing question in ablation inputs")
+            if (isinstance(query_index, bool) or not isinstance(query_index, int)
+                    or query_index < 0 or query_index in inputs):
+                raise ValueError("Missing, invalid or duplicate global query_index in ablation inputs")
             if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
                 raise ValueError("Reference evidence call budget must be a nonnegative integer")
             pool = record.get("pool")
@@ -95,8 +103,11 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
                 raise ValueError("Frozen pool contains duplicate documents")
             if self.mode == "fixed_pool" and len(pool) != 200:
                 raise ValueError("Fixed candidate experiments require exactly 200 unique documents")
-            inputs[question] = record
+            inputs[query_index] = record
+            by_question.setdefault(question, []).append(record)
         self.query_inputs = inputs
+        self._ordered_inputs = list(records)
+        self._inputs_by_question = by_question
         self._frozen_pools.clear()
         if self.mode.startswith("budget_"):
             # All budget controls use the same input-file maximum. A productive
@@ -107,13 +118,26 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
 
     def _record(self, state):
         question = state["query"]
-        if question not in self.query_inputs:
-            raise ValueError(f"No ablation input for question: {question[:160]}")
-        return self.query_inputs[question]
+        # query_idx is the position in the selected query list, not necessarily
+        # the benchmark row number. The helper freezes records in exactly that
+        # selected order; record.query_index remains the global sample identity.
+        if "query_idx" in state:
+            position = state["query_idx"]
+            if (isinstance(position, bool) or not isinstance(position, int)
+                    or not 0 <= position < len(self._ordered_inputs)):
+                raise ValueError("Query position does not match the selected ablation records")
+            record = self._ordered_inputs[position]
+            if record["question"] != question:
+                raise ValueError("Query text does not match its selected sample identity")
+            return record
+        matches = self._inputs_by_question.get(question, [])
+        if len(matches) != 1:
+            raise ValueError("A missing or ambiguous question requires an explicit query_idx")
+        return matches[0]
 
     def _frozen_pool(self, state):
-        question = state["query"]
-        if question not in self._frozen_pools:
+        identity = self._record(state)["query_index"]
+        if identity not in self._frozen_pools:
             if self._chunk_to_id is None:
                 self._chunk_to_id = {str(key): i for i, key in enumerate(self.rag.passage_node_keys)}
             pool = self._record(state)["pool"]
@@ -128,8 +152,8 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
                 actual = "chunk-" + hashlib.md5(self._document(int(doc_id)).encode("utf-8")).hexdigest()
                 if actual != item["doc_hash"]:
                     raise ValueError("Frozen candidate hash does not match indexed document content")
-            self._frozen_pools[question] = (ids, scores)
-        return self._frozen_pools[question]
+            self._frozen_pools[identity] = (ids, scores)
+        return self._frozen_pools[identity]
 
     def _infer_object(self, messages):
         state = getattr(self._local, "state", None)
@@ -189,15 +213,22 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
             self._local.job_calls = previous_calls
 
     def _plan_owned(self, state, hops):
-        if state["_ablation_call_limit"] == 0:
-            result = ([], "llm_budget_exhausted")
-            calls = 0
-            self._plan_diagnostics[state["query"]] = {"attempts": 0, "outputs": [], "validation_errors": []}
-        else:
-            result = self._owned_job(state, self._plan, state["query"], hops)
-            calls = self._local.last_job_calls
-        diagnostic = self._plan_diagnostics[state["query"]]
-        diagnostic["attempts"] = calls
+        # The inherited planner publishes diagnostics under question text. Keep
+        # its bounded prompts unchanged, but capture the result under a per-query
+        # mutex before another equal-text sample can replace that dictionary.
+        with self._single_flight_registry_lock:
+            query_lock = self._planning_query_locks.setdefault(state["query"], threading.Lock())
+        with query_lock:
+            if state["_ablation_call_limit"] == 0:
+                result = ([], "llm_budget_exhausted")
+                calls = 0
+                diagnostic = {"attempts": 0, "outputs": [], "validation_errors": []}
+            else:
+                result = self._owned_job(state, self._plan, state["query"], hops)
+                calls = self._local.last_job_calls
+                diagnostic = dict(self._plan_diagnostics[state["query"]])
+            diagnostic["attempts"] = calls
+            state["_ablation_plan_diagnostic"] = diagnostic
         return result
 
     def _verify_owned(self, state, question, answer_type, docs):
@@ -343,6 +374,8 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
                              "selection_mode": self.selection_mode, "budget_scope": "evidence_module",
                              "call_budget": state["_ablation_call_limit"], "llm_calls": 0,
                              "budget_exhausted": False}
+        if self._ordered_inputs:
+            trace["ablation"]["global_query_index"] = self._record(state)["query_index"]
         trace["ablation"]["search_limit"] = self.max_searches
         if self.mode == "selection":
             trace["ablation"].update({"selection_shared_branches": True,
@@ -536,7 +569,7 @@ class EvidenceAblationRetrieval(EvidenceRetrieval):
                         for state in states]
             for state, (plan, reason) in zip(states, self._collect_jobs(executor, requests)):
                 trace = state["evidence_trace"]
-                diagnostic = self._plan_diagnostics[state["query"]]
+                diagnostic = state["_ablation_plan_diagnostic"]
                 trace["llm_plan_calls"] += diagnostic["attempts"]
                 trace["planning_outputs"] = diagnostic
                 trace["plan"] = plan

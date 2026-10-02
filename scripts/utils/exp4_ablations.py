@@ -66,7 +66,7 @@ def freeze_records(pool_result, budget_result, data, indices, corpus):
                         "pool": [{"doc_hash": chunk_hash(doc), "score": float(score)}
                                  for doc, score in zip(docs, scores)],
                         "evidence_call_budget": sum(counts)})
-    require(len({r["question"] for r in records}) == len(records), "Duplicate questions require explicit identity routing")
+    require(len({r["query_index"] for r in records}) == len(records), "Duplicate sample indices in ablation inputs")
     return {"schema_version": 1, "records": records}
 
 
@@ -226,6 +226,8 @@ def validate_controls(result, manifest, name, inputs):
         control = trace.get("ablation") or {}
         require(control.get("mode") == mode and control.get("binding_mode") == binding
                 and control.get("selection_mode") == selection, "Missing/mismatched ablation trace")
+        require(control.get("global_query_index") == record["query_index"],
+                "Runtime matched the wrong ablation sample identity")
         calls = control.get("llm_calls")
         require(type(calls) is int and calls >= 0, "Missing logical-call accounting")
         diagnostics["logical_calls"] += calls

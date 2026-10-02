@@ -30,6 +30,7 @@ exec > >(tee -a "${OUT_ROOT}/logs/run2.log") 2>&1
 trap 'status=$?; echo "[failed-ablation] exit=${status} line=${LINENO}; inspect logs/run2.log" >&2; exit "${status}"' ERR
 test -f "${VLLM_LOG}"
 curl -fsS -o /dev/null "${LLM_BASE_URL}/models"
+echo "[start-ablation] $(date '+%F %T') sample_size=${SAMPLE_SIZE} OUT_ROOT=${OUT_ROOT}"
 
 python "${TOOLS}" exp4-ablation-prepare \
   --out-root "${OUT_ROOT}" --reference-root "${REFERENCE_ROOT}" --source-index "${SOURCE_INDEX}" \
