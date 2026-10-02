@@ -20,6 +20,10 @@ class PCRAGConfig(BaseConfig):
     evidence_coverage_weight: float = 0.45
     evidence_relation_weight: float = 0.25
     evidence_redundancy_weight: float = 0.15
+    evidence_ablation_mode: str = "normal"
+    evidence_binding_mode: str = "literal"
+    evidence_selection_mode: str = "coverage"
+    evidence_ablation_inputs_file: str = ""
 
     # Hop estimation
     use_enhanced_hop_estimation: bool = field(default=True)
@@ -141,6 +145,16 @@ class PCRAGConfig(BaseConfig):
         super().__post_init__()
         if self.improvement_stage not in range(6):
             raise ValueError("improvement_stage must be 0 through 5")
+        if self.evidence_ablation_mode not in {"normal", "budget_dag", "budget_qd", "budget_iterative", "fixed_pool", "validation", "selection"}:
+            raise ValueError("Unknown evidence_ablation_mode")
+        if self.evidence_binding_mode not in {"string", "literal", "relation"}:
+            raise ValueError("Unknown evidence_binding_mode")
+        if self.evidence_selection_mode not in {"coverage", "ancestor", "joint"}:
+            raise ValueError("Unknown evidence_selection_mode")
+        if self.evidence_ablation_mode != "normal" and not self.evidence_ablation_inputs_file:
+            raise ValueError("Evidence ablations require their frozen inputs file")
+        if self.evidence_ablation_mode != "normal" and self.improvement_stage not in (3, 4):
+            raise ValueError("Evidence ablations require stage 3 or 4")
         self.evidence_candidate_top_k = max(1, int(self.evidence_candidate_top_k))
         self.evidence_pool_size = max(5, int(self.evidence_pool_size))
         self.evidence_budget = min(5, max(1, int(self.evidence_budget)))

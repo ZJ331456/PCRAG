@@ -340,7 +340,7 @@ def recall(gold, docs):
     return len(gold & set(docs)) / len(gold)
 
 
-def validate_result(result, manifest, name, data, corpus):
+def validate_result(result, manifest, name, data, corpus, expected_stage=None):
     indices = manifest["selected_indices"]
     require(result.get("selected_indices") == indices, "selected indices mismatch")
     require(result.get("sample_size_effective") == len(indices), "sample count mismatch")
@@ -352,8 +352,9 @@ def validate_result(result, manifest, name, data, corpus):
     require(config.get("embedding_model_name") == EMBEDDING_MODEL, "runtime embedding model mismatch")
     require(config.get("llm_name") == "qwen3-8b", "runtime LLM model mismatch")
     require(config.get("max_new_tokens") == 2048, "max_new_tokens must remain 2048")
-    if CASES[name] is not None:
-        require(config.get("improvement_stage") == CASES[name], "improvement stage mismatch")
+    stage = CASES[name] if expected_stage is None else expected_stage
+    if stage is not None:
+        require(config.get("improvement_stage") == stage, "improvement stage mismatch")
         require(result.get("hop_source") == "benchmark", "hop_source must be benchmark")
         require(result.get("hop_distribution") == manifest["hop_distribution"], "hop distribution mismatch")
     rows = result.get("results")

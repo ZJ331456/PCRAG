@@ -170,6 +170,10 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         openie_max_workers=getattr(args, "openie_max_workers", None),
         llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 8)),
         improvement_stage=int(getattr(args, "improvement_stage", 0)),
+        evidence_ablation_mode=getattr(args, "evidence_ablation_mode", "normal"),
+        evidence_binding_mode=getattr(args, "evidence_binding_mode", "literal"),
+        evidence_selection_mode=getattr(args, "evidence_selection_mode", "coverage"),
+        evidence_ablation_inputs_file=getattr(args, "evidence_ablation_inputs_file", ""),
         use_enhanced_hop_estimation=not args.no_enhanced_hop_estimation,
         use_iterative_retrieval=bool(args.use_iterative_retrieval),
         use_qcappr=not args.no_qcappr,
@@ -521,6 +525,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample_indices_file", default="")
     parser.add_argument("--reuse_index", action="store_true")
     parser.add_argument("--improvement_stage", type=int, choices=range(6), default=0)
+    parser.add_argument("--evidence_ablation_mode", choices=["normal", "budget_dag", "budget_qd", "budget_iterative", "fixed_pool", "validation", "selection"], default="normal")
+    parser.add_argument("--evidence_binding_mode", choices=["string", "literal", "relation"], default="literal")
+    parser.add_argument("--evidence_selection_mode", choices=["coverage", "ancestor", "joint"], default="coverage")
+    parser.add_argument("--evidence_ablation_inputs_file", default="")
 
     parser.add_argument("--corpus_mode", choices=["full", "sample_only"], default="full")
     parser.add_argument("--max_corpus_docs", type=int, default=0)
