@@ -13,7 +13,7 @@ from pathcondrag.utils.openie_quality import TRIPLE_JSON_SCHEMA, merge_triples, 
 from .openie_semantic_validation import CONTEXT_TOKENS, MAX_COMPLETION_TOKENS, _prompt_tokens
 
 
-RECOVERY_VERSION = 'pathcondrag_compact_source_recovery_v1'
+RECOVERY_VERSION = 'pathcondrag_compact_source_recovery_v2'
 SCHEMA = {
     'type': 'object',
     'properties': {
@@ -34,6 +34,10 @@ in their proper argument positions. A supported property can be ["person","train
 Empty quotes, missing names and absent table labels remain unknown. Never invent an unspecified
 name, use a neighboring but/which clause to fill a missing argument, or guess a table header.
 Respect source rows, units, dates, qualification and negation. Keep compact complete assertions.
+Never repeat an identical triple. Stop after extracting the supported facts once.
+For an explicit list of dates, numbers or colors sharing one subject and predicate, retain
+the exact list as one object string, including markers and qualifiers; do not expand it
+into repetitive per-item triples. Repeated titles are headings, not additional facts.
 If the requested relationships cannot be supported, return
 {"triples": [], "status": "no_supported_relations"}.'''
 
