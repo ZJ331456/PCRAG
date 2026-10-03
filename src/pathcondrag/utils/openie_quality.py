@@ -101,27 +101,69 @@ def support_quote_error_feedback(quotes, triples, matches, source: str) -> str:
         grouped.setdefault(key, {'quote': quote, 'indices': [], 'triples': []})
         grouped[key]['indices'].append(index)
         grouped[key]['triples'].append(triples[index])
+    def source_excerpt(span, quote, limit=250):
+        if len(span) <= limit:
+            return span
+        match = SequenceMatcher(None, quote, span, autojunk=False).find_longest_match(
+            0, len(quote), 0, len(span))
+        center = match.b + min(match.size, limit) // 2
+        start = max(0, min(len(span) - limit, center - limit // 2))
+        return span[start:start + limit]
+
     details = []
-    for group in list(grouped.values())[:6]:
+    for group in list(grouped.values())[:3]:
         quote = group['quote'] if isinstance(group['quote'], str) else ''
         closest = sorted(spans, key=lambda span: SequenceMatcher(
             None, ' '.join(quote.split()), ' '.join(span.split())).ratio(), reverse=True)[:2]
-        details.append(
-            'Bad support quote at record indices ' + json.dumps(group['indices'])
-            + '; corresponding triples=' + json.dumps(group['triples'], ensure_ascii=False)
-            + '; supplied quote=' + json.dumps(group['quote'], ensure_ascii=False)
-            + '; nearby actual source sentences (diagnostic candidates, not verified entailment)='
-            + json.dumps(closest, ensure_ascii=False)
-        )
-    if len(grouped) > 6:
-        details.append(f'{len(grouped) - 6} additional mismatching quote groups also require correction.')
-    return (
-        'Support quotes do not occur verbatim in the supplied source passage. '
-        + '\n'.join(details)
-        + '\nCopy the shortest supporting original text exactly, including quotes and punctuation. '
+        first_triple = group['triples'][0]
+        display = {
+            'indices': group['indices'][:8],
+            'triple': [field[:48] if isinstance(field, str) else field for field in first_triple],
+            'quote': quote[:120],
+            'source_spans': [],
+        }
+        if len(group['indices']) > 8:
+            display['additional_indices'] = len(group['indices']) - 8
+        available = max(0, 500 - len(json.dumps(display, ensure_ascii=False)) - 12)
+        per_span = min(250, max(0, available // max(1, len(closest)) - 4))
+        display['source_spans'] = [source_excerpt(span, quote, per_span)
+                                   for span in closest if per_span > 0]
+        # JSON escapes can enlarge a span. Trim only diagnostic substrings;
+        # source matching and extraction acceptance are completely unchanged.
+        while len(json.dumps(display, ensure_ascii=False)) > 500 and display['source_spans']:
+            display['source_spans'][-1] = display['source_spans'][-1][:-10]
+            if not display['source_spans'][-1]:
+                display['source_spans'].pop()
+        # Escaped quotes/control characters can enlarge even the diagnostic
+        # fields themselves. Keep the per-group bound for those inputs too.
+        while len(json.dumps(display, ensure_ascii=False)) > 500:
+            if len(display['quote']) > 8:
+                display['quote'] = display['quote'][:-8]
+                continue
+            field_index = max(range(len(display['triple'])),
+                              key=lambda index: len(str(display['triple'][index])))
+            field = display['triple'][field_index]
+            if isinstance(field, str) and len(field) > 8:
+                display['triple'][field_index] = field[:-8]
+            else:
+                break
+        details.append(json.dumps(display, ensure_ascii=False))
+    prefix = ('Support quotes do not occur verbatim in the supplied source passage. '
+              'Each diagnostic gives bad record indices, triple, supplied quote excerpt, '
+              'and nearby real source substrings (candidates, not verified entailment):\n')
+    suffix = (
+        '\nCopy the shortest supporting original text exactly, including quotes and punctuation. '
         'Do not paraphrase, join separated sentences, drop quote characters, use ellipses, '
         'or copy the demonstration passage. Recheck every evidence quote against the actual source.'
     )
+    while details:
+        omitted = len(grouped) - len(details)
+        remainder = f'\n{omitted} additional quote groups also need correction.' if omitted else ''
+        result = prefix + '\n'.join(details) + remainder + suffix
+        if len(result) <= 3000 and len(result.encode('utf-8')) <= 3000:
+            return result
+        details.pop()
+    return prefix + f'{len(grouped)} mismatching quote groups need correction.' + suffix
 
 
 def extract_triple_payload(response: str) -> dict:

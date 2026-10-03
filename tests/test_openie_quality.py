@@ -10,7 +10,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pathcondrag.information_extraction.openie_openai import OpenIE
-from pathcondrag.utils.openie_quality import entity_argument_issues, extract_triple_list, validate_triples
+from pathcondrag.utils.openie_quality import (
+    entity_argument_issues, extract_triple_list, support_quote_error_feedback, validate_triples,
+)
 
 
 class FakeLLM:
@@ -213,6 +215,9 @@ class OpenIEQualityTests(unittest.TestCase):
         self.assertEqual(len({tuple(triple) for triple in family_triples}), 4)
         self.assertEqual(len({triple[0] for triple in family_triples}), 2)
         self.assertEqual(len({triple[2] for triple in family_triples}), 2)
+        self.assertTrue(all(record['support_quote'] == record['triple'][2]
+                            for record in demonstration['triples']))
+        self.assertIn('smallest exact source cell/span', messages[-1]['content'])
         self.assertFalse(any(triple[1] in ('and', 'or') for triple in triples))
         self.assertIn('originally empty/failed', messages[-1]['content'])
 
@@ -262,7 +267,7 @@ class OpenIEQualityTests(unittest.TestCase):
             'id', source, [], repair_context='Check defective record.')
         self.assertEqual(result.metadata['quality_status'], 'success')
         feedback = llm.calls[1]['messages'][-2]['content']
-        self.assertIn('record indices [0]', feedback)
+        self.assertIn('"indices": [0]', feedback)
         self.assertIn(json.dumps(triple, ensure_ascii=False), feedback)
         self.assertIn(json.dumps(bad_quote, ensure_ascii=False), feedback)
         self.assertIn(json.dumps(source, ensure_ascii=False), feedback)
@@ -312,6 +317,32 @@ class OpenIEQualityTests(unittest.TestCase):
         self.assertNotIn('window_recovery', result.metadata)
         self.assertNotIn('window_early_fallback', result.metadata)
         self.assertEqual(len(llm.calls), 4)
+
+    def test_long_unpunctuated_table_feedback_is_bounded_and_candidates_are_real_source(self):
+        source = ' '.join(f'country{i} population{i} census{i}' for i in range(160))
+        quotes = [source.replace(f'country{i}', f'edited{i}') for i in range(7)]
+        triples = [[f'country{i}', 'has population', f'population{i}'] for i in range(7)]
+        feedback = support_quote_error_feedback(quotes, triples, [False] * 7, source)
+        self.assertLessEqual(len(feedback), 3000)
+        self.assertLessEqual(len(feedback.encode('utf-8')), 3000)
+        diagnostic_lines = [line for line in feedback.splitlines() if line.startswith('{')]
+        self.assertLessEqual(len(diagnostic_lines), 3)
+        self.assertGreater(len(diagnostic_lines), 0)
+        for line in diagnostic_lines:
+            self.assertLessEqual(len(line), 500)
+            for candidate in json.loads(line)['source_spans']:
+                self.assertLessEqual(len(candidate), 250)
+                self.assertIn(candidate, source)
+
+    def test_property_and_missing_name_examples_do_not_fill_unrelated_arguments(self):
+        messages = OpenIE(FakeLLM([]))._triple_messages('Actual source.', [], repair_context='Repair property.')
+        demonstrations = [json.loads(message['content']) for message in messages if message['role'] == 'assistant']
+        self.assertIn({'triples': [{'triple': ['Dara', 'trained in', 'classical theater'],
+                                  'support_quote': 'Dara had classical theater training'}],
+                       'status': 'success'}, demonstrations)
+        self.assertIn({'triples': [], 'status': 'no_supported_relations'}, demonstrations)
+        self.assertIn('neighboring but/which clause', messages[-1]['content'])
+        self.assertIn('rewrite predicate and object together', messages[-1]['content'])
 
 
 if __name__ == "__main__":

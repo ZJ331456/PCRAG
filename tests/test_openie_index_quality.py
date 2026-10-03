@@ -118,6 +118,17 @@ class OpenIEIndexQualityTests(unittest.TestCase):
             _, missing = rag.load_existing_openie(keys, retry_failed=True)
             self.assertEqual(missing, [keys[0], keys[2]])
 
+    def test_legacy_invalid_cache_is_retried_without_failure_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rag = self.make_rag(tmp)
+            row = self.row('legacy invalid', [['Alpha', 'is located in', '']])
+            row.pop('openie_metadata')
+            Path(rag.openie_results_path).write_text(json.dumps({'docs': [row]}))
+            _, missing = rag.load_existing_openie([row['idx']], retry_failed=True)
+            self.assertEqual(missing, [row['idx']])
+            _, missing = rag.load_existing_openie([row['idx']], retry_failed=False)
+            self.assertEqual(missing, [])
+
     def test_merge_replaces_failed_row_and_persists_raw_responses(self):
         with tempfile.TemporaryDirectory() as tmp:
             rag = self.make_rag(tmp)

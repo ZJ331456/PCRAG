@@ -1170,7 +1170,8 @@ class BaseRAG:
 
             for chunk_key in chunk_keys:
                 row = existing_openie_rows.get(chunk_key)
-                if row is None or (retry_failed and openie_row_needs_retry(row)):
+                if row is None or (retry_failed and (
+                        openie_row_needs_retry(row) or self._openie_row_has_invalid_graph_triples(row))):
                     chunk_keys_to_save.append(chunk_key)
         else:
             all_openie_info = []

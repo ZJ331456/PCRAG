@@ -25,6 +25,7 @@ from pathcondrag.utils.openie_quality import merge_triples, validate_triples
 
 ROOT = Path(__file__).resolve().parents[2]
 REPAIR_VERSION = "pathcondrag_openie_quality_v2"
+SEMANTIC_VERSION = "pathcondrag_recovered_relation_entailment_v1"
 SOURCE_DEFAULT = ROOT / "outputs/pathcondrag_new_innvotion_10_1/shared_hipporag2_index"
 OUT_DEFAULT = ROOT / "outputs/openie_quality_repair_qwen3_b4_20261003"
 ASSETS = ("openie_state.json", "index_manifest.json", "chunk_metadata.json", "graph.pickle",
@@ -205,8 +206,23 @@ def repair_one(extractor, original, out):
                    "separate facts for each person. Keep specific relationship words in the predicate, "
                    "with the corresponding named entity as object; do not emit conjunctions as relations. "
                    "Use short, contiguous support quotes, rather than repeating an entire table per fact.")
-    result = extractor.triple_extraction(original["idx"], original["passage"],
-                                         original["extracted_entities"], repair_context=context)
+    audit_path = out / "semantic_audits" / (original["idx"] + ".json")
+    if audit_path.exists():
+        previous_audit = read_json(audit_path)
+        if previous_audit.get("original_sha256") == row_hash(original) and previous_audit.get("rejected"):
+            context += ("\nThese previous candidate assertions failed source-only relation verification. "
+                        "Do not repeat them or fill missing names with other co-occurring entities. "
+                        "Recover explicit supported alternatives directly from the original passage:\n"
+                        + json.dumps(previous_audit["rejected"], ensure_ascii=False)[:2000])
+    previous_path = out / "repairs" / (original["idx"] + ".json")
+    previously_failed = previous_path.exists() and not read_json(previous_path).get("complete")
+    if previously_failed or (not original["extracted_triples"] and len(original["passage"]) > 1000):
+        from utils.openie_compact_recovery import compact_recovery
+        result = compact_recovery(extractor.llm_model, original["idx"], original["passage"],
+                                  original["extracted_entities"], context)
+    else:
+        result = extractor.triple_extraction(original["idx"], original["passage"],
+                                             original["extracted_entities"], repair_context=context)
     report = validate_triples(result.triples)
     accepted = [triple for triple in report.valid_triples if all(normalize(x) for x in triple)]
     complete = (result.metadata.get("quality_status") in ("success", "empty_valid")
@@ -314,6 +330,7 @@ def repair(args, smoke=False):
         "repair_extractor": "pathcondrag.information_extraction.openie_openai.OpenIE",
         "extractor_sha256": sha256(ROOT / "src/pathcondrag/information_extraction/openie_openai.py"),
         "validation_sha256": sha256(ROOT / "src/pathcondrag/utils/openie_quality.py"),
+        "compact_recovery_sha256": sha256(ROOT / "scripts/utils/openie_compact_recovery.py"),
         "source_openie_sha256": snapshot["asset_sha256"]["openie_state.json"],
         "repaired_chunks": len(summaries), "thinking": False, "triple_max_tokens": 2048,
         "support_check": "original_quote_match; semantic_entailment_not_guaranteed",
@@ -347,10 +364,118 @@ def required_contents(rows):
     return entities, facts
 
 
+def triples_hash(triples):
+    return hashlib.sha256(json.dumps(triples, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def semantic(args):
+    """Verify only newly recovered assertions against the unchanged source."""
+    from utils.openie_semantic_validation import verify_repaired_triples
+    _, _, manifest, original_state, out, index, _ = initialize(args)
+    payload_path = out / "repaired_openie.json"
+    payload = read_json(payload_path)
+    originals = {row["idx"]: row for row in original_state["docs"]}
+    targets = [row for row in payload["docs"] if row.get("openie_quality_repair")]
+    _, CacheOpenAI, _ = baseline_modules(args)
+    llm = CacheOpenAI.from_experiment_config(make_config(args, manifest, index))
+    started = time.monotonic()
+    LOG.info("[semantic] repaired_chunks=%s workers=8; source-only; max_tokens=2048", len(targets))
+
+    def check_one(row):
+        original = originals[row["idx"]]
+        previous = row["openie_quality_repair"].get("semantic_verification") or {}
+        if (previous.get("contract_version") == SEMANTIC_VERSION
+                and previous.get("original_sha256") == row_hash(original)
+                and previous.get("final_triples_sha256") == triples_hash(row["extracted_triples"])):
+            return row, previous
+        healthy, _, _ = split_row(original)
+        healthy_keys = {tuple(triple) for triple in healthy}
+        candidates = [triple for triple in row["extracted_triples"] if tuple(triple) not in healthy_keys]
+        audit_path = out / "semantic_audits" / (row["idx"] + ".json")
+        cached = read_json(audit_path) if audit_path.exists() else {}
+        if (cached.get("contract_version") == SEMANTIC_VERSION
+                and cached.get("original_sha256") == row_hash(original)
+                and cached.get("candidate_sha256") == triples_hash(candidates)):
+            accepted, details = cached["accepted"], cached["details"]
+        else:
+            accepted, details = verify_repaired_triples(llm, original["passage"], candidates)
+        updated = copy.deepcopy(row)
+        updated["extracted_triples"] = merge_triples(healthy, accepted)
+        accepted_keys = {tuple(triple) for triple in accepted}
+        rejected = [triple for triple in candidates if tuple(triple) not in accepted_keys]
+        complete = bool(original["extracted_triples"] or updated["extracted_triples"])
+        audit = {"contract_version": SEMANTIC_VERSION, "original_sha256": row_hash(original),
+                 "candidate_sha256": triples_hash(candidates),
+                 "final_triples_sha256": triples_hash(updated["extracted_triples"]),
+                 "accepted": accepted, "rejected": rejected, "details": details,
+                 "complete": complete}
+        write_json(audit_path, audit)
+        updated["openie_quality_repair"]["semantic_verification"] = audit
+        updated["openie_quality_repair"]["recovered_count"] = len(accepted)
+        updated["openie_quality_repair"]["complete"] = complete
+        metadata = updated["openie_metadata"]["triples"]
+        metadata["semantic_verified"] = True
+        metadata["quality_status"] = ("success" if updated["extracted_triples"] else "empty_valid") if complete else "failed"
+        if not complete:
+            metadata["openie_skip_reason"] = "No source-supported recovered relations after semantic verification"
+        checkpoint_path = out / "repairs" / (row["idx"] + ".json")
+        checkpoint = read_json(checkpoint_path)
+        checkpoint.update(row=updated, complete=complete)
+        checkpoint["summary"].update(after_count=len(updated["extracted_triples"]),
+                                     recovered_count=len(accepted), complete=complete,
+                                     semantic_rejected_count=len(rejected))
+        write_json(checkpoint_path, checkpoint)
+        LOG.info("[semantic] %s accepted=%s rejected=%s complete=%s",
+                 original["passage"].split("\n")[0], len(accepted), len(rejected), complete)
+        return updated, audit
+
+    audited = {}
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(check_one, row) for row in targets]
+            for future in as_completed(futures):
+                row, audit = future.result()
+                audited[row["idx"]] = (row, audit)
+    finally:
+        stats = llm.get_request_stats()
+        llm.close()
+    payload["docs"] = [audited[row["idx"]][0] if row["idx"] in audited else row
+                       for row in payload["docs"]]
+    complete = all(audit["complete"] for _, audit in audited.values()) and not stats.get("failures")
+    payload["provenance"]["quality_repair"]["semantic_verification"] = {
+        "contract_version": SEMANTIC_VERSION, "model": manifest["openie"]["identity"]["model_name"],
+        "scope": "newly_recovered_assertions_only; original_valid_assertions_preserved",
+        "verifier_sha256": sha256(ROOT / "scripts/utils/openie_semantic_validation.py"),
+        "max_tokens": 2048, "thinking": False,
+        "check": "model_source_entailment; not_a_formal_correctness_proof",
+    }
+    write_json(payload_path, payload)
+    rows, _, summaries = recovered_rows(original_state, out)
+    write_json(out / "repair_summary.json", {"version": REPAIR_VERSION, "total_chunks": len(rows),
+               "repaired_chunks": len(summaries), "empty_chunks": sum(not r["extracted_triples"] for r in rows),
+               "invalid_records": sum(len(split_row(r)[1]) for r in rows), "rows": summaries})
+    report = {"complete": complete, "contract_version": SEMANTIC_VERSION,
+              "seconds": time.monotonic() - started, "audited_chunks": len(targets),
+              "accepted_relations": sum(len(a["accepted"]) for _, a in audited.values()),
+              "rejected_relations": sum(len(a["rejected"]) for _, a in audited.values()),
+              "llm_request_stats": stats, "repaired_openie_sha256": sha256(payload_path)}
+    write_json(out / "semantic_summary.json", report)
+    if not complete:
+        raise RuntimeError("Semantic verification left a failed empty recovery; resume repair with audit feedback")
+
+
+def require_semantic_completion(out):
+    report = read_json(out / "semantic_summary.json")
+    if (report.get("complete") is not True or report.get("contract_version") != SEMANTIC_VERSION
+            or report.get("repaired_openie_sha256") != sha256(out / "repaired_openie.json")):
+        raise ValueError("Source relation verification must complete for this exact repaired OpenIE")
+
+
 def build(args):
     import pandas as pd
     import torch
     source, model_dir, manifest, _, out, index, _ = initialize(args)
+    require_semantic_completion(out)
     payload = read_json(out / "repaired_openie.json")
     entities, facts = required_contents(payload["docs"])
     destination = index / model_dir
@@ -413,6 +538,7 @@ def validate(args):
     import pyarrow.parquet as pq
     from utils.openie_graph_validation import validate_graph_contributions
     source, model_dir, _, _, out, index, snapshot = initialize(args)
+    require_semantic_completion(out)
     destination = index / model_dir
     state = read_json(destination / "openie_state.json")
     payload_path = out / "repaired_openie.json"
@@ -481,7 +607,7 @@ def validate(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("smoke", "repair", "build", "validate", "run"), default="run")
+    parser.add_argument("--phase", choices=("smoke", "repair", "semantic", "build", "validate", "run"), default="run")
     parser.add_argument("--source-index", default=str(SOURCE_DEFAULT))
     parser.add_argument("--out-root", default=str(OUT_DEFAULT))
     parser.add_argument("--hippo-root", default="/root/baseline/HippoRAG")
@@ -494,7 +620,7 @@ def main(argv=None):
     os.environ.setdefault("HIPPORAG_LLM_MAX_IN_FLIGHT", "8")
     if args.phase == "run":
         # Separate processes release all model references between stages.
-        for phase in ("repair", "build", "validate"):
+        for phase in ("repair", "semantic", "build", "validate"):
             command = [sys.executable, str(ROOT / "scripts/repair_openie_index.py"),
                        "--phase", phase, "--source-index", args.source_index,
                        "--out-root", args.out_root, "--hippo-root", args.hippo_root,
@@ -506,6 +632,8 @@ def main(argv=None):
         repair(args)
     elif args.phase == "build":
         build(args)
+    elif args.phase == "semantic":
+        semantic(args)
     else:
         validate(args)
     return 0

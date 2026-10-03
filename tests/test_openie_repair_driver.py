@@ -114,6 +114,23 @@ class RepairDriverTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Incomplete repair'):
             repair.required_contents([row])
 
+    def test_semantic_gate_requires_success_for_the_exact_repair_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            payload = out / 'repaired_openie.json'
+            repair.write_json(payload, {'docs': []})
+            report = {'complete': True, 'contract_version': repair.SEMANTIC_VERSION,
+                      'repaired_openie_sha256': repair.sha256(payload)}
+            repair.write_json(out / 'semantic_summary.json', report)
+            repair.require_semantic_completion(out)
+            repair.write_json(payload, {'docs': [source_row()]})
+            with self.assertRaisesRegex(ValueError, 'this exact repaired OpenIE'):
+                repair.require_semantic_completion(out)
+            report.update(complete=False, repaired_openie_sha256=repair.sha256(payload))
+            repair.write_json(out / 'semantic_summary.json', report)
+            with self.assertRaisesRegex(ValueError, 'this exact repaired OpenIE'):
+                repair.require_semantic_completion(out)
+
     def test_source_output_overlap_is_rejected_before_creating_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / 'PathCondRAG'

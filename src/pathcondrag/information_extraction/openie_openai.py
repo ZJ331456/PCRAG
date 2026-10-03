@@ -261,20 +261,39 @@ class OpenIE:
                     'Extract source-supported semantic relations for index repair. '
                     'Return one JSON object with triples (paired records) and status. '
                     'Every record has triple (exactly three non-empty strings: subject, predicate, object) '
-                    'and support_quote (verbatim evidence from the original passage). '
+                    'and support_quote (an exact minimal source cell/span from the original passage). '
+                    'The whole original passage determines whether a relation is supported. The quote '
+                    'only identifies copied source text; it need not contain the subject and predicate. '
                     'A predicate must express a real relationship, never a connector such as and/or. '
                     'Expand coordinated subjects into separate complete relations. '
                     'For explicitly shared parentage, every child relates to every stated joint parent; '
                     'do not pair children and parents by list position. Expand shared arguments only when '
                     'the source states that they are shared, never for separately assigned relations. '
+                    'Defective triples locate facts but are not immutable: rewrite predicate and object '
+                    'together when needed. Never fill a missing argument with an unrelated nearby name '
+                    'or a following but/which clause. Empty quotes or omitted names are missing evidence, '
+                    'not permission to invent an unspecified/unknown argument. '
                     'Preserve entity names as arguments, put relation words in predicates, resolve pronouns only when unambiguous, '
                     'and preserve important qualifiers. Do not invent facts or copy the demonstration entities.'
                 )},
                 {'role': 'user', 'content': 'Example passage:\n' + example_source},
                 {'role': 'assistant', 'content': json.dumps({
-                    'triples': [{'triple': triple, 'support_quote': example_source} for triple in example_triples],
+                    'triples': [{'triple': triple, 'support_quote': triple[2]} for triple in example_triples],
                     'status': 'success',
                 }, ensure_ascii=False)},
+                {'role': 'user', 'content': (
+                    'Small property-repair example: Dara had classical theater training before acting in '
+                    'Feature Z. Repair ["Dara", "had classical theater training", ""].'
+                )},
+                {'role': 'assistant', 'content': json.dumps({'triples': [{
+                    'triple': ['Dara', 'trained in', 'classical theater'],
+                    'support_quote': 'Dara had classical theater training',
+                }], 'status': 'success'})},
+                {'role': 'user', 'content': (
+                    'Small missing-name example: Tracks were reissued on CD as part of "" but dated '
+                    'incorrectly. Repair only the missing release name after "as part of".'
+                )},
+                {'role': 'assistant', 'content': '{"triples":[],"status":"no_supported_relations"}'},
                 {'role': 'user', 'content': (
                     'Actual original passage:\n' + passage + '\n'
                     + json.dumps({'named_entities': named_entities}, ensure_ascii=False)
@@ -284,7 +303,7 @@ class OpenIE:
             # Change the actual task on recovery, rather than merely changing
             # a cache seed at temperature zero. The source remains in context.
             feedback = (
-                "The previous extraction failed validation: " + str(error) + "\n"
+                "The previous extraction failed validation: " + str(error)[:3000] + "\n"
                 + ('Return paired triple/support_quote records with status. ' if repair_context
                  else 'Return only {"triples": [["subject", "relation", "object"]]}. ')
                 + "Use exactly three non-empty strings per triple. Re-extract from the "
@@ -293,12 +312,12 @@ class OpenIE:
                 "Complete property relations using a meaningful object. "
                 "Remove repetition and placeholders. Do not use outside knowledge.\n"
                 "Previous output (diagnostic only, not factual evidence):\n"
-                + (previous_response or "")[:3500]
+                + (previous_response or "")[:1500]
             )
             if retained_triples:
                 feedback += ("\nAlready accepted relations are preserved. Return the corrected "
                              "relations plus any supported missing relations; do not delete correct facts:\n"
-                             + json.dumps(retained_triples[:20], ensure_ascii=False))
+                             + json.dumps(retained_triples[:10], ensure_ascii=False)[:800])
             messages.append({"role": "user", "content": feedback})
         if repair_context:
             messages.append({'role': 'user', 'content': (
@@ -310,8 +329,11 @@ class OpenIE:
                 'Return exactly {"triples": [{"triple": ["subject", "relation", "object"], '
                 '"support_quote": "verbatim original-passage evidence"}], "status": "success"}. '
                 'Each relation and its evidence must be one paired record; do not output parallel arrays. '
-                'Use a short verbatim span containing the supporting assertion; do not quote an entire '
-                'long table or passage for every relation. '
+                'Use the smallest exact source cell/span as support_quote, such as a specific year or amount. '
+                'The quote does not need to contain all triple arguments or the predicate; assess the actual '
+                'relation against the whole original passage. For a table, copy only the relevant cell, '
+                'never the entire year/amount column for every relation. Prefer compact exact cells over '
+                'repeating rows, columns, headers, or full sentences. '
                 'Never split a four/five-field relation into arbitrary groups of three. '
                 'For example ["A", "and", "B", "live in", "C"] means two complete relations '
                 '["A", "lives in", "C"] and ["B", "lives in", "C"], each with source evidence. '
@@ -325,6 +347,12 @@ class OpenIE:
                 'For entity-to-entity facts keep the entity name as the object and put relation words '
                 'in the predicate: ["X", "is", "child of", "Y"] becomes ["X", "child of", "Y"], '
                 'not ["X", "is", "child of Y"]. '
+                'For a property fact, rewrite predicate and object together using the source concept: '
+                '"a person had classical theater training" can become ["person", "trained in", '
+                '"classical theater"], never ["person", "had classical theater training", "a nearby film"]. '
+                'When an essential argument is absent (empty quotes or a missing name), omit that unsupported '
+                'relation; do not use "unknown", "unspecified", or a neighboring but/which clause as its object. '
+                'If the requested repair only concerns such a missing argument, return no_supported_relations. '
                 "Preserve qualifiers, and never infer a missing argument from outside knowledge. "
                 "If none of the requested defective records corresponds to a supported relation in the source, "
                 'return {"triples": [], "status": "no_supported_relations"}. '
