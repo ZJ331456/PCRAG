@@ -9,7 +9,7 @@ from ..prompts import PromptTemplateManager
 from ..utils.logging_utils import get_logger
 from ..utils.openie_quality import (
     REPAIR_JSON_SCHEMA, TRIPLE_JSON_SCHEMA, extract_triple_payload, merge_triples,
-    entity_argument_issues, normalize_repair_payload, validate_triples,
+    entity_argument_issues, normalize_repair_payload, support_quote_error_feedback, validate_triples,
 )
 from ..utils.misc_utils import TripleRawOutput, NerRawOutput
 from ..llm.openai_gpt import CacheOpenAI, LLM_MAX_IN_FLIGHT
@@ -426,6 +426,13 @@ class OpenIE:
                     last_error = RuntimeError('finish_reason=length: output was truncated; use complete, concise triples without duplicates')
                     recovery_history.append({'kind': 'length', 'attempt': attempt_count,
                                              'error': str(last_error), 'response': raw_response})
+                    if (repair_context and _allow_window_recovery and len(passage) > 1000
+                            and len(self._recovery_windows(passage)) > 1):
+                        # A recoverable long table already exceeded the fixed
+                        # output cap. Partition its full source immediately,
+                        # avoiding three more whole-table decoding attempts.
+                        metadata['window_early_fallback'] = True
+                        raise last_error
                     if attempt == len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 1:
                         raise last_error
                 if metadata.get('finish_reason') != 'stop':
@@ -456,7 +463,10 @@ class OpenIE:
                     metadata['repair_status'] = status
                     metadata['support_check'] = 'source_quote_match_only_not_semantic_entailment'
                     if not all(quote_matches):
-                        raise ValueError('A support quote does not occur in the supplied source passage')
+                        raise ValueError(support_quote_error_feedback(
+                            quotes, repair_triples, quote_matches,
+                            _support_source if _support_source is not None else passage,
+                        ))
                     explicitly_empty = status == 'no_supported_relations'
                 raw_count = report.raw_count
                 if report.raw_count:

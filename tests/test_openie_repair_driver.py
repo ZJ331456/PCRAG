@@ -100,6 +100,20 @@ class RepairDriverTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Stale repair checkpoint'):
                 repair.recovered_rows({'docs': [changed]}, out)
 
+    def test_publication_rejects_partial_cache_even_when_all_triples_are_valid(self):
+        for stage in ('ner', 'triples'):
+            for failure in ({'quality_status': 'partial'}, {'error': 'parse failure'},
+                            {'openie_skipped': True}):
+                row = source_row([['Station', 'opened in', '1910']])
+                row['openie_metadata'][stage].update(failure)
+                with self.subTest(stage=stage, failure=failure), self.assertRaisesRegex(
+                        ValueError, 'Incomplete OpenIE'):
+                    repair.required_contents([row])
+        row = source_row([['Station', 'opened in', '1910']])
+        row['openie_quality_repair'] = {'complete': False}
+        with self.assertRaisesRegex(ValueError, 'Incomplete repair'):
+            repair.required_contents([row])
+
     def test_source_output_overlap_is_rejected_before_creating_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / 'PathCondRAG'

@@ -1,6 +1,7 @@
 """CPU-only regressions for real OpenIE format failures and safe recovery."""
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -248,6 +249,69 @@ class OpenIEQualityTests(unittest.TestCase):
             'id', source, ['A', 'B'], repair_context='Empty result; extract source relations.')
         self.assertEqual(result.triples, [['A', 'son of', 'B']])
         self.assertEqual(result.metadata['quality_status'], 'success')
+
+    def test_bad_quote_feedback_identifies_record_and_preserves_literal_source_punctuation(self):
+        source = 'Album tracks were reissued as part of "" but dated incorrectly.'
+        bad_quote = 'Album tracks were reissued as part of " but dated incorrectly.'
+        triple = ['Album', 'tracks were reissued as part of', 'an unspecified collection']
+        llm = FakeLLM([
+            json.dumps({'triples': [{'triple': triple, 'support_quote': bad_quote}], 'status': 'success'}),
+            json.dumps({'triples': [{'triple': triple, 'support_quote': source}], 'status': 'success'}),
+        ])
+        result = OpenIE(llm, quality_max_retries=1).triple_extraction(
+            'id', source, [], repair_context='Check defective record.')
+        self.assertEqual(result.metadata['quality_status'], 'success')
+        feedback = llm.calls[1]['messages'][-2]['content']
+        self.assertIn('record indices [0]', feedback)
+        self.assertIn(json.dumps(triple, ensure_ascii=False), feedback)
+        self.assertIn(json.dumps(bad_quote, ensure_ascii=False), feedback)
+        self.assertIn(json.dumps(source, ensure_ascii=False), feedback)
+        self.assertIn('including quotes and punctuation', feedback)
+
+    def test_joined_sentence_quote_is_not_accepted_even_with_overlapping_words(self):
+        source = 'A controls two thirds of a region. Assessments include Valley, Jammu and Ladakh.'
+        bad_quote = 'A controls two thirds of a region including Valley, Jammu and Ladakh.'
+        llm = FakeLLM([json.dumps({'triples': [
+            {'triple': ['A', 'controls', 'Valley'], 'support_quote': bad_quote},
+        ], 'status': 'success'})])
+        result = OpenIE(llm, quality_max_retries=0).triple_extraction(
+            'id', source, [], repair_context='Check record.')
+        self.assertEqual(result.metadata['quality_status'], 'failed')
+        self.assertEqual(result.metadata['support_quote_matches'], [False])
+        self.assertIn('join separated sentences', result.metadata['openie_skip_reason'])
+
+    def test_long_targeted_repair_uses_windows_after_first_whole_chunk_length(self):
+        passage = 'A long table\n' + ' '.join(f'row{i} names team{i}' for i in range(100))
+        windows = OpenIE._recovery_windows(passage)
+        responses = [('truncated', 'length')]
+        for _, _, text in windows:
+            match = re.search(r'row(\d+) names team\d+', text)
+            number = match.group(1)
+            responses.append(json.dumps({'triples': [{
+                'triple': [f'row{number}', 'names', f'team{number}'],
+                'support_quote': match.group(0),
+            }], 'status': 'success'}))
+        llm = FakeLLM(responses)
+        result = OpenIE(llm, quality_max_retries=0).triple_extraction(
+            'original-id', passage, [], repair_context='Empty table extraction; recover source relations.')
+        self.assertEqual(result.metadata['quality_status'], 'success')
+        self.assertTrue(result.metadata['window_early_fallback'])
+        self.assertEqual(result.metadata['openie_attempt_count'], 1)
+        self.assertEqual(len(llm.calls), 1 + len(windows))
+        self.assertEqual(result.metadata['window_recovery'][-1]['source_end'], len(passage))
+        self.assertTrue(all(call['max_completion_tokens'] == 2048 for call in llm.calls))
+
+    def test_targeted_repair_cannot_use_partial_windows_for_over_bound_source(self):
+        passage = 'word ' * 3000
+        self.assertEqual(OpenIE._recovery_windows(passage), [])
+        llm = FakeLLM([('truncated', 'length')] * 4)
+        result = OpenIE(llm, quality_max_retries=0).triple_extraction(
+            'id', passage, [], repair_context='Recover original source.')
+        self.assertEqual(result.metadata['quality_status'], 'failed')
+        self.assertEqual(result.triples, [])
+        self.assertNotIn('window_recovery', result.metadata)
+        self.assertNotIn('window_early_fallback', result.metadata)
+        self.assertEqual(len(llm.calls), 4)
 
 
 if __name__ == "__main__":

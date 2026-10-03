@@ -5,7 +5,9 @@ Such records need a new, source-grounded extraction rather than truncation.
 """
 
 import json
+import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any, List
 
 _COORDINATING_PREDICATES = {'and', 'or', '&', 'as well as', 'and/or'}
@@ -80,6 +82,46 @@ def entity_argument_issues(triples: List[List[str]], named_entities: List[str]) 
                               f'use {relation!r} as predicate and the entity itself as object')
                 break
     return issues
+
+
+def support_quote_error_feedback(quotes, triples, matches, source: str) -> str:
+    """Describe exact quote mismatches without replacing or approving evidence.
+
+    Nearby sentences are source substrings offered to the model as diagnostics.
+    They are not automatically assigned as evidence for a particular relation.
+    """
+    spans = list(dict.fromkeys(span.strip() for span in re.split(r'(?<=[.!?])\s+|\n+', source)
+                               if span.strip()))
+    grouped = {}
+    for index, match in enumerate(matches):
+        if match:
+            continue
+        quote = quotes[index]
+        key = json.dumps(quote, ensure_ascii=False)
+        grouped.setdefault(key, {'quote': quote, 'indices': [], 'triples': []})
+        grouped[key]['indices'].append(index)
+        grouped[key]['triples'].append(triples[index])
+    details = []
+    for group in list(grouped.values())[:6]:
+        quote = group['quote'] if isinstance(group['quote'], str) else ''
+        closest = sorted(spans, key=lambda span: SequenceMatcher(
+            None, ' '.join(quote.split()), ' '.join(span.split())).ratio(), reverse=True)[:2]
+        details.append(
+            'Bad support quote at record indices ' + json.dumps(group['indices'])
+            + '; corresponding triples=' + json.dumps(group['triples'], ensure_ascii=False)
+            + '; supplied quote=' + json.dumps(group['quote'], ensure_ascii=False)
+            + '; nearby actual source sentences (diagnostic candidates, not verified entailment)='
+            + json.dumps(closest, ensure_ascii=False)
+        )
+    if len(grouped) > 6:
+        details.append(f'{len(grouped) - 6} additional mismatching quote groups also require correction.')
+    return (
+        'Support quotes do not occur verbatim in the supplied source passage. '
+        + '\n'.join(details)
+        + '\nCopy the shortest supporting original text exactly, including quotes and punctuation. '
+        'Do not paraphrase, join separated sentences, drop quote characters, use ellipses, '
+        'or copy the demonstration passage. Recheck every evidence quote against the actual source.'
+    )
 
 
 def extract_triple_payload(response: str) -> dict:

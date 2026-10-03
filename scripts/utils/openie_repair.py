@@ -271,6 +271,12 @@ def repair(args, smoke=False):
     started = time.monotonic()
     server_log = Path(args.vllm_log)
     log_start = server_log.stat().st_size if server_log.is_file() else None
+    write_json(out / "repair_run_started.json", {
+        "pid": os.getpid(), "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pending_chunks": len(pending), "smoke": smoke,
+        "server_log_start": log_start, "workers": 8, "triple_max_tokens": 2048,
+        "extractor_sha256": sha256(ROOT / "src/pathcondrag/information_extraction/openie_openai.py"),
+    })
     LOG.info("[repair] pending=%s workers=8 max_tokens=2048 thinking=false smoke=%s", len(pending), smoke)
     completed = []
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -321,6 +327,14 @@ def repair(args, smoke=False):
 def required_contents(rows):
     entities, facts = set(), set()
     for row in rows:
+        metadata = row.get("openie_metadata") or {}
+        for stage in ("ner", "triples"):
+            status = metadata.get(stage) or {}
+            if (status.get("error") or status.get("openie_skipped")
+                    or status.get("quality_status") in ("failed", "partial")):
+                raise ValueError("Incomplete OpenIE stage in publishable index: " + row["idx"])
+        if row.get("openie_quality_repair", {}).get("complete") is False:
+            raise ValueError("Incomplete repair in publishable index: " + row["idx"])
         validation = validate_triples(row["extracted_triples"])
         if validation.invalid_triples:
             raise ValueError("Invalid triples in publishable OpenIE: " + row["idx"])
@@ -344,7 +358,7 @@ def build(args):
     if (out / "build_complete.json").exists():
         marker = read_json(out / "build_complete.json")
         if marker.get("repaired_openie_sha256") == sha256(out / "repaired_openie.json"):
-            LOG.info("[build] previously completed for this exact OpenIE; validating instead")
+            LOG.info("[build] previously completed for this exact OpenIE; skipping reconstruction")
             return
         LOG.info("[build] OpenIE changed since the previous build; reconstructing graph/stores")
     for name in ("chunk_embeddings/vdb_chunk.parquet", "chunk_metadata.json"):
@@ -401,6 +415,13 @@ def validate(args):
     source, model_dir, _, _, out, index, snapshot = initialize(args)
     destination = index / model_dir
     state = read_json(destination / "openie_state.json")
+    payload_path = out / "repaired_openie.json"
+    marker = read_json(out / "build_complete.json")
+    expected_payload = read_json(payload_path)
+    if (marker.get("repaired_openie_sha256") != sha256(payload_path)
+            or state.get("docs") != expected_payload.get("docs")
+            or state.get("provenance") != expected_payload.get("provenance")):
+        raise ValueError("Built index is not bound to the current completed repair")
     entities, facts = required_contents(state["docs"])
     chunks = {row["idx"] for row in state["docs"]}
     if len(chunks) != len(state["docs"]):
@@ -422,13 +443,16 @@ def validate(args):
                 values = np.asarray(vector)
                 if values.shape != (4096,) or not np.isfinite(values).all():
                     raise ValueError("Invalid vector dimensions or non-finite values")
+                if not np.isclose(np.linalg.norm(values), 1.0, atol=0.02):
+                    raise ValueError("Embedding does not meet the normalized-vector contract")
                 ids.add(key)
                 contents.add(content)
                 count += 1
         if contents != needed:
             raise ValueError(f"{namespace} vectors do not match current OpenIE")
         sets[namespace] = ids
-        vector_reports[namespace] = {"count": count, "dimension": 4096, "finite": True}
+        vector_reports[namespace] = {"count": count, "dimension": 4096,
+                                     "finite": True, "normalized": True}
     graph = ig.Graph.Read_Pickle(str(destination / "graph.pickle"))
     if "hipporag_edge_schema" not in graph.attributes() or graph["hipporag_edge_schema"] != 1:
         raise ValueError("Source-aware graph edge schema missing")
