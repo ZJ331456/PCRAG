@@ -17,6 +17,9 @@ import numpy as np
 from collections import defaultdict
 import re
 import time
+import tempfile
+
+from .utils.openie_quality import validate_triples
 
 from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
@@ -120,6 +123,8 @@ class BaseRAG:
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory: {self.working_dir}")
             os.makedirs(self.working_dir, exist_ok=True)
+
+        self._text_normalizer = self._resolve_index_text_normalizer()
 
         self.llm_model: BaseLLM = _get_llm_class(self.global_config)
 
@@ -300,7 +305,8 @@ class BaseRAG:
 
         assert False, logger.info('Done with OpenIE, run online indexing for future retrieval.')
 
-    def index(self, docs: List[str]):
+    def index(self, docs: List[str], *, rebuild_graph: bool = False,
+              retry_failed_openie: bool = True):
         """
         Indexes the given documents based on the HippoRAG 2 framework which generates an OpenIE knowledge graph
         based on the given documents and encodes passages, entities and facts separately for later retrieval.
@@ -308,11 +314,21 @@ class BaseRAG:
         Parameters:
             docs : List[str]
                 A list of documents to be indexed.
+            rebuild_graph : bool
+                Explicitly rebuild edges and prune obsolete fact/entity vectors.
+                Use a separate working directory when repairing shared indexes.
+            retry_failed_openie : bool
+                Re-extract cached rows with an explicit failed/partial status.
+                Empty results marked valid are retained.
         """
 
         logger.info(f"Indexing Documents")
 
         logger.info(f"Performing OpenIE")
+
+        rebuild_graph = rebuild_graph or bool(
+            getattr(self.global_config, 'force_index_from_scratch', False)
+        )
 
         if self.global_config.openie_mode == 'offline':
             self.pre_openie(docs)
@@ -320,15 +336,41 @@ class BaseRAG:
         self.chunk_embedding_store.insert_strings(docs)
         chunk_to_rows = self.chunk_embedding_store.get_all_id_to_rows()
 
-        all_openie_info, chunk_keys_to_process = self.load_existing_openie(chunk_to_rows.keys())
+        all_openie_info, chunk_keys_to_process = self.load_existing_openie(
+            chunk_to_rows.keys(), retry_failed=retry_failed_openie,
+        )
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
+
+        # Replacing facts for an existing passage requires replacing its graph
+        # edges as well.  The incremental path deliberately skips those edges;
+        # refuse a stale graph rather than silently updating only the JSON.
+        if self.graph.vcount() and not rebuild_graph:
+            graph_names = set(self.graph.vs['name'])
+            replacing = graph_names.intersection(chunk_keys_to_process)
+            invalid_cached = [row['idx'] for row in all_openie_info
+                              if self._openie_row_has_invalid_graph_triples(row)]
+            if replacing or invalid_cached:
+                raise RuntimeError(
+                    'OpenIE repair changes an existing graph. Use index(..., '
+                    'rebuild_graph=True) in a separate index directory; '
+                    f'{len(replacing)} passages need extraction and '
+                    f'{len(invalid_cached)} cached passages contain invalid graph triples.'
+                )
 
         if len(chunk_keys_to_process) > 0:
             new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
 
-        if self.global_config.save_openie:
+        incomplete_rows = [row['idx'] for row in all_openie_info if openie_row_needs_retry(row)]
+        if incomplete_rows:
+            # Diagnostic checkpoints are saved even when save_openie=False.
+            # A partial graph must never be published as a completed index.
             self.save_openie_results(all_openie_info)
+            raise RuntimeError(
+                f'OpenIE incomplete for {len(incomplete_rows)} chunks; diagnostics saved to '
+                f'{self.openie_results_path}. No graph or entity/fact vectors were published. '
+                f'First chunks: {incomplete_rows[:5]}'
+            )
 
         ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
 
@@ -337,9 +379,32 @@ class BaseRAG:
         # prepare data_store
         chunk_ids = list(chunk_to_rows.keys())
 
-        chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in chunk_ids]
+        chunk_triples = [self._normalize_graph_triples(triple_results_dict[chunk_id].triples)
+                         for chunk_id in chunk_ids]
+        chunk_digests = self._openie_chunk_digests(chunk_ids, chunk_triples)
+        if self.graph.vcount() and not rebuild_graph:
+            previous = (self.graph['openie_chunk_digests']
+                        if 'openie_chunk_digests' in self.graph.attributes() else {})
+            changed = [key for key, digest in chunk_digests.items()
+                       if key in previous and previous[key] != digest]
+            if changed:
+                raise RuntimeError(
+                    f'Facts changed for {len(changed)} existing passages. '
+                    'Use index(..., rebuild_graph=True) to keep graph and vectors consistent.'
+                )
+
+        if self.global_config.save_openie:
+            self.save_openie_results(all_openie_info)
+
         entity_nodes, chunk_triple_entities = extract_entity_nodes(chunk_triples)
         facts = flatten_facts(chunk_triples)
+
+        if rebuild_graph or self.graph.vcount() == 0:
+            logger.info('Building graph from current validated OpenIE results.')
+            self.graph = ig.Graph(directed=self.global_config.is_directed_graph)
+            self.ready_to_retrieve = False
+            self._prune_embedding_store(self.entity_embedding_store, entity_nodes)
+            self._prune_embedding_store(self.fact_embedding_store, [str(fact) for fact in facts])
 
         logger.info(f"Encoding Entities")
         self.entity_embedding_store.insert_strings(entity_nodes)
@@ -356,11 +421,57 @@ class BaseRAG:
         num_new_chunks = self.add_passage_edges(chunk_ids, chunk_triple_entities)
 
         if num_new_chunks > 0:
+            self.ready_to_retrieve = False
             logger.info(f"Found {num_new_chunks} new chunks to save into graph.")
             self.add_synonymy_edges()
 
             self.augment_graph()
+            self.graph['openie_chunk_digests'] = chunk_digests
             self.save_igraph()
+
+    def _resolve_index_text_normalizer(self):
+        manifest_path = os.path.join(self.working_dir, 'index_manifest.json')
+        schema = None
+        if os.path.isfile(manifest_path):
+            with open(manifest_path, encoding='utf-8') as f:
+                schema = json.load(f).get('text_normalization')
+        if schema is None or schema == 'ascii_alnum_lower_v1':
+            self._text_normalization_schema = 'ascii_alnum_lower_v1'
+            return text_processing
+        if schema == 'unicode_alnum_casefold_v1':
+            self._text_normalization_schema = schema
+            return unicode_text_processing
+        raise ValueError(f'Unsupported index text_normalization={schema!r}: {manifest_path}')
+
+    def _normalize_index_text(self, text):
+        return getattr(self, '_text_normalizer', text_processing)(text)
+
+    def _normalize_graph_triples(self, triples):
+        return normalize_graph_triples(triples, normalizer=self._normalize_index_text)
+
+    def _openie_row_has_invalid_graph_triples(self, row: dict) -> bool:
+        validation = validate_triples(row.get('extracted_triples', []))
+        return bool(validation.invalid_triples or any(
+            not all(field.strip() for field in self._normalize_index_text(triple))
+            for triple in validation.valid_triples
+        ))
+
+    @staticmethod
+    def _openie_chunk_digests(chunk_ids, chunk_triples) -> Dict[str, str]:
+        return {
+            key: compute_mdhash_id(json.dumps(sorted(set(map(tuple, triples))), ensure_ascii=False))
+            for key, triples in zip(chunk_ids, chunk_triples)
+        }
+
+    @staticmethod
+    def _prune_embedding_store(store, current_texts: List[str]):
+        """An explicit rebuild retains embeddings only for current facts/entities."""
+        desired = {compute_mdhash_id(text, prefix=store.namespace + '-') for text in current_texts}
+        obsolete = [key for key in store.get_all_ids() if key not in desired]
+        if obsolete:
+            logger.info('Removing %s obsolete %s vectors before rebuilding graph.',
+                        len(obsolete), store.namespace)
+            store.delete(obsolete)
 
     def delete(self, docs_to_delete: List[str]):
         """
@@ -401,7 +512,7 @@ class BaseRAG:
         true_triples_to_delete = []
 
         for triple in triples_to_delete:
-            proc_triple = tuple(text_processing(list(triple)))
+            proc_triple = tuple(self._normalize_index_text(list(triple)))
 
             doc_ids = self.proc_triples_to_docs[str(proc_triple)]
 
@@ -410,7 +521,7 @@ class BaseRAG:
             if len(non_deleted_docs) == 0:
                 true_triples_to_delete.append(triple)
 
-        processed_true_triples_to_delete = [[text_processing(list(triple)) for triple in true_triples_to_delete]]
+        processed_true_triples_to_delete = [[self._normalize_index_text(list(triple)) for triple in true_triples_to_delete]]
         entities_to_delete, _ = extract_entity_nodes(processed_true_triples_to_delete)
         processed_true_triples_to_delete = flatten_facts(processed_true_triples_to_delete)
 
@@ -1008,7 +1119,8 @@ class BaseRAG:
         gc.collect()
         logger.info(f"Added {num_synonym_triple} synonymy edges.")
 
-    def load_existing_openie(self, chunk_keys: Iterable[str]) -> Tuple[List[dict], List[str]]:
+    def load_existing_openie(self, chunk_keys: Iterable[str], *,
+                             retry_failed: bool = False) -> Tuple[List[dict], List[str]]:
         """
         Loads existing OpenIE results from the specified file if it exists and combines
         them with new content while standardizing indices. If the file does not exist or
@@ -1024,31 +1136,41 @@ class BaseRAG:
                                          information (if any) loaded from the file, and the
                                          second element is a set of chunk keys that still need to
                                          be saved or processed.
+
+        retry_failed is opt-in so retrieval preparation never starts extraction.
         """
 
         # combine openie_results with contents already in file, if file exists
         # Preserve corpus order.  A set here changes OpenIE request, file, and
         # potentially graph tie-break order across Python hash seeds.
         chunk_keys_to_save = []
+        self._openie_file_metadata = {}
 
         if not self.global_config.force_openie_from_scratch and os.path.isfile(self.openie_results_path):
             with open(self.openie_results_path, encoding="utf-8") as openie_file:
                 openie_results = json.load(openie_file)
+            self._openie_file_metadata = {
+                key: deepcopy(value) for key, value in openie_results.items()
+                if key not in ('docs', 'avg_ent_chars', 'avg_ent_words')
+            }
             all_openie_info = openie_results.get('docs', [])
 
             #Standardizing indices for OpenIE Files.
 
-            renamed_openie_info = []
+            renamed_openie_info = {}
             for openie_info in all_openie_info:
                 openie_info['idx'] = compute_mdhash_id(openie_info['passage'], 'chunk-')
-                renamed_openie_info.append(openie_info)
+                # Historical duplicate rows can arise when a failed chunk is
+                # reprocessed.  The latest extraction replaces that chunk.
+                renamed_openie_info[openie_info['idx']] = openie_info
 
-            all_openie_info = renamed_openie_info
+            all_openie_info = list(renamed_openie_info.values())
 
-            existing_openie_keys = set([info['idx'] for info in all_openie_info])
+            existing_openie_rows = {info['idx']: info for info in all_openie_info}
 
             for chunk_key in chunk_keys:
-                if chunk_key not in existing_openie_keys:
+                row = existing_openie_rows.get(chunk_key)
+                if row is None or (retry_failed and openie_row_needs_retry(row)):
                     chunk_keys_to_save.append(chunk_key)
         else:
             all_openie_info = []
@@ -1086,18 +1208,43 @@ class BaseRAG:
 
         """
 
+        positions = {row['idx']: position for position, row in enumerate(all_openie_info)}
+        replacements = []
         for chunk_key, row in chunks_to_save.items():
             passage = row['content']
-            try:
-                chunk_openie_info = {'idx': chunk_key, 'passage': passage,
-                                 'extracted_entities': ner_results_dict[chunk_key].unique_entities,
-                                 'extracted_triples': triple_results_dict[chunk_key].triples}
-            except Exception as e:
-                logger.error(f"Error processing chunk {chunk_key}: {e}")
-                chunk_openie_info = {'idx': chunk_key, 'passage': passage,
-                                 'extracted_entities': [],
-                                 'extracted_triples': []}
-            all_openie_info.append(chunk_openie_info)
+            if chunk_key not in ner_results_dict or chunk_key not in triple_results_dict:
+                raise RuntimeError(f'Missing OpenIE stage result for chunk {chunk_key}')
+            ner_result = ner_results_dict[chunk_key]
+            triple_result = triple_results_dict[chunk_key]
+            if ner_result.chunk_id != chunk_key or triple_result.chunk_id != chunk_key:
+                raise RuntimeError(f'OpenIE chunk ID mismatch for {chunk_key}')
+            validation = validate_triples(triple_result.triples)
+            triple_metadata = deepcopy(triple_result.metadata or {})
+            if validation.invalid_triples:
+                triple_metadata.update({
+                    'quality_status': 'partial' if validation.valid_triples else 'failed',
+                    'invalid_triple_count': len(validation.invalid_triples),
+                    'validation_issues': validation.issues,
+                })
+            chunk_openie_info = {
+                'idx': chunk_key, 'passage': passage,
+                'extracted_entities': ner_result.unique_entities,
+                'extracted_triples': validation.valid_triples,
+                'openie_metadata': {
+                    'ner': deepcopy(ner_result.metadata or {}), 'triples': triple_metadata,
+                },
+                'openie_responses': {'ner': ner_result.response, 'triples': triple_result.response},
+            }
+            replacements.append((chunk_key, chunk_openie_info))
+
+        # Validate all results before mutating the caller's rows.  A missing
+        # stage must not leave a half-merged corpus that looks successful.
+        for chunk_key, chunk_openie_info in replacements:
+            if chunk_key in positions:
+                all_openie_info[positions[chunk_key]] = chunk_openie_info
+            else:
+                positions[chunk_key] = len(all_openie_info)
+                all_openie_info.append(chunk_openie_info)
 
         return all_openie_info
 
@@ -1127,13 +1274,24 @@ class BaseRAG:
                 avg_ent_words = 0
                 
             openie_dict = {
+                **deepcopy(getattr(self, '_openie_file_metadata', {})),
                 'docs': all_openie_info,
                 'avg_ent_chars': avg_ent_chars,
                 'avg_ent_words': avg_ent_words
             }
-            
-            with open(self.openie_results_path, 'w') as f:
-                json.dump(openie_dict, f)
+            # os.replace also avoids overwriting other experiment files that
+            # happen to share the source OpenIE file through hard links.
+            directory = os.path.dirname(os.path.abspath(self.openie_results_path))
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                 dir=directory, delete=False) as f:
+                    temporary_path = f.name
+                    json.dump(openie_dict, f, ensure_ascii=False)
+                os.replace(temporary_path, self.openie_results_path)
+            finally:
+                if temporary_path and os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
             logger.info(f"OpenIE results saved to {self.openie_results_path}")
 
     def augment_graph(self):
@@ -1210,7 +1368,15 @@ class BaseRAG:
         logger.info(
             f"Writing graph with {len(self.graph.vs())} nodes, {len(self.graph.es())} edges"
         )
-        self.graph.write_pickle(self._graph_pickle_filename)
+        directory = os.path.dirname(os.path.abspath(self._graph_pickle_filename))
+        fd, temporary_path = tempfile.mkstemp(dir=directory, suffix='.pickle')
+        os.close(fd)
+        try:
+            self.graph.write_pickle(temporary_path)
+            os.replace(temporary_path, self._graph_pickle_filename)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
         logger.info(f"Saving graph completed!")
 
     def get_graph_info(self) -> Dict:
@@ -1333,11 +1499,10 @@ class BaseRAG:
         self.proc_triples_to_docs = {}
 
         for doc in all_openie_info:
-            triples = flatten_facts([doc['extracted_triples']])
+            triples = self._normalize_graph_triples(doc.get('extracted_triples', []))
             for triple in triples:
-                if len(triple) == 3:
-                    proc_triple = tuple(text_processing(list(triple)))
-                    self.proc_triples_to_docs[str(proc_triple)] = self.proc_triples_to_docs.get(str(proc_triple), set()).union(set([doc['idx']]))
+                proc_triple = tuple(triple)
+                self.proc_triples_to_docs[str(proc_triple)] = self.proc_triples_to_docs.get(str(proc_triple), set()).union(set([doc['idx']]))
 
         if self.ent_node_to_chunk_ids is None:
             ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
@@ -1364,7 +1529,8 @@ class BaseRAG:
                         )
 
             # prepare data_store
-            chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in self.passage_node_keys]
+            chunk_triples = [self._normalize_graph_triples(triple_results_dict[chunk_id].triples)
+                             for chunk_id in self.passage_node_keys]
 
             self.node_to_node_stats = {}
             self.ent_node_to_chunk_ids = {}

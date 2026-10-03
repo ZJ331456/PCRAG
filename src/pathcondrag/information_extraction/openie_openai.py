@@ -7,12 +7,16 @@ from tqdm import tqdm
 
 from ..prompts import PromptTemplateManager
 from ..utils.logging_utils import get_logger
-from ..utils.llm_utils import filter_invalid_triples
+from ..utils.openie_quality import (
+    REPAIR_JSON_SCHEMA, TRIPLE_JSON_SCHEMA, extract_triple_payload, merge_triples,
+    entity_argument_issues, normalize_repair_payload, validate_triples,
+)
 from ..utils.misc_utils import TripleRawOutput, NerRawOutput
 from ..llm.openai_gpt import CacheOpenAI, LLM_MAX_IN_FLIGHT
 
 logger = get_logger(__name__)
 _LENGTH_RETRY_FREQUENCY_PENALTIES = (0.2, 0.5)
+_DEFAULT_QUALITY_MAX_RETRIES = 5
 
 
 def _safe_env_int(name: str, default: int | None = None) -> int | None:
@@ -63,8 +67,7 @@ def _extract_ner_from_response(real_response):
     return _extract_json_list_field(real_response, "named_entities")
 
 
-def _length_retry_seed(llm_model: CacheOpenAI) -> int:
-    """Change the cache key once without changing the decoding settings."""
+def _base_generate_seed(llm_model: CacheOpenAI) -> int:
     config = getattr(llm_model, "llm_config", None)
     params = getattr(config, "generate_params", {}) or {}
     base_seed = params.get("seed")
@@ -72,17 +75,41 @@ def _length_retry_seed(llm_model: CacheOpenAI) -> int:
         base_seed = 0
     if not isinstance(base_seed, int) or isinstance(base_seed, bool):
         raise ValueError(f"OpenIE retry requires an integer or null seed, got {base_seed!r}")
-    return base_seed + 1
+    return base_seed
+
+
+def _length_retry_seed(llm_model: CacheOpenAI) -> int:
+    """Change the cache key once without changing the decoding settings."""
+    return _base_generate_seed(llm_model) + 1
+
+
+def _resolve_quality_max_retries(explicit):
+    if explicit is not None:
+        if explicit < 0:
+            raise ValueError("quality_max_retries cannot be negative.")
+        return explicit
+    raw = os.environ.get("HIPPO_OPENIE_QUALITY_MAX_RETRIES", "").strip()
+    if raw:
+        value = int(raw)
+        if value < 0:
+            raise ValueError("HIPPO_OPENIE_QUALITY_MAX_RETRIES cannot be negative.")
+        return value
+    return _DEFAULT_QUALITY_MAX_RETRIES
 
 
 class OpenIE:
-    def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, respect_env_workers: bool = True):
+    def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, respect_env_workers: bool = True,
+                 quality_max_retries=None, guided_recovery: bool = False):
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1.")
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
         self.llm_model = llm_model
         self.max_workers = max_workers
         self.respect_env_workers = respect_env_workers
+        self.quality_max_retries = _resolve_quality_max_retries(quality_max_retries)
+        # Optional vLLM 0.8.x guided_json is used only for error recovery. The
+        # client continues to enforce enable_thinking=False for Qwen3.
+        self.guided_recovery = guided_recovery
 
     def worker_limits(self) -> Tuple[int, int]:
         """Resolve NER/triple limits; explicit config takes priority over legacy env."""
@@ -100,7 +127,7 @@ class OpenIE:
         raw_response = ""
         metadata = {}
         # Align with HippoRAG: default 512, escalate to 1024 on parse failure or truncation.
-        ner_max_tokens = _safe_env_int('HIPPO_OPENIE_NER_MAX_TOKENS', 512)
+        ner_max_tokens = getattr(self, 'ner_max_tokens', _safe_env_int('HIPPO_OPENIE_NER_MAX_TOKENS', 512))
         token_budgets = [ner_max_tokens]
         if ner_max_tokens < 1024:
             token_budgets.append(1024)
@@ -203,93 +230,302 @@ class OpenIE:
             metadata=metadata
         )
 
-    def triple_extraction(self, chunk_key: str, passage: str, named_entities: List[str]) -> TripleRawOutput:
-        def _extract_triples_from_response(real_response):
-            return _extract_json_list_field(real_response, "triples")
-
-        # PREPROCESSING
+    def _triple_messages(self, passage, named_entities, error=None, previous_response=None,
+                         retained_triples=None, repair_context=''):
         messages = self.prompt_template_manager.render(
-            name='triple_extraction',
-            passage=passage,
-            named_entity_json=json.dumps({"named_entities": named_entities})
+            name='triple_extraction', passage=passage,
+            named_entity_json=json.dumps({"named_entities": named_entities}, ensure_ascii=False),
         )
+        if repair_context:
+            # Demonstrate semantic relations for every coordinated subject; a
+            # list connector is not a relation and must not become a graph edge.
+            example_source = (
+                "Lena Vale and Tomas Reed are twins and are both children of Mira Vale and Owen Reed. "
+                "Lena is their daughter and Tomas their son. Both characters are portrayed by Alex Rowan "
+                "and appear in Film Two."
+            )
+            example_triples = [
+                ['Lena Vale', 'portrayed by', 'Alex Rowan'],
+                ['Tomas Reed', 'portrayed by', 'Alex Rowan'],
+                ['Lena Vale', 'daughter of', 'Mira Vale'],
+                ['Lena Vale', 'daughter of', 'Owen Reed'],
+                ['Tomas Reed', 'son of', 'Mira Vale'],
+                ['Tomas Reed', 'son of', 'Owen Reed'],
+                ['Lena Vale', 'twin of', 'Tomas Reed'],
+                ['Tomas Reed', 'twin of', 'Lena Vale'],
+                ['Lena Vale', 'appears in', 'Film Two'],
+                ['Tomas Reed', 'appears in', 'Film Two'],
+            ]
+            messages = [
+                {'role': 'system', 'content': (
+                    'Extract source-supported semantic relations for index repair. '
+                    'Return one JSON object with triples (paired records) and status. '
+                    'Every record has triple (exactly three non-empty strings: subject, predicate, object) '
+                    'and support_quote (verbatim evidence from the original passage). '
+                    'A predicate must express a real relationship, never a connector such as and/or. '
+                    'Expand coordinated subjects into separate complete relations. '
+                    'For explicitly shared parentage, every child relates to every stated joint parent; '
+                    'do not pair children and parents by list position. Expand shared arguments only when '
+                    'the source states that they are shared, never for separately assigned relations. '
+                    'Preserve entity names as arguments, put relation words in predicates, resolve pronouns only when unambiguous, '
+                    'and preserve important qualifiers. Do not invent facts or copy the demonstration entities.'
+                )},
+                {'role': 'user', 'content': 'Example passage:\n' + example_source},
+                {'role': 'assistant', 'content': json.dumps({
+                    'triples': [{'triple': triple, 'support_quote': example_source} for triple in example_triples],
+                    'status': 'success',
+                }, ensure_ascii=False)},
+                {'role': 'user', 'content': (
+                    'Actual original passage:\n' + passage + '\n'
+                    + json.dumps({'named_entities': named_entities}, ensure_ascii=False)
+                )},
+            ]
+        if error:
+            # Change the actual task on recovery, rather than merely changing
+            # a cache seed at temperature zero. The source remains in context.
+            feedback = (
+                "The previous extraction failed validation: " + str(error) + "\n"
+                + ('Return paired triple/support_quote records with status. ' if repair_context
+                 else 'Return only {"triples": [["subject", "relation", "object"]]}. ')
+                + "Use exactly three non-empty strings per triple. Re-extract from the "
+                "original passage; never truncate four/five-field records or invent a missing field. "
+                "Keep time/place qualifiers inside a relation or object string. "
+                "Complete property relations using a meaningful object. "
+                "Remove repetition and placeholders. Do not use outside knowledge.\n"
+                "Previous output (diagnostic only, not factual evidence):\n"
+                + (previous_response or "")[:3500]
+            )
+            if retained_triples:
+                feedback += ("\nAlready accepted relations are preserved. Return the corrected "
+                             "relations plus any supported missing relations; do not delete correct facts:\n"
+                             + json.dumps(retained_triples[:20], ensure_ascii=False))
+            messages.append({"role": "user", "content": feedback})
+        if repair_context:
+            messages.append({'role': 'user', 'content': (
+                "Targeted index repair. The original passage above is the only factual source.\n"
+                + repair_context[:6000] + "\n"
+                "Follow the repair scope in the context: for an originally empty/failed result, extract all "
+                "explicit relations from the original source, including each relation for each coordinated subject. "
+                "For listed defective records, repair those; existing valid relations are retained externally. "
+                'Return exactly {"triples": [{"triple": ["subject", "relation", "object"], '
+                '"support_quote": "verbatim original-passage evidence"}], "status": "success"}. '
+                'Each relation and its evidence must be one paired record; do not output parallel arrays. '
+                'Use a short verbatim span containing the supporting assertion; do not quote an entire '
+                'long table or passage for every relation. '
+                'Never split a four/five-field relation into arbitrary groups of three. '
+                'For example ["A", "and", "B", "live in", "C"] means two complete relations '
+                '["A", "lives in", "C"] and ["B", "lives in", "C"], each with source evidence. '
+                'Likewise "A and B are both portrayed by C" requires ["A", "portrayed by", "C"] '
+                'and ["B", "portrayed by", "C"]. Do not omit the shared portrayed-by relation. '
+                'For explicit joint parentage (such as both children of C and D, or C and D\'s children), '
+                'each child has each joint parent: A child-of C, A child-of D, B child-of C, B child-of D. '
+                'Preserve any explicitly stated son/daughter roles in these relations. '
+                'This is not a general Cartesian expansion: if the passage assigns individual relations '
+                'with respectively or other separate assignments, follow those assignments. '
+                'For entity-to-entity facts keep the entity name as the object and put relation words '
+                'in the predicate: ["X", "is", "child of", "Y"] becomes ["X", "child of", "Y"], '
+                'not ["X", "is", "child of Y"]. '
+                "Preserve qualifiers, and never infer a missing argument from outside knowledge. "
+                "If none of the requested defective records corresponds to a supported relation in the source, "
+                'return {"triples": [], "status": "no_supported_relations"}. '
+                "Do not repeat already valid unrelated facts to hide failure to recover the requested records."
+            )})
+        return messages
 
-        raw_response = ""
-        metadata = {}
-        # Align with HippoRAG openie_triple_max_tokens default=2048
-        triple_max_tokens = _safe_env_int('HIPPO_OPENIE_TRIPLE_MAX_TOKENS', 2048)
-        length_observed_count = 0
-        length_retry_count = 0
-        length_retry_penalties_attempted = []
-        openie_attempt_settings = []
-        attempt_count = 0
-        try:
-            # LLM INFERENCE
-            for attempt in range(len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 2):
-                kwargs = {"messages": messages, "max_completion_tokens": triple_max_tokens}
-                if attempt == 1:
-                    kwargs['seed'] = _length_retry_seed(self.llm_model)
-                elif attempt > 1:
-                    penalty = _LENGTH_RETRY_FREQUENCY_PENALTIES[attempt - 2]
-                    kwargs['frequency_penalty'] = penalty
-                    length_retry_penalties_attempted.append(penalty)
-                if attempt:
-                    length_retry_count += 1
-                attempt_count += 1
-                openie_attempt_settings.append({key: value for key, value in kwargs.items()
-                                                if key != "messages"})
-                raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
-                metadata = dict(response_metadata)
-                metadata.update({
-                    'cache_hit': cache_hit,
-                    'openie_attempt_count': attempt_count,
-                    'length_retry_count': length_retry_count,
-                    'length_observed_count': length_observed_count,
-                    'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
-                    'openie_attempt_settings': list(openie_attempt_settings),
-                })
-                if attempt == 1:
-                    metadata['length_retry_seed'] = kwargs['seed']
-                elif attempt > 1:
-                    metadata['length_retry_frequency_penalty'] = kwargs['frequency_penalty']
-                if metadata.get('finish_reason') != 'length':
+    @staticmethod
+    def _recovery_windows(passage, max_windows=8, window_chars=900, overlap_chars=120):
+        """Bounded source windows; offsets refer to the unchanged original chunk.
+
+        Titles are repeated as context. Windows overlap at whitespace boundaries
+        so facts near a cut are not silently discarded. Huge passages that cannot
+        fit the bound are left failed rather than silently dropping their tail.
+        """
+        newline = passage.find("\n")
+        title = passage[:newline] if 0 < newline <= 200 else ""
+        offset = newline + 1 if title else 0
+        windows = []
+        while offset < len(passage):
+            end = min(len(passage), offset + window_chars)
+            if end < len(passage):
+                boundary = passage.rfind(" ", offset + window_chars // 2, end)
+                if boundary > offset:
+                    end = boundary
+            text = passage[offset:end]
+            windows.append((offset, end, (title + "\n" if title else "") + text))
+            if end == len(passage):
+                return windows
+            if len(windows) >= max_windows:
+                return []
+            offset = max(offset + 1, end - overlap_chars)
+            while offset > 0 and not passage[offset - 1].isspace():
+                offset += 1
+                if offset >= end:
                     break
-                length_observed_count += 1
-                metadata['length_observed_count'] = length_observed_count
-                if attempt == len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 1:
-                    raise RuntimeError(
-                        f"Triple extraction chunk {chunk_key} remains truncated "
-                        f"(finish_reason=length) after {attempt + 1} attempts"
-                    )
-                logger.warning("Triple response truncated for %s; retrying at max_new_tokens=%s",
-                               chunk_key, triple_max_tokens)
-            extracted_triples = _extract_triples_from_response(raw_response)
-            triplets = filter_invalid_triples(triples=extracted_triples)
+        return windows
 
-        except Exception as e:
-            logger.warning(f"Exception for chunk {chunk_key}: {e}")
+    def triple_extraction(self, chunk_key: str, passage: str, named_entities: List[str],
+                          repair_context: str = '', _allow_window_recovery: bool = True,
+                          _support_source: str | None = None) -> TripleRawOutput:
+        raw_response, metadata, retained = "", {}, []
+        triple_max_tokens = getattr(self, 'triple_max_tokens', _safe_env_int('HIPPO_OPENIE_TRIPLE_MAX_TOKENS', 2048))
+        attempt_settings, recovery_history, penalties = [], [], []
+        attempt_count = length_count = length_retry_count = 0
+        last_error = None
+        invalid_count = raw_count = 0
+        total_rounds = 1 + self.quality_max_retries
+        quality_idx = 0
+
+        def diagnostics():
             metadata.update({
-                'error': f'{type(e).__name__}: {e}',
                 'openie_attempt_count': attempt_count,
                 'length_retry_count': length_retry_count,
-                'length_observed_count': length_observed_count,
-                'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
-                'openie_attempt_settings': list(openie_attempt_settings),
+                'length_observed_count': length_count,
+                'length_retry_penalties_attempted': list(penalties),
+                'openie_attempt_settings': list(attempt_settings),
+                'quality_retry_count': quality_idx,
+                'quality_attempt_index': quality_idx,
+                'quality_max_retries': self.quality_max_retries,
+                'raw_triple_count': raw_count,
+                'valid_triple_count': len(retained),
+                'invalid_triple_count': invalid_count,
+                'recovery_history': list(recovery_history),
             })
-            return TripleRawOutput(
-                chunk_id=chunk_key,
-                response=raw_response,
-                metadata=metadata,
-                triples=[]
-            )
 
-        # Success
-        return TripleRawOutput(
-            chunk_id=chunk_key,
-            response=raw_response,
-            metadata=metadata,
-            triples=triplets
-        )
+        for quality_idx in range(total_rounds):
+            try:
+                for attempt in range(len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 2):
+                    messages = self._triple_messages(
+                        passage, named_entities, last_error,
+                        raw_response if last_error else None, retained, repair_context,
+                    )
+                    kwargs = {'messages': messages, 'max_completion_tokens': triple_max_tokens}
+                    if quality_idx or attempt:
+                        kwargs['seed'] = _base_generate_seed(self.llm_model) + 100 + quality_idx * 10 + attempt
+                    if attempt > 1:
+                        penalty = _LENGTH_RETRY_FREQUENCY_PENALTIES[attempt - 2]
+                        kwargs['frequency_penalty'] = penalty
+                        penalties.append(penalty)
+                    if attempt:
+                        length_retry_count += 1
+                    if (last_error or repair_context) and getattr(self, 'guided_recovery', False):
+                        configured = getattr(getattr(self.llm_model, 'llm_config', None), 'generate_params', {}) or {}
+                        kwargs['extra_body'] = dict(configured.get('extra_body') or {})
+                        kwargs['extra_body']['guided_json'] = REPAIR_JSON_SCHEMA if repair_context else TRIPLE_JSON_SCHEMA
+                    attempt_count += 1
+                    attempt_settings.append({key: value for key, value in kwargs.items() if key != 'messages'})
+                    raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
+                    metadata = dict(response_metadata)
+                    metadata['cache_hit'] = cache_hit
+                    if 'seed' in kwargs:
+                        metadata['length_retry_seed'] = kwargs['seed']
+                    if 'frequency_penalty' in kwargs:
+                        metadata['length_retry_frequency_penalty'] = kwargs['frequency_penalty']
+                    if metadata.get('finish_reason') != 'length':
+                        break
+                    length_count += 1
+                    last_error = RuntimeError('finish_reason=length: output was truncated; use complete, concise triples without duplicates')
+                    recovery_history.append({'kind': 'length', 'attempt': attempt_count,
+                                             'error': str(last_error), 'response': raw_response})
+                    if attempt == len(_LENGTH_RETRY_FREQUENCY_PENALTIES) + 1:
+                        raise last_error
+                if metadata.get('finish_reason') != 'stop':
+                    raise RuntimeError(f"Triple extraction did not complete: {metadata.get('finish_reason')!r}")
+                payload = extract_triple_payload(raw_response)
+                repair_triples, quotes, status = (normalize_repair_payload(payload) if repair_context
+                                                   else (payload['triples'], None, None))
+                report = validate_triples(repair_triples)
+                if repair_context:
+                    argument_errors = entity_argument_issues(report.valid_triples, named_entities)
+                    if argument_errors:
+                        raise ValueError('; '.join(argument_errors[:8]))
+                explicitly_empty = False
+                if repair_context:
+                    if status not in ('success', 'no_supported_relations'):
+                        raise ValueError('Repair response needs an explicit success/no_supported_relations status')
+                    if not isinstance(quotes, list) or len(quotes) != report.raw_count:
+                        raise ValueError('Each paired repair record must have one support quote')
+                    if status == 'no_supported_relations' and report.raw_count:
+                        raise ValueError('no_supported_relations must have empty triples and support_quotes')
+                    if status == 'success' and not report.raw_count:
+                        raise ValueError('Empty repair must explicitly confirm no_supported_relations')
+                    source_normalized = ' '.join((_support_source if _support_source is not None else passage).split())
+                    quote_matches = [isinstance(quote, str) and bool(quote.strip())
+                                     and ' '.join(quote.split()) in source_normalized for quote in quotes]
+                    metadata['support_quotes'] = quotes
+                    metadata['support_quote_matches'] = quote_matches
+                    metadata['repair_status'] = status
+                    metadata['support_check'] = 'source_quote_match_only_not_semantic_entailment'
+                    if not all(quote_matches):
+                        raise ValueError('A support quote does not occur in the supplied source passage')
+                    explicitly_empty = status == 'no_supported_relations'
+                raw_count = report.raw_count
+                if report.raw_count:
+                    invalid_count = len(report.invalid_triples)
+                retained = merge_triples(retained, report.valid_triples)
+                if report.invalid_triples:
+                    raise ValueError('; '.join(report.issues[:8]))
+                # An empty initial result is legitimate. Empty recovery of known
+                # invalid records does not prove that the source lacks relations.
+                if raw_count == 0 and recovery_history and not explicitly_empty:
+                    raise ValueError('Recovery returned no relations after a known extraction failure')
+                diagnostics()
+                metadata.update({'quality_status': 'success' if retained else 'empty_valid',
+                                 'quality_recovered': bool(recovery_history or repair_context)})
+                metadata.pop('error', None)
+                metadata.pop('openie_skipped', None)
+                return TripleRawOutput(chunk_id=chunk_key, response=raw_response,
+                                       metadata=metadata, triples=retained)
+            except Exception as error:
+                last_error = error
+                recovery_history.append({'kind': 'quality', 'attempt': attempt_count,
+                                         'error': f'{type(error).__name__}: {error}',
+                                         'response': raw_response})
+                logger.warning('OpenIE quality failure for %s, round %s/%s: %s',
+                               chunk_key, quality_idx, self.quality_max_retries, error)
+                # Repeating whole-table generation after four truncations is
+                # unproductive. Move directly to smaller source windows.
+                if metadata.get('finish_reason') == 'length' and len(passage) > 1000:
+                    break
+
+        diagnostics()
+        metadata['quality_status'] = 'partial' if retained else 'failed'
+        metadata['openie_skip_reason'] = f'{type(last_error).__name__}: {last_error}'
+        if _allow_window_recovery and len(passage) > 1000:
+            windows = self._recovery_windows(passage)
+            if len(windows) > 1:
+                window_reports, responses = [], []
+                for start, end, window_text in windows:
+                    window_entities = [entity for entity in named_entities
+                                       if isinstance(entity, str) and entity.casefold() in window_text.casefold()]
+                    output = self.triple_extraction(chunk_key, window_text, window_entities,
+                                                    repair_context=repair_context, _allow_window_recovery=False,
+                                                    _support_source=passage)
+                    retained = merge_triples(retained, output.triples)
+                    window_reports.append({'source_start': start, 'source_end': end,
+                                           'metadata': output.metadata})
+                    responses.append(output.response)
+                metadata['window_recovery'] = window_reports
+                metadata['window_recovery_attempt_count'] = sum(
+                    report['metadata'].get('openie_attempt_count', 0) for report in window_reports)
+                metadata['valid_triple_count'] = len(retained)
+                window_success = all(report['metadata'].get('quality_status') in ('success', 'empty_valid')
+                                     for report in window_reports)
+                metadata['quality_status'] = ('success' if retained and window_success
+                                              else 'empty_valid' if window_success and repair_context
+                                              else 'partial' if retained else 'failed')
+                metadata['window_recovery_complete'] = bool(window_success and (retained or repair_context))
+                if metadata['window_recovery_complete']:
+                    metadata['quality_recovered'] = True
+                    metadata['invalid_triple_count'] = 0
+                    metadata.pop('openie_skip_reason', None)
+                # Persist all raw window outputs without pretending they are a
+                # single model answer. Accepted relations are stored separately.
+                raw_response = json.dumps({'window_responses': responses}, ensure_ascii=False)
+        if metadata['quality_status'] not in ('success', 'empty_valid'):
+            metadata['openie_skipped'] = True
+        metadata.pop('error', None)
+        return TripleRawOutput(chunk_id=chunk_key, response=raw_response,
+                               metadata=metadata, triples=retained)
 
     def openie(self, chunk_key: str, passage: str) -> Dict[str, Any]:
         ner_output = self.ner(chunk_key=chunk_key, passage=passage)
@@ -394,6 +630,16 @@ class OpenIE:
         ]
         if failed_triple_chunk_ids:
             raise RuntimeError(f"Triple extraction failed for {len(failed_triple_chunk_ids)} chunk(s): {failed_triple_chunk_ids}")
+        skipped_triple_chunk_ids = [
+            chunk_key for chunk_key in chunk_passages
+            if triple_results_by_id[chunk_key].metadata.get("openie_skipped")
+        ]
+        if skipped_triple_chunk_ids:
+            logger.warning(
+                "Skipped triple extraction for %s chunk(s) after quality retries: %s",
+                len(skipped_triple_chunk_ids),
+                skipped_triple_chunk_ids,
+            )
 
         ner_results_dict = {chunk_key: ner_results_by_id[chunk_key] for chunk_key in chunk_passages}
         triple_results_dict = {chunk_key: triple_results_by_id[chunk_key] for chunk_key in chunk_passages}

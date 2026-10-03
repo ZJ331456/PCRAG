@@ -254,8 +254,12 @@ def freeze_index(args):
         metadata = row.get("openie_metadata") or {}
         for stage in ("ner", "triples"):
             stage_meta = metadata.get(stage) or {}
-            require(stage_meta.get("finish_reason") == "stop" and not stage_meta.get("error"),
-                    f"fresh OpenIE {stage} did not finish successfully: {row['idx']}")
+            finished_ok = (
+                stage_meta.get("finish_reason") == "stop"
+                and not stage_meta.get("openie_skipped") and not stage_meta.get("error")
+                and stage_meta.get("quality_status") not in ("failed", "partial")
+            )
+            require(finished_ok, f"fresh OpenIE {stage} did not finish successfully: {row['idx']}")
     config = result.get("runtime_config") or {}
     for key in ("embedding_model_name", "llm_name", "embedding_batch_size", "openie_max_workers",
                 "llm_prefetch_workers", "max_new_tokens"):

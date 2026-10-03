@@ -63,7 +63,7 @@ build_shared_index() {
   log_start="$(stat -c %s "${VLLM_LOG}")"
   start="$(date +%s)"
   echo "[index] HippoRAG2 fresh build started=$(date '+%F %T'); OpenIE workers=8, embedding batch=4"
-  conda run --no-capture-output -n "${CONDA_ENV}" python -u "${HIPPO_ROOT}/main.py" \
+  conda run --no-capture-output -n "${CONDA_ENV}" python -u "${ROOT}/scripts/build_shared_index.py" \
     --dataset musique --datasets_dir /root/datasets --rag_type hipporag \
     --sample_size "${SAMPLE_SIZE}" --sample_seed "${SAMPLE_SEED}" \
     --sample_indices_file "${OUT_ROOT}/selected_indices.json" \

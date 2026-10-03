@@ -2,12 +2,13 @@ from argparse import ArgumentTypeError
 from dataclasses import dataclass
 from hashlib import md5
 from typing import Dict, Any, List, Tuple, Literal, Union, Optional
+from copy import deepcopy
 import numpy as np
 import re
 import logging
 
 from .typing import Triple
-from .llm_utils import filter_invalid_triples
+from .openie_quality import validate_triples
 
 logger = logging.getLogger(__name__)
 
@@ -60,28 +61,75 @@ def text_processing(text):
         text = str(text)
     return re.sub('[^A-Za-z0-9 ]', ' ', text.lower()).strip()
 
+
+def unicode_text_processing(text):
+    """Match indexes declaring HippoRAG's unicode_alnum_casefold_v1 schema."""
+    if isinstance(text, list):
+        return [unicode_text_processing(item) for item in text]
+    if not isinstance(text, str):
+        text = str(text)
+    normalized = ''.join(character if character.isalnum() or character.isspace() else ' '
+                         for character in text.casefold())
+    return ' '.join(normalized.split())
+
 def reformat_openie_results(corpus_openie_results) -> (Dict[str, NerRawOutput], Dict[str, TripleRawOutput]):
+    """Restore cached outputs without discarding extraction diagnostics.
 
-    ner_output_dict = {
-        chunk_item['idx']: NerRawOutput(
-            chunk_id=chunk_item['idx'],
-            response=None,
-            metadata={},
-            unique_entities=list(np.unique(chunk_item['extracted_entities']))
+    Older HippoRAG rows do not contain responses or metadata.  Their triples are
+    still checked strictly; malformed cached relations must not become graph
+    nodes merely because their container happens to have length three.
+    """
+    ner_output_dict, triple_output_dict = {}, {}
+    for chunk_item in corpus_openie_results:
+        chunk_id = chunk_item['idx']
+        metadata = chunk_item.get('openie_metadata') or {}
+        responses = chunk_item.get('openie_responses') or {}
+        validation = validate_triples(chunk_item.get('extracted_triples', []))
+        triple_metadata = deepcopy(metadata.get('triples') or {})
+        if validation.invalid_triples:
+            triple_metadata['cached_validation'] = {
+                'invalid_triple_count': len(validation.invalid_triples),
+                'issues': validation.issues,
+            }
+        ner_output_dict[chunk_id] = NerRawOutput(
+            chunk_id=chunk_id,
+            response=responses.get('ner'),
+            metadata=deepcopy(metadata.get('ner') or {}),
+            unique_entities=list(np.unique(chunk_item.get('extracted_entities', []))),
         )
-        for chunk_item in corpus_openie_results
-    }
-    triple_output_dict = {
-        chunk_item['idx']: TripleRawOutput(
-            chunk_id=chunk_item['idx'],
-            response=None,
-            metadata={},
-            triples=filter_invalid_triples(triples=chunk_item['extracted_triples'])
+        triple_output_dict[chunk_id] = TripleRawOutput(
+            chunk_id=chunk_id,
+            response=responses.get('triples'),
+            metadata=triple_metadata,
+            triples=validation.valid_triples,
         )
-        for chunk_item in corpus_openie_results
-    }
-
     return ner_output_dict, triple_output_dict
+
+
+def normalize_graph_triples(triples: List[List[str]], *, normalizer=text_processing) -> List[List[str]]:
+    """Use the existing graph normalization while rejecting empty results.
+
+    The caller chooses the index manifest's normalizer. Keeping the legacy
+    default preserves old entity/fact IDs. Non-ASCII text can disappear under
+    that historical rule, so normalized fields are checked again.
+    """
+    normalized = []
+    for triple in validate_triples(triples).valid_triples:
+        processed = normalizer(triple)
+        if all(field.strip() for field in processed):
+            normalized.append(processed)
+    return normalized
+
+
+def openie_row_needs_retry(row: dict) -> bool:
+    """Retry explicit extraction failures, not every legitimate empty result."""
+    metadata = row.get('openie_metadata') or {}
+    for stage in ('ner', 'triples'):
+        stage_metadata = metadata.get(stage) or {}
+        if (stage_metadata.get('error') or stage_metadata.get('openie_skipped')
+                or stage_metadata.get('quality_status') in ('failed', 'partial')):
+            return True
+    return False
 
 def extract_entity_nodes(chunk_triples: List[List[Triple]]) -> (List[str], List[List[str]]):
     chunk_triple_entities = []  # a list of lists of unique entities from each chunk's triples

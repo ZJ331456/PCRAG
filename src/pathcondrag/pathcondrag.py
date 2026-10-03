@@ -203,8 +203,10 @@ class PCRAG(BaseRAG):
     # ---------------------------------------------------------------------
     # Index-side innovations
     # ---------------------------------------------------------------------
-    def index(self, docs: List[str]):
-        super().index(docs)
+    def index(self, docs: List[str], *, rebuild_graph: bool = False,
+              retry_failed_openie: bool = True):
+        super().index(docs, rebuild_graph=rebuild_graph,
+                      retry_failed_openie=retry_failed_openie)
 
         if not (
             self.pcrag_config.use_entity_idf_index
