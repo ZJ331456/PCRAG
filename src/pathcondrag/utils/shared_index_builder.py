@@ -12,6 +12,7 @@ import gc
 import hashlib
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 import runpy
@@ -24,10 +25,11 @@ from .openie_compact_recovery import RECOVERY_VERSION
 from .openie_semantic_validation import VERIFIER_VERSION
 from ..prompts.templates.triple_extraction import prompt_template
 from .misc_utils import openie_row_needs_retry
-from .openie_quality import TRIPLE_JSON_SCHEMA
+from .openie_quality import TRIPLE_JSON_SCHEMA, validate_triples
 
 
 QUALITY_SCHEMA = 'pathcondrag_openie_quality_v2'
+LOG = logging.getLogger(__name__)
 
 
 def quality_profile():
@@ -87,6 +89,87 @@ def quality_hipporag_class(native_class):
     """Create a runtime adapter without changing files in the baseline repo."""
 
     class QualitySharedHippoRAG(native_class):
+        def load_existing_openie(self, chunk_keys, force_reextract=False):
+            """Resume only an explicitly authorized, unpublished checkpoint.
+
+            Native ``index_only`` still requires both fresh-build flags. The
+            resume permission therefore has to be interpreted here, before
+            native ``force_reextract`` would discard successful checkpoint
+            rows. A failed row remains pending even though its ID is present.
+            """
+            allowed = os.environ.get('HIPPO_ALLOW_INDEX_RESUME', '').strip().lower() in {
+                '1', 'true', 'yes', 'on',
+            }
+            checkpoint = next((Path(path) for path in (
+                getattr(self, 'openie_state_path', None),
+                getattr(self, 'openie_results_path', None),
+            ) if path and Path(path).is_file()), None)
+            if not (allowed and force_reextract and checkpoint is not None):
+                return super().load_existing_openie(chunk_keys, force_reextract=force_reextract)
+            config = self.global_config
+            if not (config.force_index_from_scratch and config.force_openie_from_scratch):
+                raise RuntimeError('Checkpoint resume requires both explicit fresh-index flags.')
+            graph_path = getattr(self, '_graph_pickle_filename', None)
+            if (self.graph.vcount() or (graph_path and Path(graph_path).exists())
+                    or self.entity_embedding_store.get_all_ids()
+                    or self.fact_embedding_store.get_all_ids()):
+                raise RuntimeError('Checkpoint resume refused: graph or entity/fact state already exists.')
+
+            keys = list(chunk_keys)
+            requested = set(keys)
+            if len(requested) != len(keys):
+                raise RuntimeError('Checkpoint resume received duplicate corpus chunk IDs.')
+            # This invokes native identity/producer checks plus our unchanged
+            # quality-profile check; no checkpoint provenance is bypassed.
+            rows, _ = super().load_existing_openie(keys, force_reextract=False)
+            if self._openie_provenance.get('producer') != self._current_openie_provenance()['producer']:
+                raise RuntimeError('Checkpoint resume refused: extraction producer differs.')
+            by_key = {row['idx']: row for row in rows}
+            if len(by_key) != len(rows) or set(by_key).difference(requested):
+                raise RuntimeError('Checkpoint resume refused: duplicate or out-of-corpus rows.')
+
+            def incomplete(row):
+                if openie_row_needs_retry(row):
+                    return True
+                metadata = row.get('openie_metadata') or {}
+                if any((metadata.get(stage) or {}).get('finish_reason') != 'stop'
+                       for stage in ('ner', 'triples')):
+                    return True
+                triples = row.get('extracted_triples')
+                if not isinstance(triples, list) or validate_triples(triples).invalid_triples:
+                    return True
+                if not triples:
+                    stage = metadata.get('triples') or {}
+                    if not (stage.get('source_no_supported_relations') is True
+                            and stage.get('semantic_verified') is True
+                            and stage.get('complete') is True):
+                        return True
+                return False
+
+            missing = [key for key in keys if key not in by_key]
+            failed = [key for key in keys if key in by_key and incomplete(by_key[key])]
+            pending_set = set(missing).union(failed)
+            pending = [key for key in keys if key in pending_set]
+            self._openie_resume_diagnostics = {
+                'schema': 'pathcondrag_unpublished_checkpoint_resume_v1',
+                'checkpoint': str(checkpoint),
+                'checkpoint_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                'requested_chunk_count': len(keys), 'checkpoint_row_count': len(rows),
+                'retained_success_count': len(rows) - len(failed),
+                'missing_chunk_ids': missing, 'failed_chunk_ids': failed,
+                'pending_chunk_ids': pending, 'reextract_count': len(pending),
+                'explicit_resume_permission': True,
+                'completed_graph_present': False, 'derived_entity_fact_state_present': False,
+                'quality_profile': quality_profile(),
+            }
+            target = Path(self.working_dir) / 'openie_resume_diagnostics.json'
+            temporary = target.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(self._openie_resume_diagnostics, indent=2), encoding='utf-8')
+            os.replace(temporary, target)
+            LOG.info('Resuming unpublished OpenIE checkpoint: retained=%d, missing=%d, '
+                     'failed=%d, pending=%s', len(rows) - len(failed), len(missing), len(failed), pending)
+            return rows, pending
+
         def add_synonymy_edges(self, query_node_keys=None):
             if os.environ.get('PATHCONDRAG_SHARED_KNN_DEVICE', '').strip().lower() != 'cuda':
                 return super().add_synonymy_edges(query_node_keys)

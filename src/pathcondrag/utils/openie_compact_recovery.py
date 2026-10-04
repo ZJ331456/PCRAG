@@ -14,6 +14,7 @@ from .openie_semantic_validation import CONTEXT_TOKENS, MAX_COMPLETION_TOKENS, _
 
 
 RECOVERY_VERSION = 'pathcondrag_compact_source_recovery_v3'
+RECOVERY_IMPLEMENTATION = 'bounded_child_feedback_v4'
 SCHEMA = {
     'type': 'object',
     'properties': {
@@ -77,12 +78,12 @@ def _child_windows(passage, start, end):
 
 
 def _recover_failed_window(llm, passage, start, end, entities, context, raw, metadata):
-    """Spend at most three additional calls; never accept incomplete coverage."""
+    """Spend at most six additional calls; never accept incomplete coverage."""
     children = _child_windows(passage, start, end)
     parent_metadata = copy.deepcopy(metadata)
     accepted, child_results, child_responses = [], [], []
     for child_start, child_end, text in children:
-        found, child_raw, diagnostic = _extract(llm, text, entities, context, 1)
+        found, child_raw, diagnostic = _extract(llm, text, entities, context, 2)
         accepted = merge_triples(accepted, found)
         child_results.append({'source_start': child_start, 'source_end': child_end,
                               'metadata': diagnostic})
@@ -136,6 +137,12 @@ def _extract(llm, passage, entities, context, max_calls):
             messages.append({'role': 'user', 'content': (
                 'Correct the failed JSON extraction: ' + error[:500]
                 + '\nReturn only complete three-string arrays and status; no quotes or filler.'
+                + '\nA coordinating word such as and/or is never a relationship predicate. '
+                'For a source saying Ada and Bo are characters in Show C, separately extract '
+                '[Ada, is a character in, Show C] and [Bo, is a character in, Show C]. '
+                'This example is not evidence for this SOURCE. Do not extract a link '
+                'between Ada and Bo merely because they are listed together. '
+                'Extract actual source predicates for each coordinated subject.'
                 + '\nPrevious output (diagnostic, not evidence): ' + response[:700]
             )})
         record = {'attempt': index + 1, 'raw_response': None}
@@ -188,6 +195,7 @@ def compact_recovery(llm, chunk_key, passage, named_entities, repair_context):
     """Try the whole source, bounded windows, then smaller failed spans only."""
     triples, response, metadata = _extract(llm, passage, named_entities, repair_context, 1)
     metadata.update({'recovery_version': RECOVERY_VERSION, 'recovery_strategy': 'compact_flat_triples',
+                     'recovery_implementation': RECOVERY_IMPLEMENTATION,
                      'requires_semantic_verification': True, 'semantic_verified': False,
                      'max_completion_tokens': MAX_COMPLETION_TOKENS,
                      'temperature': 0.0, 'thinking': False})

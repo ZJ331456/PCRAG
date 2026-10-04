@@ -76,8 +76,12 @@ class SourceVerifiedOpenIE(OpenIE):
                 metadata = candidates.metadata or {}
                 if (not metadata.get('complete') or metadata.get('openie_skipped')
                         or validate_triples(candidates.triples).invalid_triples):
-                    return self._failed(chunk_key, initial, history, audits,
-                                        'Compact recovery did not completely validate the source')
+                    if compact_attempts >= MAX_COMPACT_ATTEMPTS:
+                        return self._failed(chunk_key, initial, history, audits,
+                                            'Compact recovery did not completely validate the source')
+                    context = self._incomplete_recovery_feedback(metadata)
+                    candidates = None
+                    continue
             try:
                 accepted, audit = verify_repaired_triples(
                     self.llm_model, passage, candidates.triples)
@@ -118,6 +122,33 @@ class SourceVerifiedOpenIE(OpenIE):
             candidates = None
 
     @staticmethod
+    def _incomplete_recovery_feedback(metadata):
+        """Change a bounded retry using failed-span errors, never approve partial output."""
+        errors = []
+
+        def visit(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in ('validation_error', 'request_error') and isinstance(item, str):
+                        if item not in errors:
+                            errors.append(item)
+                    elif key in ('attempts', 'window_recovery', 'child_window_recovery',
+                                 'metadata', 'parent_attempt_metadata'):
+                        visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(metadata)
+        return ('Previous compact extraction did not completely cover and validate the source. '
+                'Re-extract all supported facts once, without duplicate triples. '
+                'A coordinating word such as and/or is not a predicate; use the actual '
+                'source relationship separately for each coordinated subject. '
+                'Preserve grammatical roles, qualifiers and attribution. '
+                'Diagnostics are not factual evidence: '
+                + '; '.join(errors[-3:])[:750])
+
+    @staticmethod
     def _diagnostics(history, audits):
         return {'source_verified_schema': SOURCE_VERIFIED_VERSION,
                 'compact_recovery_contract': RECOVERY_VERSION,
@@ -125,6 +156,7 @@ class SourceVerifiedOpenIE(OpenIE):
                 'fresh_extraction_history': copy.deepcopy(history),
                 'semantic_verification_history': copy.deepcopy(audits),
                 'recovery_max_compact_attempts': MAX_COMPACT_ATTEMPTS,
+                'fresh_recovery_implementation': 'retry_incomplete_with_feedback_v2',
                 'max_completion_tokens': 2048, 'thinking': False,
                 'response_is_aggregate': True}
 

@@ -101,6 +101,10 @@ def environment(args):
 def execute(command, logfile, env):
     LOG.info('[command] %s', ' '.join(command))
     started = time.monotonic()
+    if logfile.is_file() and logfile.stat().st_size:
+        previous = logfile.with_name(f'{logfile.stem}.attempt_{time.time_ns()}.log')
+        logfile.rename(previous)
+        LOG.info('[previous-attempt-log] %s', previous)
     with logfile.open('w', encoding='utf-8') as stream:
         with subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, encoding='utf-8',

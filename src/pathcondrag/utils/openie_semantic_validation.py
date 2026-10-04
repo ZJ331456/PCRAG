@@ -12,6 +12,7 @@ from functools import lru_cache
 
 
 VERIFIER_VERSION = 'pathcondrag_source_only_entailment_v1'
+VERIFIER_IMPLEMENTATION = 'coordinated_subject_scope_v2'
 MAX_COMPLETION_TOKENS = 2048
 MAX_SHAPE_REPAIRS = 2
 FEEDBACK_RESPONSE_CHARS = 1200
@@ -73,6 +74,10 @@ publisher, country, or other nearby entity to fill the name of a missing collect
 Do not silently omit necessary time/location qualifiers or turn a conditional, reported, or negated assertion
 into an unconditional positive one. In tables/lists, respect the exact row, column header, units and dates;
 nearby values and adjacent rows do not establish a relationship. Resolve pronouns only when unambiguous.
+When a subject names multiple people joined by and/or, its assertion must be supported for
+every named member unless the predicate explicitly describes a collective relationship.
+A description, quote, age, action or other property attributed to one member does not support
+the same property for the entire group. Do not let a passage title override sentence-level attribution.
 
 Examples illustrate the rules only; their facts are NOT evidence for the actual SOURCE:
 Example SOURCE: 'Actor Iris had classical theater training and appeared in the film Moon Harbor.'
@@ -81,6 +86,9 @@ Example SOURCE: 'Actor Iris had classical theater training and appeared in the f
 Example SOURCE: 'Record A was originally released on Label B. Its tracks were later reissued as part of "" on CD.'
 ['Record A', 'tracks reissued as part of', 'Label B'] => false
 ['Record A', 'originally released on', 'Label B'] => true
+Example SOURCE: 'Lena and Omar are characters. The writer describes Lena as the funniest character.'
+['Lena and Omar', 'described as', 'the funniest character'] => false
+['Lena', 'described as', 'the funniest character'] => true
 
 Return ONLY a JSON object {"supported": [true, false, ...]}. There must be exactly one JSON boolean
 for each candidate triple, in the same order. No strings, numbers, explanations, new triples or extra keys.
@@ -124,6 +132,7 @@ def _audit(triples, attempts, supported, *, error=None):
     return {
         'schema': VERIFIER_VERSION,
         'contract_version': VERIFIER_VERSION,
+        'implementation': VERIFIER_IMPLEMENTATION,
         'complete': complete, 'status': 'success' if complete else 'failed',
         'n_input': len(triples), 'n_accepted': sum(supported) if complete else 0,
         'n_rejected': len(triples) - sum(supported) if complete else None,

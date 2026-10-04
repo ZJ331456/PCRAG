@@ -129,7 +129,7 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
 
     def test_compact_failure_checkpointed_before_shared_graph_publication(self):
         output, _ = self.call(result([], 'empty_valid'), FakeLLM(),
-                              [result([], 'failed', complete=False, openie_skipped=True)])
+                              [result([], 'failed', complete=False, openie_skipped=True)] * 2)
 
         class Native:
             def _current_openie_provenance(self):
@@ -148,7 +148,7 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
                     {'chunk': output})
             saved = json.loads(Path(runtime.openie_state_path).read_text())
             self.assertFalse(saved[0]['openie_metadata']['triples']['complete'])
-            self.assertEqual(len(saved[0]['openie_metadata']['triples']['fresh_extraction_history']), 2)
+            self.assertEqual(len(saved[0]['openie_metadata']['triples']['fresh_extraction_history']), 3)
 
     def test_shared_extractor_uses_source_verified_class_and_fixed_budgets(self):
         extractor = SharedQualityOpenIE(FakeLLM(), max_workers=8)
@@ -201,6 +201,161 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
         with patch.dict(os.environ, {'PATHCONDRAG_SHARED_KNN_DEVICE': ''}):
             self.assertEqual(runtime.add_synonymy_edges(['entity-a']), ['entity-a'])
         self.assertIs(runtime.embedding_model.model, encoder)
+
+
+class CheckpointResumeTests(unittest.TestCase):
+    """An unpublished checkpoint may retain only completed compatible rows."""
+
+    @staticmethod
+    def row(key, **triple_metadata):
+        return {'idx': key, 'passage': SOURCE, 'extracted_entities': ['Iris'],
+                'extracted_triples': [SUPPORTED],
+                'openie_metadata': {
+                    'ner': {'finish_reason': 'stop'},
+                    'triples': {'finish_reason': 'stop', 'quality_status': 'success',
+                                **triple_metadata}},
+                'openie_responses': {'ner': '{}', 'triples': '{}'}}
+
+    def runtime(self, directory, rows):
+        class Native:
+            def _current_openie_provenance(self):
+                return {'identity': {'model': 'test', 'max_tokens': 2048},
+                        'producer': {'model': 'test', 'endpoint': 'local'}}
+
+            def _validate_openie_provenance(self, stored, source_path):
+                if stored.get('identity') != self._current_openie_provenance()['identity']:
+                    raise RuntimeError('native identity mismatch')
+                return stored
+
+            def load_existing_openie(self, keys, force_reextract=False):
+                self.native_load_calls.append(force_reextract)
+                if force_reextract:
+                    self._openie_provenance = self._current_openie_provenance()
+                    return [], set(keys)
+                payload = json.loads(Path(self.openie_state_path).read_text())
+                self._openie_provenance = self._validate_openie_provenance(
+                    payload['provenance'], self.openie_state_path)
+                return payload['docs'], set(keys).difference(row['idx'] for row in payload['docs'])
+
+            def _save_openie_state(self, rows):
+                Path(self.openie_state_path).write_text(json.dumps({
+                    'docs': rows, 'provenance': self._openie_provenance}))
+
+        runtime_class = quality_hipporag_class(Native)
+        runtime = runtime_class.__new__(runtime_class)
+        runtime.working_dir = str(directory)
+        runtime.openie_state_path = str(Path(directory) / 'openie_state.json')
+        runtime.openie_results_path = str(Path(directory) / 'legacy_openie.json')
+        runtime._graph_pickle_filename = str(Path(directory) / 'graph.pickle')
+        runtime.global_config = SimpleNamespace(force_index_from_scratch=True,
+                                                force_openie_from_scratch=True)
+        runtime.graph = SimpleNamespace(vcount=lambda: 0)
+        runtime.entity_embedding_store = SimpleNamespace(get_all_ids=lambda: [])
+        runtime.fact_embedding_store = SimpleNamespace(get_all_ids=lambda: [])
+        runtime.native_load_calls = []
+        runtime._openie_provenance = None
+        Path(runtime.openie_state_path).write_text(json.dumps({
+            'docs': rows, 'provenance': runtime._current_openie_provenance()}))
+        return runtime
+
+    def test_resume_keeps_success_rows_and_repairs_failed_and_missing_in_corpus_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.runtime(temporary, [self.row('good'), self.row('failed',
+                                                        quality_status='failed', openie_skipped=True)])
+            with patch.dict(os.environ, {'HIPPO_ALLOW_INDEX_RESUME': '1'}):
+                rows, pending = runtime.load_existing_openie(
+                    ['good', 'missing', 'failed'], force_reextract=True)
+            self.assertEqual(runtime.native_load_calls, [False])
+            self.assertEqual(pending, ['missing', 'failed'])
+            original_good = copy.deepcopy(rows[0])
+            diagnostic = json.loads((Path(temporary) / 'openie_resume_diagnostics.json').read_text())
+            self.assertEqual(diagnostic['retained_success_count'], 1)
+            self.assertEqual(diagnostic['failed_chunk_ids'], ['failed'])
+            self.assertEqual(diagnostic['missing_chunk_ids'], ['missing'])
+            self.assertEqual(diagnostic['reextract_count'], 2)
+            chunks = {key: {'content': SOURCE} for key in pending}
+            ner = {key: NerRawOutput(key, '{}', ['Iris'], {'finish_reason': 'stop'})
+                   for key in pending}
+            triples = {key: TripleRawOutput(key, '{}', [SUPPORTED],
+                                           {'finish_reason': 'stop', 'quality_status': 'success'})
+                       for key in pending}
+            merged = runtime.merge_openie_results(rows, chunks, ner, triples)
+            self.assertIs(merged, rows)
+            self.assertEqual(rows[0], original_good)
+            self.assertEqual([row['idx'] for row in rows], ['good', 'failed', 'missing'])
+            self.assertNotIn('openie_skipped', rows[1]['openie_metadata']['triples'])
+
+    def test_without_explicit_permission_the_fresh_flags_still_reextract_everything(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.runtime(temporary, [self.row('good')])
+            with patch.dict(os.environ, {'HIPPO_ALLOW_INDEX_RESUME': ''}):
+                rows, pending = runtime.load_existing_openie(['good'], force_reextract=True)
+            self.assertEqual(rows, [])
+            self.assertEqual(pending, {'good'})
+            self.assertEqual(runtime.native_load_calls, [True])
+            self.assertFalse((Path(temporary) / 'openie_resume_diagnostics.json').exists())
+
+    def test_authorized_resume_without_checkpoint_runs_normal_fresh_extraction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.runtime(temporary, [])
+            Path(runtime.openie_state_path).unlink()
+            with patch.dict(os.environ, {'HIPPO_ALLOW_INDEX_RESUME': '1'}):
+                rows, pending = runtime.load_existing_openie(['new'], force_reextract=True)
+            self.assertEqual((rows, pending), ([], {'new'}))
+            self.assertEqual(runtime.native_load_calls, [True])
+
+    def test_resume_refuses_any_completed_or_derived_state_and_missing_fresh_flag(self):
+        for existing in ('graph_nodes', 'graph_file', 'entity_vectors', 'fact_vectors', 'fresh_flag'):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temporary:
+                runtime = self.runtime(temporary, [self.row('good')])
+                if existing == 'graph_nodes':
+                    runtime.graph.vcount = lambda: 1
+                elif existing == 'graph_file':
+                    Path(runtime._graph_pickle_filename).write_text('completed')
+                elif existing == 'entity_vectors':
+                    runtime.entity_embedding_store.get_all_ids = lambda: ['entity']
+                elif existing == 'fact_vectors':
+                    runtime.fact_embedding_store.get_all_ids = lambda: ['fact']
+                else:
+                    runtime.global_config.force_index_from_scratch = False
+                with patch.dict(os.environ, {'HIPPO_ALLOW_INDEX_RESUME': '1'}):
+                    with self.assertRaises(RuntimeError):
+                        runtime.load_existing_openie(['good'], force_reextract=True)
+                self.assertEqual(runtime.native_load_calls, [])
+
+    def test_resume_rejects_provenance_changes_out_of_corpus_and_duplicate_rows(self):
+        for invalid in ('identity', 'quality_profile', 'producer', 'extra_row', 'duplicate_row'):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temporary:
+                runtime = self.runtime(temporary, [self.row('good')])
+                path = Path(runtime.openie_state_path)
+                payload = json.loads(path.read_text())
+                if invalid in ('identity', 'quality_profile', 'producer'):
+                    payload['provenance'][invalid] = {'incompatible': True}
+                elif invalid == 'extra_row':
+                    payload['docs'].append(self.row('outside'))
+                else:
+                    payload['docs'].append(self.row('good'))
+                path.write_text(json.dumps(payload))
+                with patch.dict(os.environ, {'HIPPO_ALLOW_INDEX_RESUME': '1'}):
+                    with self.assertRaises(RuntimeError):
+                        runtime.load_existing_openie(['good'], force_reextract=True)
+                self.assertFalse((Path(temporary) / 'openie_resume_diagnostics.json').exists())
+
+    def test_resume_retries_unfinished_invalid_and_unexplained_empty_rows(self):
+        rows = [self.row('complete'), self.row('length', finish_reason='length'),
+                self.row('invalid'), self.row('empty'), self.row('legitimate_empty',
+                    source_no_supported_relations=True, semantic_verified=True, complete=True)]
+        rows[2]['extracted_triples'] = [['Iris', 'and', 'Moon Harbor']]
+        rows[3]['extracted_triples'] = []
+        rows[4]['extracted_triples'] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self.runtime(temporary, rows)
+            with patch.dict(os.environ, {'HIPPO_ALLOW_INDEX_RESUME': '1'}):
+                loaded, pending = runtime.load_existing_openie(
+                    [row['idx'] for row in rows], force_reextract=True)
+            self.assertEqual(pending, ['length', 'invalid', 'empty'])
+            self.assertEqual(loaded, rows)
+            self.assertEqual(runtime._openie_resume_diagnostics['retained_success_count'], 2)
 
 
 if __name__ == '__main__':

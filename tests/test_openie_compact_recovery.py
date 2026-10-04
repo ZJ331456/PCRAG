@@ -71,12 +71,12 @@ class CompactRecoveryTests(unittest.TestCase):
         self.assertEqual(len(windows), 2)
         children = _child_windows(passage, windows[1][0], windows[1][1])
         llm = FakeLLM(['not json', OK, 'not json', 'not json']
-                      + ['not json'] * len(children))
+                      + ['not json'] * (2 * len(children)))
         output = compact_recovery(llm, 'id', passage, [], 'Recover source facts.')
         self.assertEqual(output.metadata['quality_status'], 'partial')
         self.assertFalse(output.metadata['complete'])
         self.assertTrue(output.metadata['openie_skipped'])
-        self.assertEqual(len(llm.calls), 4 + len(children))
+        self.assertEqual(len(llm.calls), 4 + 2 * len(children))
         self.assertFalse(output.metadata['window_recovery'][1]['metadata']
                          ['child_window_recovery_complete'])
 
@@ -135,7 +135,7 @@ class CompactRecoveryTests(unittest.TestCase):
         children = _child_windows(passage, windows[0][0], windows[0][1])
         llm = FakeLLM([('whole truncated', 'length'), ('parent truncated', 'length'),
                        ('parent truncated again', 'length'), OK]
-                      + [('child truncated', 'length')] * (len(children) - 1))
+                      + [('child truncated', 'length')] * (2 * (len(children) - 1)))
         output = compact_recovery(llm, 'id', passage, [], 'Recover source facts.')
         self.assertFalse(output.metadata['complete'])
         parent = output.metadata['window_recovery'][0]['metadata']
@@ -150,6 +150,20 @@ class CompactRecoveryTests(unittest.TestCase):
         self.assertEqual(output.metadata['quality_status'], 'empty_valid')
         self.assertTrue(output.metadata['complete'])
         self.assertEqual(output.triples, [])
+
+    def test_short_child_quality_failure_receives_source_grounded_feedback(self):
+        passage = 'Title\nAda and Bo are fictional characters in Show C.'
+        bad = '{"triples":[["Ada","and","Bo"]],"status":"success"}'
+        llm = FakeLLM([('whole truncated', 'length'), ('parent truncated', 'length'),
+                       ('parent truncated again', 'length'), bad, OK])
+        output = compact_recovery(llm, 'id', passage, [], 'Recover source facts.')
+        self.assertTrue(output.metadata['complete'])
+        child = output.metadata['window_recovery'][0]['metadata']['child_window_recovery'][0]['metadata']
+        self.assertEqual(child['openie_attempt_count'], 2)
+        self.assertIn('coordinating word', child['attempts'][0]['validation_error'])
+        self.assertIn('separately extract', llm.calls[-1]['messages'][-1]['content'])
+        self.assertEqual(llm.calls[-1]['max_completion_tokens'], 2048)
+        self.assertFalse(llm.calls[-1]['extra_body']['chat_template_kwargs']['enable_thinking'])
 
 
 if __name__ == '__main__':
