@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_ROOT="${OUT_ROOT:-${ROOT}/outputs/openie_quality_repair_qwen3_b4_20261003}"
 RAG_PYTHON="${RAG_PYTHON:-/root/anaconda3/envs/rag/bin/python}"
 mkdir -p "${OUT_ROOT}/logs"
+if [[ -d "${OUT_ROOT}/runtime_deps/transformers" ]]; then
+  export PYTHONPATH="${OUT_ROOT}/runtime_deps${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 exec 9>"${ROOT}/outputs/.openie_quality_repair.lock"
 flock -n 9 || { echo "An OpenIE repair is already running." >&2; exit 1; }
 exec > >(tee -a "${OUT_ROOT}/logs/run.log") 2>&1
