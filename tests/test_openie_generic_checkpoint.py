@@ -16,9 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from pathcondrag.BaseRAG import BaseRAG
 from pathcondrag.information_extraction.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput, compute_mdhash_id
-from pathcondrag.utils.openie_source_evidence import VERIFIER_VERSION
-from pathcondrag.utils.shared_index_builder import quality_profile
-from pathcondrag.utils.openie_atomic_recovery import ATOMIC_RECOVERY_IMPLEMENTATION
+from pathcondrag.index.openie_source_evidence import VERIFIER_VERSION
+from pathcondrag.index.shared_index_builder import quality_profile
+from pathcondrag.index.openie_atomic_recovery import ATOMIC_RECOVERY_IMPLEMENTATION
 
 
 class InterruptedStage(RuntimeError):
@@ -141,7 +141,7 @@ class GenericCheckpointTests(unittest.TestCase):
             changed = copy.deepcopy(quality_profile())
             changed['structured_output'] = 'different-grammar-contract'
             rag.batch_calls.clear()
-            with patch('pathcondrag.utils.shared_index_builder.quality_profile', return_value=changed):
+            with patch('pathcondrag.index.shared_index_builder.quality_profile', return_value=changed):
                 with self.assertRaisesRegex(RuntimeError, 'another corpus/producer/quality contract'):
                     rag.index(['Alpha is Beta.'])
             self.assertEqual(rag.batch_calls, [])

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from pathcondrag.utils import openie_source_evidence as module
+from pathcondrag.index import openie_source_evidence as module
 
 
 SOURCE = ('Randy and Sharon Marsh\nRandy Marsh and Sharon Marsh are fictional characters. '

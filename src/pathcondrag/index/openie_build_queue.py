@@ -9,7 +9,7 @@ import copy
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import logging
 
-from .misc_utils import NerRawOutput, TripleRawOutput
+from ..utils.misc_utils import NerRawOutput, TripleRawOutput
 from .openie_quality import validate_triples
 
 

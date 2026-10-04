@@ -8,7 +8,7 @@ import re
 import logging
 
 from .typing import Triple
-from .openie_quality import validate_triples
+from ..index.openie_quality import validate_triples
 
 logger = logging.getLogger(__name__)
 

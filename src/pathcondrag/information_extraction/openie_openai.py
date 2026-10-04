@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from ..prompts import PromptTemplateManager
 from ..utils.logging_utils import get_logger
-from ..utils.openie_quality import (
+from ..index.openie_quality import (
     REPAIR_JSON_SCHEMA, TRIPLE_JSON_SCHEMA, extract_triple_payload, merge_triples,
     entity_argument_issues, normalize_repair_payload, support_quote_error_feedback, validate_triples,
 )
@@ -440,7 +440,7 @@ class OpenIE:
                         kwargs['extra_body'] = dict(configured.get('extra_body') or {})
                         kwargs['extra_body']['guided_json'] = REPAIR_JSON_SCHEMA if repair_context else TRIPLE_JSON_SCHEMA
                         if getattr(self, 'bounded_structured_output', False):
-                            from ..utils.openie_structured_output import guided_json_parameters
+                            from ..index.openie_structured_output import guided_json_parameters
                             kwargs['extra_body'] = guided_json_parameters(
                                 kwargs['extra_body']['guided_json'], kwargs['extra_body'])
                     attempt_count += 1

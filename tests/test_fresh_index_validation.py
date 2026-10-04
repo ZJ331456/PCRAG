@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from utils.fresh_index_validation import validate_fresh_index, unicode_normalize
-from pathcondrag.utils.openie_source_evidence import (
+from pathcondrag.index.openie_source_evidence import (
     FLAGS, VERIFIER_VERSION, _base_audit, _evaluate, _quote_offsets,
 )
 

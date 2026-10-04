@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from pathcondrag.information_extraction.openie_openai import OpenIE
 from pathcondrag.information_extraction import source_verified_openie as source_module
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput
-from pathcondrag.utils.shared_index_builder import (
+from pathcondrag.index.shared_index_builder import (
     SharedQualityOpenIE, quality_hipporag_class, quality_profile, run_shared_index_cli,
 )
 
@@ -194,8 +194,8 @@ class SharedIndexBuilderTests(unittest.TestCase):
                 self.assertTrue(sys.dont_write_bytecode)
                 raise SystemExit(0)
 
-            with patch('pathcondrag.utils.shared_index_builder.importlib.import_module', return_value=module), \
-                    patch('pathcondrag.utils.shared_index_builder.runpy.run_path', side_effect=run_entry):
+            with patch('pathcondrag.index.shared_index_builder.importlib.import_module', return_value=module), \
+                    patch('pathcondrag.index.shared_index_builder.runpy.run_path', side_effect=run_entry):
                 with self.assertRaises(SystemExit):
                     run_shared_index_cli(['--eval_mode', 'index_only', '--embedding_batch_size', '4'], hippo_root=tmp)
             self.assertIs(module.OpenIE, native_openie)

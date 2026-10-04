@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput
-from pathcondrag.utils.openie_build_queue import run_openie_queue
+from pathcondrag.index.openie_build_queue import run_openie_queue
 
 
 FACT = ['Iris', 'trained in', 'classical theater']

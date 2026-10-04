@@ -20,7 +20,7 @@ import time
 import tempfile
 import hashlib
 
-from .utils.openie_quality import validate_triples
+from .index.openie_quality import validate_triples
 
 from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
@@ -342,10 +342,10 @@ class BaseRAG:
         )
         progress = None
         if isinstance(self.openie, OpenIE):
-            from .utils.openie_checkpoint import OpenIECheckpoint
-            from .utils.openie_source_evidence import VERIFIER_VERSION
-            from .utils.openie_build_queue import openie_row_is_verified_complete
-            from .utils.shared_index_builder import quality_profile
+            from .index.openie_checkpoint import OpenIECheckpoint
+            from .index.openie_source_evidence import VERIFIER_VERSION
+            from .index.openie_build_queue import openie_row_is_verified_complete
+            from .index.shared_index_builder import quality_profile
             corpus_digest = hashlib.sha256('\n'.join(sorted(chunk_to_rows)).encode()).hexdigest()
             progress = OpenIECheckpoint(os.path.join(
                 self.working_dir, f'openie_progress_{corpus_digest}.sqlite'), {

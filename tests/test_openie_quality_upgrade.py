@@ -13,9 +13,9 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from pathcondrag.utils.shared_index_builder import quality_hipporag_class, quality_profile
-from pathcondrag.utils.openie_build_queue import openie_row_is_verified_complete
-from pathcondrag.utils.openie_checkpoint import OpenIECheckpoint
+from pathcondrag.index.shared_index_builder import quality_hipporag_class, quality_profile
+from pathcondrag.index.openie_build_queue import openie_row_is_verified_complete
+from pathcondrag.index.openie_checkpoint import OpenIECheckpoint
 
 
 class MemoryStore:

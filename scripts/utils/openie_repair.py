@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from pathcondrag.information_extraction.openie_openai import OpenIE
-from pathcondrag.utils.openie_quality import merge_triples, validate_triples
+from pathcondrag.index.openie_quality import merge_triples, validate_triples
 
 ROOT = Path(__file__).resolve().parents[2]
 REPAIR_VERSION = "pathcondrag_openie_quality_v2"
@@ -329,7 +329,7 @@ def repair(args, smoke=False):
         "base_prompt_schema": manifest["openie"]["identity"]["prompt_schema"],
         "repair_extractor": "pathcondrag.information_extraction.openie_openai.OpenIE",
         "extractor_sha256": sha256(ROOT / "src/pathcondrag/information_extraction/openie_openai.py"),
-        "validation_sha256": sha256(ROOT / "src/pathcondrag/utils/openie_quality.py"),
+        "validation_sha256": sha256(ROOT / "src/pathcondrag/index/openie_quality.py"),
         "compact_recovery_sha256": sha256(ROOT / "scripts/utils/openie_compact_recovery.py"),
         "source_openie_sha256": snapshot["asset_sha256"]["openie_state.json"],
         "repaired_chunks": len(summaries), "thinking": False, "triple_max_tokens": 2048,

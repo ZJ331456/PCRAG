@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from pathcondrag.information_extraction.openie_openai import OpenIE
 from pathcondrag.information_extraction import source_verified_openie as module
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput
-from pathcondrag.utils.shared_index_builder import SharedQualityOpenIE, quality_hipporag_class
-from pathcondrag.utils.openie_semantic_validation import (
+from pathcondrag.index.shared_index_builder import SharedQualityOpenIE, quality_hipporag_class
+from pathcondrag.index.openie_semantic_validation import (
     verify_repaired_triples as boolean_verifier,
     SemanticVerificationError as BooleanVerificationError,
 )
@@ -68,7 +68,7 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
         extractor = module.SourceVerifiedOpenIE(llm)
         with patch.object(OpenIE, 'triple_extraction', return_value=initial), \
                 patch.object(module, 'verify_repaired_triples', side_effect=wrapper_verifier), \
-                patch('pathcondrag.utils.openie_atomic_recovery.atomic_recovery',
+                patch('pathcondrag.index.openie_atomic_recovery.atomic_recovery',
                       return_value=result([], 'failed', complete=False, openie_skipped=True)):
             with patch.object(module, 'compact_recovery', side_effect=recovered) as fallback:
                 output = extractor.triple_extraction('chunk', SOURCE, ['Iris', 'Moon Harbor'])
@@ -196,7 +196,7 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
         extractor = module.SourceVerifiedOpenIE(FakeLLM())
         with patch.object(OpenIE, 'triple_extraction', return_value=initial), \
                 patch.object(module, 'compact_recovery') as compact, \
-                patch('pathcondrag.utils.openie_atomic_recovery.atomic_recovery',
+                patch('pathcondrag.index.openie_atomic_recovery.atomic_recovery',
                       return_value=atomic_result) as atomic, \
                 patch.object(module, 'verify_repaired_triples', side_effect=[
                     ([SUPPORTED], audit(initial.triples, [False, True])),

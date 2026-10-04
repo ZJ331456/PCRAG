@@ -26,7 +26,7 @@ from .openie_source_evidence import VERIFIER_VERSION
 from .openie_checkpoint import OpenIECheckpoint
 from .openie_build_queue import openie_row_is_verified_complete
 from ..prompts.templates.triple_extraction import prompt_template
-from .misc_utils import openie_row_needs_retry
+from ..utils.misc_utils import openie_row_needs_retry
 from .openie_quality import TRIPLE_JSON_SCHEMA, validate_triples
 
 

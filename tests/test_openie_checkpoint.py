@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from pathcondrag.utils.openie_checkpoint import OpenIECheckpoint
+from pathcondrag.index.openie_checkpoint import OpenIECheckpoint
 
 
 class OpenIECheckpointTests(unittest.TestCase):

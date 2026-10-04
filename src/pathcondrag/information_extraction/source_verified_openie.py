@@ -10,10 +10,10 @@ import logging
 
 from .openie_openai import OpenIE
 from ..utils.misc_utils import NerRawOutput, TripleRawOutput
-from ..utils.openie_compact_recovery import compact_recovery, RECOVERY_VERSION
-from ..utils.openie_quality import validate_triples
-from ..utils.openie_structured_output import guided_json_parameters
-from ..utils.openie_source_evidence import (
+from ..index.openie_compact_recovery import compact_recovery, RECOVERY_VERSION
+from ..index.openie_quality import validate_triples
+from ..index.openie_structured_output import guided_json_parameters
+from ..index.openie_source_evidence import (
     SourceEvidenceError as SemanticVerificationError, VERIFIER_VERSION,
     verify_source_relations as verify_repaired_triples,
     verify_source_empty_focus,
@@ -60,7 +60,7 @@ class SourceVerifiedOpenIE(OpenIE):
                 and audits[-1].get('source_no_supported_relations') is True))
 
     def batch_openie(self, chunks):
-        from ..utils.openie_build_queue import run_openie_queue
+        from ..index.openie_build_queue import run_openie_queue
         return run_openie_queue(self, chunks, initial_rows=self.initial_rows,
                                 checkpoint=self.checkpoint)
 
@@ -69,7 +69,7 @@ class SourceVerifiedOpenIE(OpenIE):
 
     def _ner_attempts(self, chunk_key, passage, context=''):
         """Retain the fixed 512-token NER budget on every quality retry."""
-        from ..utils.openie_semantic_validation import _prompt_tokens
+        from ..index.openie_semantic_validation import _prompt_tokens
         messages = self.prompt_template_manager.render(name='ner', passage=passage)
         schema = {'type': 'object', 'properties': {'named_entities': {
             'type': 'array', 'items': {'type': 'string', 'minLength': 1}}},
@@ -114,7 +114,7 @@ class SourceVerifiedOpenIE(OpenIE):
             'ner_attempts': attempts, 'thinking': False})
 
     def recover_pending_ner(self, chunk_key, passage, previous, round_number):
-        from ..utils.openie_atomic_recovery import source_units
+        from ..index.openie_atomic_recovery import source_units
         entities, units = [], []
         for start, end, text in source_units(passage):
             result = self._ner_attempts(chunk_key, text, (
@@ -194,7 +194,7 @@ class SourceVerifiedOpenIE(OpenIE):
                     if atomic_used:
                         return self._failed(chunk_key, initial, history, audits,
                                             'No supported relation after bounded source-unit recovery')
-                    from ..utils.openie_atomic_recovery import atomic_recovery
+                    from ..index.openie_atomic_recovery import atomic_recovery
                     atomic_used = True
                     candidates = atomic_recovery(self.llm_model, chunk_key, passage, named_entities,
                                                  context + f' Pending recovery round: {pending_round}.')
@@ -247,7 +247,7 @@ class SourceVerifiedOpenIE(OpenIE):
             legitimate_empty = (not candidates.triples
                                 and candidates.metadata.get('repair_status') == 'no_supported_relations'
                                 and audit.get('source_no_supported_relations') is True)
-            from ..utils.openie_source_evidence import _subject_members
+            from ..index.openie_source_evidence import _subject_members
             scope_errors = any(
                 check.get('rejection_kind') == 'attribution'
                 or check.get('rejection_kind') == 'subject_scope'

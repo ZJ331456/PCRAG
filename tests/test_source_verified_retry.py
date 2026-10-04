@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from pathcondrag.information_extraction.openie_openai import OpenIE
 from pathcondrag.information_extraction import source_verified_openie as module
 from pathcondrag.utils.misc_utils import TripleRawOutput
-from pathcondrag.utils.openie_semantic_validation import verify_repaired_triples as boolean_verifier
+from pathcondrag.index.openie_semantic_validation import verify_repaired_triples as boolean_verifier
 
 
 class FakeLLM:
@@ -38,7 +38,7 @@ class IncompleteCompactRetryTests(unittest.TestCase):
                 patch.object(module, 'verify_repaired_triples',
                              side_effect=lambda llm, passage, values, **kwargs:
                              boolean_verifier(llm, passage, values)), \
-                patch('pathcondrag.utils.openie_atomic_recovery.atomic_recovery',
+                patch('pathcondrag.index.openie_atomic_recovery.atomic_recovery',
                       return_value=extraction([], complete=False, openie_skipped=True)):
             with patch.object(module, 'compact_recovery', side_effect=recovery) as fallback:
                 output = module.SourceVerifiedOpenIE(llm).triple_extraction(
