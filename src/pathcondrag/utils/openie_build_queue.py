@@ -263,7 +263,8 @@ def run_openie_queue(extractor, chunks, initial_rows=None, checkpoint=None):
                 key, passage, entities, previous, round_number)
 
         logger.info('OpenIE queue round %d: NER pending=%d, triple pending=%d',
-                    round_number, len(ner_pending), len(triple_pending))
+                    round_number, sum(not _ner_complete(ner_results.get(key)) for key in chunks),
+                    len(triple_pending))
         round_failed = 0
         for processed, (key, result) in enumerate(
                 _bounded_results(triple_pending, triple_workers, extract_triples, 'triples'), 1):

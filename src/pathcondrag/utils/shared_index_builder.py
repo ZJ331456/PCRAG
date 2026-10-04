@@ -261,8 +261,8 @@ def quality_hipporag_class(native_class):
             temporary = target.with_suffix('.json.tmp')
             temporary.write_text(json.dumps(self._openie_resume_diagnostics, indent=2), encoding='utf-8')
             os.replace(temporary, target)
-            LOG.info('Resuming unpublished OpenIE checkpoint: retained=%d, missing=%d, '
-                     'failed=%d, pending_count=%d, first_pending=%s',
+            LOG.info('Resuming unpublished OpenIE checkpoint: verified_current_contract=%d, missing=%d, '
+                     'awaiting_current_verification=%d, pending_count=%d, first_pending=%s',
                      len(rows) - len(failed), len(missing), len(failed), len(pending), pending[:10])
             if not pending and hasattr(self, '_strict_openie_progress'):
                 self._strict_openie_progress.close()
