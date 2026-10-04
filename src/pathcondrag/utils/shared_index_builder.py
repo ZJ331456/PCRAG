@@ -8,6 +8,7 @@ this overlay is not a claim that the original v1 prompts were used unchanged.
 
 import argparse
 import copy
+import gc
 import hashlib
 import importlib
 import json
@@ -18,7 +19,9 @@ import sys
 from string import Template
 
 from ..BaseRAG import BaseRAG
-from ..information_extraction.openie_openai import OpenIE
+from ..information_extraction.source_verified_openie import SourceVerifiedOpenIE
+from .openie_compact_recovery import RECOVERY_VERSION
+from .openie_semantic_validation import VERIFIER_VERSION
 from ..prompts.templates.triple_extraction import prompt_template
 from .misc_utils import openie_row_needs_retry
 from .openie_quality import TRIPLE_JSON_SCHEMA
@@ -42,9 +45,12 @@ def quality_profile():
             for row in prompt_template
         ]),
         'triple_json_schema_sha256': digest(TRIPLE_JSON_SCHEMA),
-        'extractor': 'pathcondrag.information_extraction.openie_openai.OpenIE',
+        'extractor': 'pathcondrag.information_extraction.source_verified_openie.SourceVerifiedOpenIE',
         'validation': 'three_nonempty_unicode_strings_v2',
         'recovery': 'source_grounded_feedback_and_windows_v2',
+        'fresh_recovery': RECOVERY_VERSION,
+        'fresh_recovery_semantic_verifier': VERIFIER_VERSION,
+        'semantic_scope': 'fresh_recovered_and_empty_only',
         'failure_policy': 'checkpoint_then_abort_before_graph_publication',
         'ner_max_tokens': 512,
         'triple_max_tokens': 2048,
@@ -52,7 +58,7 @@ def quality_profile():
     }
 
 
-class SharedQualityOpenIE(OpenIE):
+class SharedQualityOpenIE(SourceVerifiedOpenIE):
     """Accept the baseline constructor while preserving fixed token budgets."""
 
     def __init__(self, llm_model, max_workers=8, ner_max_tokens=512,
@@ -71,7 +77,7 @@ class SharedQualityOpenIE(OpenIE):
                 and metadata.get('quality_status') in ('success', 'empty_valid')):
             # The combined result completed in multiple requests, even if the
             # initial whole-passage request was truncated. Keep both facts.
-            metadata['whole_chunk_finish_reason'] = metadata.get('finish_reason')
+            metadata.setdefault('whole_chunk_finish_reason', metadata.get('finish_reason'))
             metadata['finish_reason'] = 'stop'
             metadata['finish_source'] = 'all_windows_completed'
         return result
@@ -81,6 +87,52 @@ def quality_hipporag_class(native_class):
     """Create a runtime adapter without changing files in the baseline repo."""
 
     class QualitySharedHippoRAG(native_class):
+        def add_synonymy_edges(self, query_node_keys=None):
+            if os.environ.get('PATHCONDRAG_SHARED_KNN_DEVICE', '').strip().lower() != 'cuda':
+                return super().add_synonymy_edges(query_node_keys)
+            import torch
+            if not torch.cuda.is_available():
+                raise RuntimeError('PATHCONDRAG_SHARED_KNN_DEVICE=cuda requires an available CUDA device.')
+            # Native index() encodes all chunk/entity/fact vectors before this
+            # call. A build-only entry can release the encoder while KNN uses
+            # the already stored vectors; no subsequent encoding is performed.
+            if hasattr(self.embedding_model, 'model'):
+                self.embedding_model.model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            config = self.global_config
+            previous_batches = (config.synonymy_edge_query_batch_size,
+                                config.synonymy_edge_key_batch_size)
+            previous_device = os.environ.get('HIPPORAG_KNN_DEVICE')
+            previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+            config.synonymy_edge_query_batch_size = 1000
+            config.synonymy_edge_key_batch_size = 16384
+            os.environ['HIPPORAG_KNN_DEVICE'] = 'cuda'
+            torch.backends.cuda.matmul.allow_tf32 = False
+            self._shared_knn_execution = {
+                'device': 'cuda', 'dtype': 'float32', 'allow_tf32': False,
+                'query_batch_size': 1000, 'key_batch_size': 16384,
+                'embedding_model_released_after_encoding': True,
+                'native_cosine_topk_and_threshold_unchanged': True,
+            }
+            try:
+                result = super().add_synonymy_edges(query_node_keys)
+                self._shared_knn_execution['complete'] = True
+                if hasattr(self, 'working_dir'):
+                    target = Path(self.working_dir) / 'shared_build_execution.json'
+                    temporary = target.with_suffix('.json.tmp')
+                    temporary.write_text(json.dumps(self._shared_knn_execution, indent=2), encoding='utf-8')
+                    os.replace(temporary, target)
+                return result
+            finally:
+                (config.synonymy_edge_query_batch_size,
+                 config.synonymy_edge_key_batch_size) = previous_batches
+                torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+                if previous_device is None:
+                    os.environ.pop('HIPPORAG_KNN_DEVICE', None)
+                else:
+                    os.environ['HIPPORAG_KNN_DEVICE'] = previous_device
+
         def _current_openie_provenance(self):
             provenance = copy.deepcopy(super()._current_openie_provenance())
             provenance['quality_profile'] = quality_profile()
