@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build a fresh HippoRAG2 index, then reuse it for seven retrieval cases.
+# Reuse the NV-Embed-v2 HippoRAG musique index and retrieve three cases:
+# hipporag2, pathcondrag_original (stage 0), exp4_dependency_binding (stage 4).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,13 +10,17 @@ SAMPLE_SEED="${SAMPLE_SEED:-42}"
 CONDA_ENV="${CONDA_ENV:-rag}"
 LLM_BASE_URL="${LLM_BASE_URL:-http://127.0.0.1:8035/v1}"
 VLLM_LOG="${VLLM_LOG:-/root/eval/logs/vllm_qwen3.log}"
-DEFAULT_OUT_ROOT="${ROOT}/outputs/pathcondrag_new_innvotion_10_1"
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-/root/models/NV-Embed-v2}"
+EMBEDDING_PROVIDER="${EMBEDDING_PROVIDER:-nvembed}"
+EMBEDDING_BATCH_SIZE="${EMBEDDING_BATCH_SIZE:-2}"
+SOURCE_INDEX="${SOURCE_INDEX:-/root/baseline/HippoRAG/outputs/musique}"
+DEFAULT_OUT_ROOT="${ROOT}/outputs/pathcondeag_new_compare_nv2_10_2"
 if (( SAMPLE_SIZE > 0 )); then
   DEFAULT_OUT_ROOT="${DEFAULT_OUT_ROOT}_smoke${SAMPLE_SIZE}_$(date +%Y%m%d_%H%M%S)"
 fi
 OUT_ROOT="${OUT_ROOT:-${DEFAULT_OUT_ROOT}}"
-SOURCE_INDEX="${OUT_ROOT}/shared_hipporag2_index"
 TOOLS="${ROOT}/scripts/experiment_tools.py"
+CASES="${CASES:-hipporag2 pathcondrag_original exp4_dependency_binding}"
 
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 export TOKENIZERS_PARALLELISM=false
@@ -26,87 +31,40 @@ export HIPPORAG_LLM_MAX_IN_FLIGHT=8
 export HIPPO_OPENIE_MAX_WORKERS=8
 export HIPPO_OPENIE_NER_WORKERS=8
 export HIPPO_OPENIE_TRIPLE_WORKERS=8
-export HIPPO_OPENIE_QUALITY_MAX_RETRIES="${HIPPO_OPENIE_QUALITY_MAX_RETRIES:-5}"
+export HIPPO_EMBEDDING_MODEL_NAME="${EMBEDDING_MODEL}"
 
 mkdir -p "${OUT_ROOT}/logs"
-exec 9>"${ROOT}/outputs/.recall_top5_improvements.lock"
-flock -n 9 || { echo "Another seven-case run is already active." >&2; exit 1; }
+exec 9>"${ROOT}/outputs/.nv2_embed_ablation.lock"
+flock -n 9 || { echo "Another NV-Embed ablation is already active." >&2; exit 1; }
 exec > >(tee -a "${OUT_ROOT}/logs/run.log") 2>&1
 trap 'status=$?; echo "[failed] exit=${status} line=${LINENO}; inspect ${OUT_ROOT}/logs/run.log" >&2; exit "${status}"' ERR
 test -f "${VLLM_LOG}"
 curl -fsS -o /dev/null "${LLM_BASE_URL}/models"
+test -f "${SOURCE_INDEX}/qwen3-8b__root_models_NV-Embed-v2/graph.pickle"
 
 prepare_args=(
   --out-root "${OUT_ROOT}" --source-index "${SOURCE_INDEX}"
   --data-path /root/datasets/musique.json --corpus-path /root/datasets/musique_corpus.json
-  --sample-size "${SAMPLE_SIZE}" --sample-seed "${SAMPLE_SEED}" --cases "${CASES:-}"
-  --build-shared-index
+  --sample-size "${SAMPLE_SIZE}" --sample-seed "${SAMPLE_SEED}" --cases "${CASES}"
+  --embedding-model "${EMBEDDING_MODEL}" --embedding-provider "${EMBEDDING_PROVIDER}"
+  --embedding-batch-size "${EMBEDDING_BATCH_SIZE}"
 )
 if [[ -n "${SAMPLE_INDICES_FILE:-}" ]]; then
   prepare_args+=(--sample-indices-file "${SAMPLE_INDICES_FILE}")
 fi
 python "${TOOLS}" improvement-prepare "${prepare_args[@]}"
+python "${TOOLS}" improvement-index-ready --out-root "${OUT_ROOT}"
 
 echo "[run] OUT_ROOT=${OUT_ROOT} SAMPLE_SIZE=${SAMPLE_SIZE} seed=${SAMPLE_SEED}"
-echo "[run] Qwen3-Embedding-8B batch=4; qwen3-8b workers=8; max_new_tokens=2048; thinking disabled in clients"
-echo "[run] source=${SOURCE_INDEX}; build NER/triples, vectors and graph from scratch before retrieval"
-
-build_shared_index() {
-  if python "${TOOLS}" improvement-index-ready --out-root "${OUT_ROOT}"; then
-    echo "[index] verified fresh shared index already completed"
-    return 0
-  fi
-  local resume=0
-  if [[ -e "${SOURCE_INDEX}" ]]; then
-    # Incomplete prior build: reuse chunk embeddings + llm_cache; re-run OpenIE/graph.
-    echo "[index] incomplete build at ${SOURCE_INDEX}; resuming (keep chunk embeds/cache, rebuild OpenIE/graph)"
-    resume=1
-    export HIPPO_ALLOW_INDEX_RESUME=1
-  fi
-  export HIPPO_OPENIE_QUALITY_MAX_RETRIES="${HIPPO_OPENIE_QUALITY_MAX_RETRIES:-5}"
-  local log_start log_end start end
-  log_start="$(stat -c %s "${VLLM_LOG}")"
-  start="$(date +%s)"
-  echo "[index] HippoRAG2 build started=$(date '+%F %T'); OpenIE workers=8, embedding batch=4, quality_max_retries=${HIPPO_OPENIE_QUALITY_MAX_RETRIES}, resume=${resume}"
-  # Pass resume/quality env explicitly — conda run does not always inherit shell exports reliably.
-  env \
-    HIPPO_ALLOW_INDEX_RESUME="${HIPPO_ALLOW_INDEX_RESUME:-0}" \
-    HIPPO_OPENIE_QUALITY_MAX_RETRIES="${HIPPO_OPENIE_QUALITY_MAX_RETRIES}" \
-    HIPPO_OPENIE_MAX_WORKERS="${HIPPO_OPENIE_MAX_WORKERS:-8}" \
-    HIPPO_OPENIE_NER_WORKERS="${HIPPO_OPENIE_NER_WORKERS:-8}" \
-    HIPPO_OPENIE_TRIPLE_WORKERS="${HIPPO_OPENIE_TRIPLE_WORKERS:-8}" \
-    PATHCONDRAG_LLM_MAX_IN_FLIGHT="${PATHCONDRAG_LLM_MAX_IN_FLIGHT:-8}" \
-    HIPPORAG_LLM_MAX_IN_FLIGHT="${HIPPORAG_LLM_MAX_IN_FLIGHT:-8}" \
-    OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}" \
-    TOKENIZERS_PARALLELISM=false \
-    PYTHONUNBUFFERED=1 \
-    HIPPORAG_KNN_DEVICE=cpu \
-  conda run --no-capture-output -n "${CONDA_ENV}" python -u "${ROOT}/scripts/build_shared_index.py" \
-    --dataset musique --datasets_dir /root/datasets --rag_type hipporag \
-    --sample_size "${SAMPLE_SIZE}" --sample_seed "${SAMPLE_SEED}" \
-    --sample_indices_file "${OUT_ROOT}/selected_indices.json" \
-    --llm_name qwen3-8b --llm_base_url "${LLM_BASE_URL}" \
-    --embedding_name /root/models/Qwen3-Embedding-8B --embedding_provider transformers \
-    --embedding_batch_size 4 --openie_max_workers 8 --llm_prefetch_workers 8 \
-    --openie_mode online --eval_mode index_only \
-    --force_index_from_scratch true --force_openie_from_scratch true \
-    --save_dir_exact --save_dir "${SOURCE_INDEX}" --output "${OUT_ROOT}/index_build_result.json" \
-    2>&1 | tee "${OUT_ROOT}/logs/hipporag2_index.log"
-  end="$(date +%s)"
-  log_end="$(stat -c %s "${VLLM_LOG}")"
-  python "${TOOLS}" improvement-freeze-index \
-    --out-root "${OUT_ROOT}" --elapsed "$((end-start))" \
-    --vllm-log "${VLLM_LOG}" --log-start "${log_start}" --log-end "${log_end}"
-  echo "[index] fresh shared index validated; seven retrieval cases can begin"
-}
-
-build_shared_index
+echo "[run] reuse SOURCE_INDEX=${SOURCE_INDEX}"
+echo "[run] embedding=${EMBEDDING_MODEL} provider=${EMBEDDING_PROVIDER} batch=${EMBEDDING_BATCH_SIZE}"
+echo "[run] cases=${CASES}; qwen3-8b workers=8; max_new_tokens=2048"
 
 COMMON=(
   --dataset musique --sample_size "${SAMPLE_SIZE}" --sample_seed "${SAMPLE_SEED}"
   --sample_indices_file "${OUT_ROOT}/selected_indices.json"
   --llm_name qwen3-8b --llm_base_url "${LLM_BASE_URL}"
-  --embedding_batch_size 4 --openie_max_workers 8 --llm_prefetch_workers 8
+  --embedding_batch_size "${EMBEDDING_BATCH_SIZE}" --openie_max_workers 8 --llm_prefetch_workers 8
   --eval_mode retrieve --retrieval_top_k 200 --result_top_k 10 --candidate_output_top_k 200
   --reuse_index
 )
@@ -125,11 +83,7 @@ PC3_COMMON=(
 ALL_CASES=(
   "hipporag2|-1"
   "pathcondrag_original|0"
-  "exp1_correctness|1"
-  "exp2_evidence_candidates|2"
-  "exp3_prefix_coverage|3"
   "exp4_dependency_binding|4"
-  "exp5_verified_beam|5"
 )
 
 run_case() {
@@ -146,7 +100,7 @@ run_case() {
   if (( stage < 0 )); then
     conda run --no-capture-output -n "${CONDA_ENV}" python -u "${HIPPO_ROOT}/main.py" \
       "${COMMON[@]}" --datasets_dir /root/datasets --rag_type hipporag \
-      --embedding_name /root/models/Qwen3-Embedding-8B --embedding_provider transformers \
+      --embedding_name "${EMBEDDING_MODEL}" --embedding_provider "${EMBEDDING_PROVIDER}" \
       --save_dir_exact --save_dir "${case_dir}/index" --output "${case_dir}/result.json" \
       2>&1 | tee "${OUT_ROOT}/logs/${name}.log"
   else
@@ -154,7 +108,7 @@ run_case() {
       "${COMMON[@]}" "${PC3_COMMON[@]}" \
       --data_path /root/datasets/musique.json --corpus_path /root/datasets/musique_corpus.json \
       --corpus_mode full --qa_top_k 5 --max_qa_steps 1 --max_new_tokens 2048 \
-      --embedding_model_name /root/models/Qwen3-Embedding-8B \
+      --embedding_model_name "${EMBEDDING_MODEL}" \
       --improvement_stage "${stage}" \
       --save_dir "${case_dir}/index" --output "${case_dir}/result.json" \
       --stratified_eval --stratified_output "${case_dir}/stratified.json" \

@@ -1,4 +1,7 @@
 /outputs/
+/data-process/raw/**
+!/data-process/raw/README.md
+/data-process/infer_hop/outputs/
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -13,6 +13,8 @@ from .common import http_status_counts, read_json, write_json
 
 MODEL_DIR = "qwen3-8b__root_models_Qwen3-Embedding-8B"
 EMBEDDING_MODEL = "/root/models/Qwen3-Embedding-8B"
+DEFAULT_EMBEDDING_PROVIDER = "transformers"
+DEFAULT_EMBEDDING_BATCH_SIZE = 4
 CASES = {
     "hipporag2": None,
     "pathcondrag_original": 0,
@@ -30,6 +32,10 @@ ASSETS = (
 )
 
 
+def model_dir_name(embedding_model):
+    return "qwen3-8b__" + str(embedding_model).strip("/").replace("/", "_")
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -43,8 +49,8 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def asset_hashes(index):
-    return {name: sha256(Path(index) / MODEL_DIR / name) for name in ASSETS}
+def asset_hashes(index, model_dir=None):
+    return {name: sha256(Path(index) / (model_dir or MODEL_DIR) / name) for name in ASSETS}
 
 
 def cache_hashes(directory):
@@ -100,14 +106,18 @@ def load_indices(path, total):
     return indices
 
 
-def index_identity(source, docs):
-    identity = read_json(Path(source) / MODEL_DIR / "index_manifest.json")
-    require(identity.get("embedding", {}).get("model_name") == EMBEDDING_MODEL,
-            "source index embedding model is not Qwen3-Embedding-8B")
-    require(identity.get("embedding", {}).get("provider") == "transformers", "source embedding provider mismatch")
+def index_identity(source, docs, embedding_model=None, embedding_provider=None, model_dir=None):
+    embedding_model = embedding_model or EMBEDDING_MODEL
+    embedding_provider = embedding_provider or DEFAULT_EMBEDDING_PROVIDER
+    model_dir = model_dir or model_dir_name(embedding_model)
+    identity = read_json(Path(source) / model_dir / "index_manifest.json")
+    require(identity.get("embedding", {}).get("model_name") == embedding_model,
+            f"source index embedding model is not {embedding_model}")
+    require(identity.get("embedding", {}).get("provider") == embedding_provider,
+            "source embedding provider mismatch")
     require(identity.get("openie", {}).get("identity", {}).get("model_name") == "qwen3-8b",
             "source extraction model mismatch")
-    chunk_ids = set(read_json(Path(source) / MODEL_DIR / "chunk_metadata.json"))
+    chunk_ids = set(read_json(Path(source) / model_dir / "chunk_metadata.json"))
     expected_ids = {"chunk-" + hashlib.md5(doc.encode()).hexdigest() for doc in docs}
     require(chunk_ids == expected_ids, "source index does not contain exactly the declared corpus")
 
@@ -137,19 +147,24 @@ def prepare(args):
     require(bool(names) and len(names) == len(set(names)) and all(n in CASES for n in names),
             "CASES contains unknown or duplicate case names")
     names = [n for n in CASES if n in names]
+    embedding_model = getattr(args, "embedding_model", None) or EMBEDDING_MODEL
+    embedding_provider = getattr(args, "embedding_provider", None) or DEFAULT_EMBEDDING_PROVIDER
+    embedding_batch_size = int(getattr(args, "embedding_batch_size", None) or DEFAULT_EMBEDDING_BATCH_SIZE)
+    model_dir = model_dir_name(embedding_model)
     if fresh:
         hashes, initial_cache = {}, {}
     else:
-        index_identity(source, docs)
-        hashes = asset_hashes(source)
-        require((source / "llm_cache").is_dir(), "Hippo source llm_cache is missing")
-        initial_cache = cache_hashes(source / "llm_cache")
-        require(bool(initial_cache), "Hippo source llm_cache is empty")
+        index_identity(source, docs, embedding_model=embedding_model,
+                       embedding_provider=embedding_provider, model_dir=model_dir)
+        hashes = asset_hashes(source, model_dir)
+        cache_dir = source / "llm_cache"
+        initial_cache = cache_hashes(cache_dir) if cache_dir.is_dir() else {}
     manifest = {
         "schema_version": 2,
         "index_build_mode": "fresh" if fresh else "external_snapshot",
         "index_build_status": "pending" if fresh else "ready",
-        "source_index": str(source), "model_dir": MODEL_DIR,
+        "source_index": str(source), "model_dir": model_dir,
+        "embedding_provider": embedding_provider,
         "data_path": str(Path(args.data_path).resolve()),
         "corpus_path": str(Path(args.corpus_path).resolve()),
         "data_sha256": sha256(args.data_path), "corpus_sha256": sha256(args.corpus_path),
@@ -161,7 +176,9 @@ def prepare(args):
         "hop_distribution": dict(Counter(str(hops[i]) for i in indices)),
         "dataset_hop_distribution": dict(Counter(map(str, hops))),
         "cases": names,
-        "runtime": {"embedding_model_name": EMBEDDING_MODEL, "embedding_batch_size": 4,
+        "runtime": {"embedding_model_name": embedding_model,
+                    "embedding_provider": embedding_provider,
+                    "embedding_batch_size": embedding_batch_size,
                     "llm_name": "qwen3-8b", "llm_prefetch_workers": 8, "openie_max_workers": 8,
                     "max_new_tokens": 2048, "enable_thinking": False,
                     "retrieval_top_k": 200, "result_top_k": 10, "candidate_output_top_k": 200},
@@ -190,7 +207,11 @@ def prepare(args):
             require(not source.exists() or not any(source.iterdir()), "fresh shared index directory is not empty")
             require(not (out / "index_build_result.json").exists(), "fresh index build result already exists")
         else:
-            shutil.copytree(source / "llm_cache", snapshot, ignore=shutil.ignore_patterns("*.lock"))
+            cache_dir = source / "llm_cache"
+            if cache_dir.is_dir():
+                shutil.copytree(cache_dir, snapshot, ignore=shutil.ignore_patterns("*.lock"))
+            else:
+                snapshot.mkdir(parents=True)
             require(cache_hashes(snapshot) == initial_cache, "source LLM cache changed during snapshot")
         write_json(out / "selected_indices.json", indices)
         write_json(manifest_path, manifest)
@@ -205,7 +226,8 @@ def index_ready(args):
     root, manifest = Path(args.out_root).resolve(), manifest_at(args.out_root)
     if manifest.get("index_build_status") != "ready":
         return 1
-    require(asset_hashes(manifest["source_index"]) == manifest["source_asset_sha256"], "shared source index changed")
+    require(asset_hashes(manifest["source_index"], manifest["model_dir"]) == manifest["source_asset_sha256"],
+            "shared source index changed")
     require(cache_hashes(root / "initial_llm_cache") == manifest["initial_cache_sha256"],
             "shared cache snapshot changed")
     if manifest.get("index_build_mode") == "fresh":
@@ -232,7 +254,10 @@ def freeze_index(args):
     require(sha256(manifest["data_path"]) == manifest["data_sha256"], "dataset changed during index build")
     require(sha256(manifest["corpus_path"]) == manifest["corpus_sha256"], "corpus changed during index build")
     _, docs, _ = validated_dataset(manifest["data_path"], manifest["corpus_path"])
-    index_identity(source, docs)
+    index_identity(source, docs,
+                   embedding_model=manifest["runtime"]["embedding_model_name"],
+                   embedding_provider=manifest.get("embedding_provider") or manifest["runtime"].get("embedding_provider"),
+                   model_dir=manifest["model_dir"])
     result = read_json(root / "index_build_result.json")
     require(result.get("eval_mode") == "index_only" and result.get("index_build_complete") is True,
             "index_only did not report successful index completion")
@@ -276,7 +301,7 @@ def freeze_index(args):
     status = http_status_counts(args.vllm_log, args.log_start, args.log_end)
     require(bool(status) and not any(code != "200" for code in status),
             f"fresh indexing missing statuses or non-200 HTTP responses: {status}")
-    hashes = asset_hashes(source)
+    hashes = asset_hashes(source, manifest["model_dir"])
     require((source / "llm_cache").is_dir(), "fresh indexing LLM cache is missing")
     snapshot = root / "initial_llm_cache"
     require(not snapshot.exists(), "pending fresh index already has a cache snapshot")
@@ -309,18 +334,22 @@ def initialize_case(args):
     require(index_ready(args) == 0, "shared Hippo index integrity check failed")
     require(name in manifest["cases"], f"case not selected: {name}")
     source = Path(manifest["source_index"])
-    require(asset_hashes(source) == manifest["source_asset_sha256"], "source graph/embeddings changed")
+    require(asset_hashes(source, manifest["model_dir"]) == manifest["source_asset_sha256"],
+            "source graph/embeddings changed")
     case = root / "cases" / name
     require(not (case / "validated.ok").exists(), "validated case must not be overwritten")
     require(not case.exists(), f"incomplete case exists: {case}; inspect it and select a new OUT_ROOT")
     case.mkdir(parents=True)
     index = case / "index"
     shutil.copytree(source, index, ignore=shutil.ignore_patterns("*.lock", "metrics*.json", "eval_results*"))
-    shutil.rmtree(index / "llm_cache")
-    shutil.copytree(root / "initial_llm_cache", index / "llm_cache")
-    require(asset_hashes(index) == manifest["source_asset_sha256"], "copied graph/embeddings differ")
+    llm_cache = index / "llm_cache"
+    if llm_cache.exists():
+        shutil.rmtree(llm_cache)
+    shutil.copytree(root / "initial_llm_cache", llm_cache)
+    require(asset_hashes(index, manifest["model_dir"]) == manifest["source_asset_sha256"],
+            "copied graph/embeddings differ")
     require(cache_hashes(index / "llm_cache") == manifest["initial_cache_sha256"], "copied LLM cache differs")
-    write_json(case / "before.json", {"asset_sha256": asset_hashes(index),
+    write_json(case / "before.json", {"asset_sha256": asset_hashes(index, manifest["model_dir"]),
                                       "initial_cache_sha256": cache_hashes(index / "llm_cache")})
     print(f"[initialized] {name}: isolated Hippo index and identical cache snapshot", flush=True)
 
@@ -334,7 +363,8 @@ def ready(args):
                        "report_sha256": sha256(case / "report.json"),
                        "manifest_sha256": sha256(Path(args.out_root) / "manifest.json")},
             f"validated files changed: {args.name}")
-    require(asset_hashes(case / "index") == manifest_at(args.out_root)["source_asset_sha256"],
+    require(asset_hashes(case / "index", manifest_at(args.out_root)["model_dir"])
+            == manifest_at(args.out_root)["source_asset_sha256"],
             f"validated index changed: {args.name}")
     print(f"[skip] {args.name}: previously validated", flush=True)
     return 0
@@ -353,7 +383,8 @@ def validate_result(result, manifest, name, data, corpus, expected_stage=None):
     config = result.get("runtime_config") or {}
     for key in ("embedding_batch_size", "llm_prefetch_workers", "openie_max_workers"):
         require(config.get(key) == manifest["runtime"][key], f"runtime_config.{key} mismatch")
-    require(config.get("embedding_model_name") == EMBEDDING_MODEL, "runtime embedding model mismatch")
+    require(config.get("embedding_model_name") == manifest["runtime"]["embedding_model_name"],
+            "runtime embedding model mismatch")
     require(config.get("llm_name") == "qwen3-8b", "runtime LLM model mismatch")
     require(config.get("max_new_tokens") == 2048, "max_new_tokens must remain 2048")
     stage = CASES[name] if expected_stage is None else expected_stage
@@ -421,9 +452,10 @@ def report(args):
     result = read_json(case / "result.json")
     measurements, metrics = validate_result(result, manifest, name, data, corpus)
     before = read_json(case / "before.json")
-    after = asset_hashes(case / "index")
+    after = asset_hashes(case / "index", manifest["model_dir"])
     require(before["asset_sha256"] == after == manifest["source_asset_sha256"], "graph/embeddings changed")
-    require(asset_hashes(manifest["source_index"]) == manifest["source_asset_sha256"], "source index changed")
+    require(asset_hashes(manifest["source_index"], manifest["model_dir"]) == manifest["source_asset_sha256"],
+            "source index changed")
     require(before["initial_cache_sha256"] == manifest["initial_cache_sha256"], "initial cache mismatch")
     require(args.log_start >= 0 and args.log_end >= args.log_start, "vLLM log rotated/truncated")
     status = http_status_counts(args.vllm_log, args.log_start, args.log_end)
@@ -495,6 +527,9 @@ def register_commands(subparsers):
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--sample-indices-file")
     parser.add_argument("--cases", default="")
+    parser.add_argument("--embedding-model", default=EMBEDDING_MODEL)
+    parser.add_argument("--embedding-provider", default=DEFAULT_EMBEDDING_PROVIDER)
+    parser.add_argument("--embedding-batch-size", type=int, default=DEFAULT_EMBEDDING_BATCH_SIZE)
     parser.add_argument("--build-shared-index", action="store_true",
                         help="prepare an empty OUT_ROOT/shared_hipporag2_index for fresh OpenIE/index build")
     parser.set_defaults(handler=prepare)
