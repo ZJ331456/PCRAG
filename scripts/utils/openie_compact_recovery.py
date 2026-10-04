@@ -13,7 +13,7 @@ from pathcondrag.utils.openie_quality import TRIPLE_JSON_SCHEMA, merge_triples, 
 from .openie_semantic_validation import CONTEXT_TOKENS, MAX_COMPLETION_TOKENS, _prompt_tokens
 
 
-RECOVERY_VERSION = 'pathcondrag_compact_source_recovery_v2'
+RECOVERY_VERSION = 'pathcondrag_compact_source_recovery_v3'
 SCHEMA = {
     'type': 'object',
     'properties': {
@@ -42,9 +42,9 @@ If the requested relationships cannot be supported, return
 {"triples": [], "status": "no_supported_relations"}.'''
 
 
-def _windows(passage, chars=450, overlap=60, maximum=8):
+def _windows(passage, chars=450, overlap=60, maximum=8, keep_title=True):
     newline = passage.find('\n')
-    title = passage[:newline] if 0 < newline <= 200 else ''
+    title = passage[:newline] if keep_title and 0 < newline <= 200 else ''
     start = newline + 1 if title else 0
     windows = []
     while start < len(passage):
@@ -63,6 +63,52 @@ def _windows(passage, chars=450, overlap=60, maximum=8):
         while start < end and start > 0 and not passage[start - 1].isspace():
             start += 1
     return windows
+
+
+def _child_windows(passage, start, end):
+    """Cover one failed parent span, retaining its original absolute offsets."""
+    children = _windows(passage[start:end], chars=225, overlap=40, maximum=3,
+                        keep_title=False)
+    newline = passage.find('\n')
+    title = passage[:newline] if 0 < newline <= 200 else ''
+    return [(start + child_start, start + child_end,
+             (title + '\n' if title else '') + text)
+            for child_start, child_end, text in children]
+
+
+def _recover_failed_window(llm, passage, start, end, entities, context, raw, metadata):
+    """Spend at most three additional calls; never accept incomplete coverage."""
+    children = _child_windows(passage, start, end)
+    parent_metadata = copy.deepcopy(metadata)
+    accepted, child_results, child_responses = [], [], []
+    for child_start, child_end, text in children:
+        found, child_raw, diagnostic = _extract(llm, text, entities, context, 1)
+        accepted = merge_triples(accepted, found)
+        child_results.append({'source_start': child_start, 'source_end': child_end,
+                              'metadata': diagnostic})
+        child_responses.append(child_raw)
+    complete = bool(children) and all(item['metadata']['complete'] for item in child_results)
+    metadata.update({'parent_attempt_metadata': parent_metadata,
+                     'child_window_recovery': child_results,
+                     'child_window_coverage_complete': bool(children),
+                     'child_window_recovery_complete': complete,
+                     'complete': complete,
+                     'openie_attempt_count': parent_metadata['openie_attempt_count']
+                     + sum(item['metadata']['openie_attempt_count'] for item in child_results),
+                     'valid_triple_count': len(accepted),
+                     'quality_status': ('success' if complete and accepted else 'empty_valid'
+                                        if complete else 'partial' if accepted else 'failed')})
+    if complete:
+        metadata.update({'finish_reason': 'stop', 'aggregated_from_complete_children': True,
+                         'repair_status': 'success' if accepted else 'no_supported_relations'})
+        metadata.pop('openie_skipped', None)
+        metadata.pop('openie_skip_reason', None)
+    else:
+        metadata['openie_skipped'] = True
+        metadata['openie_skip_reason'] = 'Failed parent span was not completely recovered by child windows'
+    response = json.dumps({'parent_response': raw, 'child_responses': child_responses},
+                          ensure_ascii=False)
+    return accepted, response, metadata
 
 
 def _extract(llm, passage, entities, context, max_calls):
@@ -139,7 +185,7 @@ def _extract(llm, passage, entities, context, max_calls):
 
 
 def compact_recovery(llm, chunk_key, passage, named_entities, repair_context):
-    """Try one whole-source call, then up to eight fully covering small windows."""
+    """Try the whole source, bounded windows, then smaller failed spans only."""
     triples, response, metadata = _extract(llm, passage, named_entities, repair_context, 1)
     metadata.update({'recovery_version': RECOVERY_VERSION, 'recovery_strategy': 'compact_flat_triples',
                      'requires_semantic_verification': True, 'semantic_verified': False,
@@ -155,6 +201,9 @@ def compact_recovery(llm, chunk_key, passage, named_entities, repair_context):
     window_results, responses, accepted = [], [], []
     for start, end, text in windows:
         found, raw, diagnostic = _extract(llm, text, named_entities, repair_context, 2)
+        if not diagnostic['complete']:
+            found, raw, diagnostic = _recover_failed_window(
+                llm, passage, start, end, named_entities, repair_context, raw, diagnostic)
         accepted = merge_triples(accepted, found)
         window_results.append({'source_start': start, 'source_end': end, 'metadata': diagnostic})
         responses.append(raw)

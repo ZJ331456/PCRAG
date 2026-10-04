@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'scripts'))
 
-from utils.openie_compact_recovery import _windows, compact_recovery
+from utils.openie_compact_recovery import _child_windows, _windows, compact_recovery
 
 
 class FakeLLM:
@@ -69,19 +69,80 @@ class CompactRecoveryTests(unittest.TestCase):
         passage = 'row item amount ' * 40
         windows = _windows(passage)
         self.assertEqual(len(windows), 2)
-        llm = FakeLLM(['not json', OK, 'not json', 'not json'])
+        children = _child_windows(passage, windows[1][0], windows[1][1])
+        llm = FakeLLM(['not json', OK, 'not json', 'not json']
+                      + ['not json'] * len(children))
         output = compact_recovery(llm, 'id', passage, [], 'Recover source facts.')
         self.assertEqual(output.metadata['quality_status'], 'partial')
         self.assertFalse(output.metadata['complete'])
         self.assertTrue(output.metadata['openie_skipped'])
-        self.assertEqual(len(llm.calls), 4)
+        self.assertEqual(len(llm.calls), 4 + len(children))
+        self.assertFalse(output.metadata['window_recovery'][1]['metadata']
+                         ['child_window_recovery_complete'])
 
     def test_over_context_is_blocked_before_any_http_request(self):
         llm = FakeLLM([], token_count=7000)
         output = compact_recovery(llm, 'id', 'A is located in B.', [], 'Recover source facts.')
         self.assertEqual(output.metadata['quality_status'], 'failed')
         self.assertEqual(llm.calls, [])
-        self.assertIn('exceeds 8192', output.metadata['window_recovery'][0]['metadata']['openie_skip_reason'])
+        self.assertIn('exceeds 8192', output.metadata['window_recovery'][0]['metadata']
+                      ['parent_attempt_metadata']['openie_skip_reason'])
+
+    def test_failed_parent_recovers_with_children_and_preserves_attempts(self):
+        passage = 'Table title\n' + 'row item amount ' * 40
+        windows = _windows(passage)
+        children = _child_windows(passage, windows[0][0], windows[0][1])
+        llm = FakeLLM([('whole truncated', 'length'), ('parent truncated', 'length'),
+                       ('parent truncated again', 'length')]
+                      + [OK] * len(children) + [OK] * (len(windows) - 1))
+        output = compact_recovery(llm, 'id', passage, [], 'Recover source facts.')
+        self.assertTrue(output.metadata['complete'])
+        parent = output.metadata['window_recovery'][0]['metadata']
+        self.assertEqual(parent['finish_reason'], 'stop')
+        self.assertTrue(parent['aggregated_from_complete_children'])
+        self.assertEqual(parent['parent_attempt_metadata']['finish_reason'], 'length')
+        self.assertEqual(len(parent['parent_attempt_metadata']['attempts']), 2)
+        self.assertEqual(parent['openie_attempt_count'], 2 + len(children))
+        self.assertEqual(output.metadata['window_recovery_attempt_count'],
+                         2 + len(children) + len(windows) - 1)
+        self.assertEqual(len(llm.calls), 3 + len(children) + len(windows) - 1)
+        self.assertNotIn('child_window_recovery',
+                         output.metadata['window_recovery'][1]['metadata'])
+        recovered_response = json.loads(json.loads(output.response)['window_responses'][0])
+        self.assertEqual(recovered_response['parent_response'], 'parent truncated again')
+        self.assertEqual(recovered_response['child_responses'], [OK] * len(children))
+
+    def test_child_windows_retain_absolute_offsets_and_complete_span(self):
+        passage = 'Title\n' + 'row item amount ' * 40
+        for start, end, _ in _windows(passage):
+            children = _child_windows(passage, start, end)
+            self.assertGreater(len(children), 0)
+            self.assertLessEqual(len(children), 3)
+            self.assertEqual(children[0][0], start)
+            self.assertEqual(children[-1][1], end)
+            previous_end = start
+            for child_start, child_end, text in children:
+                self.assertLessEqual(child_start, previous_end)
+                self.assertGreater(child_end, child_start)
+                self.assertLessEqual(child_end - child_start, 225)
+                self.assertEqual(text, 'Title\n' + passage[child_start:child_end])
+                previous_end = child_end
+
+    def test_one_child_failure_never_marks_parent_complete(self):
+        passage = 'row item amount ' * 20
+        windows = _windows(passage)
+        self.assertEqual(len(windows), 1)
+        children = _child_windows(passage, windows[0][0], windows[0][1])
+        llm = FakeLLM([('whole truncated', 'length'), ('parent truncated', 'length'),
+                       ('parent truncated again', 'length'), OK]
+                      + [('child truncated', 'length')] * (len(children) - 1))
+        output = compact_recovery(llm, 'id', passage, [], 'Recover source facts.')
+        self.assertFalse(output.metadata['complete'])
+        parent = output.metadata['window_recovery'][0]['metadata']
+        self.assertFalse(parent['complete'])
+        self.assertEqual(parent['finish_reason'], 'length')
+        self.assertNotIn('aggregated_from_complete_children', parent)
+        self.assertEqual(output.metadata['quality_status'], 'partial')
 
     def test_explicit_no_supported_relations_is_valid_empty(self):
         llm = FakeLLM(['{"triples":[],"status":"no_supported_relations"}'])
