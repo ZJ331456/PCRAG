@@ -46,7 +46,9 @@ class CompactRecoveryTests(unittest.TestCase):
         self.assertEqual(settings['max_completion_tokens'], 2048)
         self.assertEqual(settings['temperature'], 0.0)
         self.assertFalse(settings['extra_body']['chat_template_kwargs']['enable_thinking'])
-        self.assertNotIn('support_quotes', settings['extra_body']['guided_json']['properties'])
+        self.assertTrue(settings['extra_body']['guided_grammar'])
+        self.assertNotIn('guided_json', settings['extra_body'])
+        self.assertNotIn('support_quotes', settings['extra_body']['guided_grammar'])
 
     def test_length_immediately_uses_fully_covering_windows(self):
         passage = 'Table title\n' + 'row item amount ' * 90

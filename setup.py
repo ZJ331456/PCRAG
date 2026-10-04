@@ -6,4 +6,5 @@ setup(
     description="PathCondRAG: path-conditioned query decomposition for multi-hop RAG (PC3 + optional MPCE)",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
+    extras_require={"index-quality": ["xgrammar==0.1.18"]},
 )

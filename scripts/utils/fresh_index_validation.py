@@ -10,6 +10,9 @@ import json
 from pathlib import Path
 
 from pathcondrag.utils.openie_quality import validate_triples
+from pathcondrag.utils.openie_source_evidence import (
+    FLAGS, VERIFIER_VERSION, _evaluate, _quote_offsets,
+)
 
 from .openie_graph_validation import validate_graph_contributions
 
@@ -48,7 +51,139 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _audit_counts(metadata, triples, chunk_id):
+def _exact_evidence(passage, quote, offsets, chunk_id, *, focus=None):
+    _require(isinstance(quote, str) and bool(quote.strip())
+             and isinstance(offsets, list) and bool(offsets),
+             f'Accepted relation has no exact source evidence: {chunk_id}')
+    try:
+        actual = _quote_offsets(passage, quote)
+    except ValueError as error:
+        raise ValueError(f'Accepted relation has no exact source evidence: {chunk_id}: {error}') from error
+    _require(offsets == actual, f'Exact source evidence offsets mismatch: {chunk_id}')
+    if focus is not None:
+        _require(any(position['start'] >= focus[0] and position['end'] <= focus[1]
+                     for position in actual),
+                 f'Empty-focus evidence does not occur inside the original focus: {chunk_id}')
+
+
+def _positive_evidence(check, passage, chunk_id):
+    """Recompute deterministic role coverage from raw verdict fields."""
+    _exact_evidence(passage, check.get('quote'), check.get('quote_offsets'), chunk_id)
+    flags, roles = check.get('role_flags'), check.get('subject_roles')
+    _require(isinstance(flags, dict) and set(flags) == set(FLAGS)
+             and all(flag is True for flag in flags.values())
+             and check.get('model_supported') is True
+             and isinstance(roles, list) and bool(roles),
+             f'Accepted relation lacks complete source role checks: {chunk_id}')
+    raw_roles = []
+    for role in roles:
+        _require(isinstance(role, dict), f'Invalid accepted subject role: {chunk_id}')
+        raw_roles.append({name: role.get(name) for name in (
+            'source_subject', 'mention', 'relation_quote', 'relation_supported')})
+    verdict = {'supported': True, 'quote': check['quote'], 'subject_roles': raw_roles,
+               'reason': check.get('reason'), **flags}
+    try:
+        recomputed = _evaluate(passage, check['triple'], verdict)
+    except (ValueError, TypeError) as error:
+        raise ValueError(f'Accepted relation lacks valid source role evidence: {chunk_id}: {error}') from error
+    # Guided responses may carry span IDs in addition to the resolved exact
+    # quotation. IDs are transport annotations; compare the actual source
+    # evidence and every derived role check independently of those annotations.
+    comparable_roles = [{name: value for name, value in role.items()
+                         if name != 'relation_quote_id'} for role in roles]
+    _require(recomputed['supported'] is True
+             and check.get('subject_scope_complete') is True
+             and not check.get('deterministic_rejection')
+             and check.get('subject_member_checks') == recomputed['subject_member_checks']
+             and check.get('whole_named_argument_supported') == recomputed['whole_named_argument_supported']
+             and comparable_roles == recomputed['subject_roles'],
+             f'Accepted relation source roles or coverage differ from actual evidence: {chunk_id}')
+
+
+def _whole_source_verdict(audit, passage, chunk_id, *, empty=False):
+    _require(audit.get('contract_version') == VERIFIER_VERSION
+             and audit.get('evidence_contract') == 'exact_source_quotes_subject_roles_and_entailment'
+             and audit.get('source_scope') == 'whole_original_passage_only'
+             and audit.get('finish_reason') == 'stop',
+             f'Invalid whole-source evidence contract: {chunk_id}')
+    has_relations, no_relations = audit.get('source_has_supported_relations'), audit.get('source_no_supported_relations')
+    _require(type(has_relations) is bool and type(no_relations) is bool
+             and has_relations is not no_relations,
+             f'Invalid independent whole-source relation verdict: {chunk_id}')
+    batches = audit.get('batches')
+    _require(isinstance(batches, list) and bool(batches),
+             f'Whole-source verdict has no independent evidence batches: {chunk_id}')
+    if empty:
+        _require(has_relations is False and no_relations is True,
+                 f'Empty extraction lacks an independent whole-source no-relation verdict: {chunk_id}')
+    batched_checks = []
+    for batch in batches:
+        _require(isinstance(batch, dict) and batch.get('complete') is True
+                 and not batch.get('error') and batch.get('n_unverified') == 0
+                 and batch.get('contract_version') == VERIFIER_VERSION
+                 and batch.get('source_scope') == 'whole_original_passage_only'
+                 and batch.get('finish_reason') == 'stop',
+                 f'Incomplete independent source evidence batch: {chunk_id}')
+        source_flag = batch.get('source_has_supported_relations')
+        _require(type(source_flag) is bool and type(batch.get('source_no_supported_relations')) is bool
+                 and batch.get('source_no_supported_relations') is not source_flag,
+                 f'Invalid independent source evidence batch verdict: {chunk_id}')
+        _exact_evidence(passage, batch.get('source_evidence_quote'),
+                        batch.get('source_evidence_quote_offsets'), chunk_id)
+        _require(isinstance(batch.get('source_reason'), str) and bool(batch['source_reason'].strip()),
+                 f'Independent source verdict lacks a reason: {chunk_id}')
+        if empty:
+            _require(source_flag is False and batch.get('n_input') == 0
+                     and batch.get('checks') == [] and batch.get('supported') == [],
+                     f'Empty extraction lacks an independent zero-candidate source audit: {chunk_id}')
+        _require(isinstance(batch.get('checks'), list)
+                 and all(isinstance(check, dict) for check in batch['checks'])
+                 and batch.get('n_input') == len(batch['checks']),
+                 f'Independent source batch does not cover its candidates: {chunk_id}')
+        batched_checks.extend(batch['checks'])
+    _require(has_relations is any(batch['source_has_supported_relations'] for batch in batches),
+             f'Whole-source aggregate relation verdict differs from its evidence batches: {chunk_id}')
+    flattened = [{**check, 'index': index} for index, check in enumerate(batched_checks)]
+    _require(audit.get('checks') == flattened,
+             f'Whole-source aggregate assertions differ from actual evidence batches: {chunk_id}')
+
+
+def _empty_focus_audits(metadata, passage, chunk_id):
+    focuses, audits = metadata.get('unverified_empty_focuses', []), metadata.get('atomic_empty_focus_audits', [])
+    _require(isinstance(focuses, list) and isinstance(audits, list) and len(focuses) == len(audits),
+             f'Atomic empty source focuses lack independent audits: {chunk_id}')
+    for focus, audit in zip(focuses, audits):
+        if isinstance(focus, dict):
+            start, end = focus.get('source_start'), focus.get('source_end')
+        else:
+            _require(isinstance(focus, (list, tuple)) and len(focus) == 2,
+                     f'Invalid atomic empty original focus: {chunk_id}')
+            start, end = focus
+        _require(type(start) is int and type(end) is int and 0 <= start < end <= len(passage),
+                 f'Invalid atomic empty original focus: {chunk_id}')
+        _require(isinstance(audit, dict) and audit.get('complete') is True
+                 and not audit.get('error') and audit.get('n_unverified') == 0
+                 and audit.get('contract_version') == VERIFIER_VERSION
+                 and audit.get('source_no_supported_relations') is True
+                 and audit.get('source_has_supported_relations') is False
+                 and audit.get('n_input') == 0 and audit.get('n_accepted') == 0
+                 and audit.get('n_rejected') == 0 and audit.get('checks') == []
+                 and audit.get('supported') == [] and audit.get('finish_reason') == 'stop'
+                 and audit.get('source_scope') == 'whole_source_with_original_focus'
+                 and audit.get('source_relation_verdict_scope') == 'original_focus_only'
+                 and audit.get('source_focus') == {'start': start, 'end': end, 'text': passage[start:end]},
+                 f'Atomic empty focus has no complete independent no-relation verdict: {chunk_id}')
+        if audit.get('deterministic_empty_focus') is True:
+            _require(not passage[start:end].strip(),
+                     f'Nonempty source focus falsely marked as deterministic whitespace: {chunk_id}')
+        else:
+            _exact_evidence(passage, audit.get('source_evidence_quote'),
+                            audit.get('source_evidence_quote_offsets'), chunk_id, focus=(start, end))
+        _require(isinstance(audit.get('source_reason'), str) and bool(audit['source_reason'].strip()),
+                 f'Atomic empty focus audit lacks a reason: {chunk_id}')
+
+
+def _audit_counts(metadata, triples, chunk_id, passage=None, *, evidence_required=False):
     """Bind the final triples to the final completed source-only verdict."""
     audits = metadata.get("semantic_verification_history")
     _require(isinstance(audits, list) and bool(audits),
@@ -56,7 +191,11 @@ def _audit_counts(metadata, triples, chunk_id):
     counts = {"verification_passes": len(audits), "accepted_assertions_across_passes": 0,
               "rejected_assertions_across_passes": 0}
     final_accepted = None
-    for audit in audits:
+    for audit_number, audit in enumerate(audits):
+        if audit_number < len(audits) - 1 and isinstance(audit, dict) and audit.get('complete') is False:
+            # An earlier failed audit is diagnostic. Only a completed final
+            # verdict can authorize graph publication.
+            continue
         _require(isinstance(audit, dict) and audit.get("complete") is True
                  and not audit.get("error") and audit.get("n_unverified") == 0,
                  f"Incomplete recovered source audit: {chunk_id}")
@@ -74,6 +213,8 @@ def _audit_counts(metadata, triples, chunk_id):
             _require(isinstance(triple, list) and not validate_triples([triple]).invalid_triples,
                      f"Invalid recovered audit triple: {chunk_id}")
             if flag:
+                if evidence_required:
+                    _positive_evidence(check, passage, chunk_id)
                 accepted.append(tuple(triple))
         accepted_count, rejected_count = sum(supported), len(supported) - sum(supported)
         _require(audit.get("n_accepted") == accepted_count
@@ -81,8 +222,10 @@ def _audit_counts(metadata, triples, chunk_id):
                  f"Recovered audit counts mismatch: {chunk_id}")
         counts["accepted_assertions_across_passes"] += accepted_count
         counts["rejected_assertions_across_passes"] += rejected_count
-        final_accepted = set(accepted)
-    _require(final_accepted == {tuple(triple) for triple in triples},
+        if evidence_required:
+            _whole_source_verdict(audit, passage, chunk_id, empty=not supported)
+        final_accepted = accepted
+    _require(final_accepted == [tuple(triple) for triple in triples],
              f"Final recovered facts differ from accepted source verdicts: {chunk_id}")
     counts["accepted_relations_final"] = len(triples)
     return counts
@@ -95,6 +238,12 @@ def _validated_rows(rows, docs, quality_profile):
               "audited_chunks": 0, "verification_passes": 0,
               "accepted_relations_final": 0, "accepted_assertions_across_passes": 0,
               "rejected_assertions_across_passes": 0}
+    strict_scope = quality_profile.get('semantic_scope') == 'all_final_relations'
+    if quality_profile.get('name') == 'pathcondrag_openie_quality_v3':
+        _require(strict_scope, 'A v3 fresh index must audit all final relations')
+    if strict_scope:
+        _require(quality_profile.get('fresh_recovery_semantic_verifier') == VERIFIER_VERSION,
+                 'Strict fresh index uses an obsolete source evidence contract')
     for row in rows:
         _require(isinstance(row, dict), "Invalid OpenIE row")
         passage, chunk_id = row.get("passage"), row.get("idx")
@@ -119,21 +268,29 @@ def _validated_rows(rows, docs, quality_profile):
         _require(isinstance(triples, list), f"Invalid fresh triples: {chunk_id}")
         validation = validate_triples(triples)
         _require(not validation.invalid_triples, f"Structurally invalid fresh triples: {chunk_id}")
+        _require(validation.raw_count == len(validation.valid_triples),
+                 f'Duplicate fresh triples: {chunk_id}')
         triple_metadata = metadata["triples"]
         recovered = bool(triple_metadata.get("quality_recovered")
                          or triple_metadata.get("source_verified_schema"))
+        _require(not strict_scope or recovered,
+                 f'Normal initial extraction bypassed required source evidence audit: {chunk_id}')
         if recovered:
-            counts["recovered_chunks"] += 1
+            counts["recovered_chunks"] += bool(triple_metadata.get('quality_recovered'))
             _require(triple_metadata.get("source_verified_schema")
-                     == "pathcondrag_fresh_source_verified_openie_v1"
+                     == ("pathcondrag_fresh_source_verified_openie_v2" if strict_scope
+                         else "pathcondrag_fresh_source_verified_openie_v1")
                      and triple_metadata.get("semantic_verified") is True
                      and triple_metadata.get("complete") is True
                      and triple_metadata.get("requires_semantic_verification") is False,
                      f"Recovered extraction is not completely source verified: {chunk_id}")
-            audit_counts = _audit_counts(triple_metadata, triples, chunk_id)
+            audit_counts = _audit_counts(triple_metadata, triples, chunk_id, passage,
+                                        evidence_required=strict_scope)
             counts["audited_chunks"] += 1
             for name, value in audit_counts.items():
                 counts[name] += value
+            if strict_scope:
+                _empty_focus_audits(triple_metadata, passage, chunk_id)
             verifier = quality_profile.get("fresh_recovery_semantic_verifier")
             _require(isinstance(verifier, str) and bool(verifier)
                      and triple_metadata.get("semantic_verifier_contract") == verifier
@@ -149,6 +306,9 @@ def _validated_rows(rows, docs, quality_profile):
                      and triple_metadata.get("semantic_verified") is True,
                      f"Empty extraction lacks explicit source-only confirmation: {chunk_id}")
             counts["legitimate_empty_chunks"] += 1
+            if strict_scope:
+                _require(triple_metadata['semantic_verification_history'][-1].get('source_no_supported_relations') is True,
+                         f'Empty extraction lacks an independent whole-source no-relation verdict: {chunk_id}')
         for triple in triples:
             normalized = tuple(unicode_normalize(field) for field in triple)
             _require(all(normalized), f"Empty normalized fresh triple field: {chunk_id}")

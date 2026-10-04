@@ -16,6 +16,10 @@ from pathcondrag.information_extraction.openie_openai import OpenIE
 from pathcondrag.information_extraction import source_verified_openie as module
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput
 from pathcondrag.utils.shared_index_builder import SharedQualityOpenIE, quality_hipporag_class
+from pathcondrag.utils.openie_semantic_validation import (
+    verify_repaired_triples as boolean_verifier,
+    SemanticVerificationError as BooleanVerificationError,
+)
 
 
 class FakeLLM:
@@ -41,21 +45,45 @@ UNSUPPORTED = ['Iris', 'had classical theater training', 'Moon Harbor']
 SOURCE = 'Iris had classical theater training and appeared in Moon Harbor.'
 
 
+def wrapper_verifier(llm, passage, triples, retry_context=''):
+    """Test-only verdict bridge; evidence JSON is covered in its own test suite."""
+    if triples:
+        try:
+            return boolean_verifier(llm, passage, triples)
+        except BooleanVerificationError as error:
+            raise module.SemanticVerificationError(str(error), error.audit_metadata) from error
+    response, metadata, _ = llm.infer(
+        messages=[{'role': 'system', 'content': 'Independently audit original-source emptiness.'},
+                  {'role': 'user', 'content': json.dumps({'SOURCE': passage, 'TRIPLES': []})}],
+        max_completion_tokens=2048, temperature=0.0,
+        extra_body={'chat_template_kwargs': {'enable_thinking': False}})
+    payload = json.loads(response)
+    return [], {'complete': True, 'n_unverified': 0, 'n_input': 0, 'n_accepted': 0,
+                'n_rejected': 0, 'checks': [], 'raw_response': response,
+                'source_no_supported_relations': payload['source_has_supported_relations'] is False}
+
+
 class SourceVerifiedOpenIETests(unittest.TestCase):
     def call(self, initial, llm, recovered):
         extractor = module.SourceVerifiedOpenIE(llm)
-        with patch.object(OpenIE, 'triple_extraction', return_value=initial):
+        with patch.object(OpenIE, 'triple_extraction', return_value=initial), \
+                patch.object(module, 'verify_repaired_triples', side_effect=wrapper_verifier), \
+                patch('pathcondrag.utils.openie_atomic_recovery.atomic_recovery',
+                      return_value=result([], 'failed', complete=False, openie_skipped=True)):
             with patch.object(module, 'compact_recovery', side_effect=recovered) as fallback:
                 output = extractor.triple_extraction('chunk', SOURCE, ['Iris', 'Moon Harbor'])
         return output, fallback
 
-    def test_initial_valid_nonempty_does_not_add_audit_calls(self):
+    def test_initial_valid_nonempty_is_audited_before_publication(self):
         initial = result([SUPPORTED])
-        llm = FakeLLM()
+        llm = FakeLLM(['{"supported":[true]}'])
         output, fallback = self.call(initial, llm, [])
-        self.assertIs(output, initial)
+        self.assertIsNot(output, initial)
+        self.assertEqual(output.triples, initial.triples)
+        self.assertTrue(output.metadata['semantic_verified'])
+        self.assertTrue(module.SourceVerifiedOpenIE.is_verified_complete(output))
         fallback.assert_not_called()
-        self.assertEqual(llm.calls, [])
+        self.assertEqual(len(llm.calls), 1)
 
     def test_fresh_empty_uses_compact_recovery_and_whole_source_verifier(self):
         recovered = result([SUPPORTED], complete=True, repair_status='success')
@@ -100,12 +128,13 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
 
     def test_legitimate_no_relations_remains_explicit_empty_not_invented(self):
         empty = result([], 'empty_valid', complete=True, repair_status='no_supported_relations')
-        llm = FakeLLM()
+        llm = FakeLLM(['{"source_has_supported_relations":false}'])
         output, _ = self.call(result([], 'empty_valid'), llm, [empty])
         self.assertEqual(output.triples, [])
         self.assertTrue(output.metadata['complete'])
         self.assertTrue(output.metadata['source_no_supported_relations'])
-        self.assertEqual(llm.calls, [])
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(json.loads(llm.calls[0]['messages'][1]['content'])['SOURCE'], SOURCE)
 
     def test_transport_verification_failure_cannot_publish_candidates(self):
         llm = FakeLLM([RuntimeError('backend down')])
@@ -148,13 +177,62 @@ class SourceVerifiedOpenIETests(unittest.TestCase):
                     {'chunk': output})
             saved = json.loads(Path(runtime.openie_state_path).read_text())
             self.assertFalse(saved[0]['openie_metadata']['triples']['complete'])
-            self.assertEqual(len(saved[0]['openie_metadata']['triples']['fresh_extraction_history']), 3)
+            self.assertEqual(len(saved[0]['openie_metadata']['triples']['fresh_extraction_history']), 4)
+
+    def test_normal_group_scope_error_recovers_atomic_individual_then_audits_again(self):
+        source = ('Iris and Lena are actors. Iris had classical theater training. '
+                  'Lena appeared in Moon Harbor.')
+        group = ['Iris and Lena', 'trained in', 'classical theater']
+        individual = ['Lena', 'appeared in', 'Moon Harbor']
+        initial = result([group, SUPPORTED])
+        atomic_result = result([SUPPORTED, individual], complete=True)
+
+        def audit(values, decisions):
+            return {'complete': True, 'n_unverified': 0,
+                    'checks': [{'triple': value, 'supported': supported,
+                                **({'rejection_kind': 'subject_scope'} if not supported else {})}
+                               for value, supported in zip(values, decisions)]}
+
+        extractor = module.SourceVerifiedOpenIE(FakeLLM())
+        with patch.object(OpenIE, 'triple_extraction', return_value=initial), \
+                patch.object(module, 'compact_recovery') as compact, \
+                patch('pathcondrag.utils.openie_atomic_recovery.atomic_recovery',
+                      return_value=atomic_result) as atomic, \
+                patch.object(module, 'verify_repaired_triples', side_effect=[
+                    ([SUPPORTED], audit(initial.triples, [False, True])),
+                    ([SUPPORTED, individual], audit(atomic_result.triples, [True, True]))]) as verifier:
+            output = extractor.triple_extraction('chunk', source, ['Iris', 'Lena', 'Moon Harbor'])
+        compact.assert_not_called()
+        atomic.assert_called_once()
+        self.assertEqual(verifier.call_count, 2)
+        self.assertEqual(output.triples, [SUPPORTED, individual])
+        self.assertEqual([entry['stage'] for entry in output.metadata['fresh_extraction_history']],
+                         ['initial', 'atomic'])
+        self.assertTrue(extractor.is_verified_complete(output))
 
     def test_shared_extractor_uses_source_verified_class_and_fixed_budgets(self):
         extractor = SharedQualityOpenIE(FakeLLM(), max_workers=8)
         self.assertIsInstance(extractor, module.SourceVerifiedOpenIE)
         self.assertEqual(extractor.worker_limits(), (8, 8))
         self.assertEqual((extractor.ner_max_tokens, extractor.triple_max_tokens), (512, 2048))
+
+    def test_pending_audit_resumes_last_complete_candidates_instead_of_reextracting(self):
+        previous = result([], 'failed', openie_skipped=True,
+            openie_skip_reason='Evidence transport incomplete', fresh_extraction_history=[
+                {'stage': 'compact', 'triples': [SUPPORTED], 'response': 'complete candidate',
+                 'metadata': {'finish_reason': 'stop', 'complete': True, 'quality_status': 'success'}},
+                {'stage': 'atomic', 'triples': [], 'response': 'unfinished',
+                 'metadata': {'complete': False, 'openie_skipped': True, 'finish_reason': 'length'}}])
+        original = copy.deepcopy(previous.metadata)
+        extractor = module.SourceVerifiedOpenIE(FakeLLM())
+        with patch.object(extractor, '_verify_and_recover') as resume:
+            extractor.recover_pending_triples('chunk', SOURCE, ['Iris'], previous, 2)
+        candidate = resume.call_args.args[3]
+        self.assertEqual(candidate.triples, [SUPPORTED])
+        self.assertEqual(candidate.response, 'complete candidate')
+        self.assertEqual(candidate.metadata['resumed_candidate_stage'], 'compact')
+        self.assertEqual(candidate.metadata['openie_skip_reason'], 'Evidence transport incomplete')
+        self.assertEqual(previous.metadata, original)
 
     def test_cuda_knn_releases_encoder_uses_native_float32_and_restores_settings(self):
         import torch

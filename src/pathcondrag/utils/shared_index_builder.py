@@ -20,26 +20,28 @@ import sys
 from string import Template
 
 from ..BaseRAG import BaseRAG
-from ..information_extraction.source_verified_openie import SourceVerifiedOpenIE
+from ..information_extraction.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
 from .openie_compact_recovery import RECOVERY_VERSION
-from .openie_semantic_validation import VERIFIER_VERSION
+from .openie_source_evidence import VERIFIER_VERSION
+from .openie_checkpoint import OpenIECheckpoint
+from .openie_build_queue import openie_row_is_verified_complete
 from ..prompts.templates.triple_extraction import prompt_template
 from .misc_utils import openie_row_needs_retry
 from .openie_quality import TRIPLE_JSON_SCHEMA, validate_triples
 
 
-QUALITY_SCHEMA = 'pathcondrag_openie_quality_v2'
+QUALITY_SCHEMA = 'pathcondrag_openie_quality_v3'
 LOG = logging.getLogger(__name__)
 
 
-def quality_profile():
+def quality_profile(*, legacy=False):
     """Identity of the extra extraction contract, independent of native config."""
     digest = lambda value: hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')
     ).hexdigest()
-    return {
-        'schema_version': 2,
-        'name': QUALITY_SCHEMA,
+    result = {
+        'schema_version': 2 if legacy else 3,
+        'name': 'pathcondrag_openie_quality_v2' if legacy else QUALITY_SCHEMA,
         'prompt_schema': 'pathcondrag_source_grounded_triples_v2',
         'prompt_sha256': digest([
             {'role': row['role'], 'content': row['content'].template
@@ -49,15 +51,29 @@ def quality_profile():
         'triple_json_schema_sha256': digest(TRIPLE_JSON_SCHEMA),
         'extractor': 'pathcondrag.information_extraction.source_verified_openie.SourceVerifiedOpenIE',
         'validation': 'three_nonempty_unicode_strings_v2',
-        'recovery': 'source_grounded_feedback_and_windows_v2',
+        'recovery': 'source_grounded_feedback_and_windows_v2' if legacy else 'whole_context_source_units_v3',
         'fresh_recovery': RECOVERY_VERSION,
-        'fresh_recovery_semantic_verifier': VERIFIER_VERSION,
-        'semantic_scope': 'fresh_recovered_and_empty_only',
+        'fresh_recovery_semantic_verifier': 'pathcondrag_source_only_entailment_v1' if legacy else VERIFIER_VERSION,
+        'semantic_scope': 'fresh_recovered_and_empty_only' if legacy else 'all_final_relations',
         'failure_policy': 'checkpoint_then_abort_before_graph_publication',
         'ner_max_tokens': 512,
         'triple_max_tokens': 2048,
         'native_identity_scope': 'baseline_configuration_compatibility',
     }
+    if not legacy:
+        from . import openie_source_evidence as evidence
+        from . import openie_atomic_recovery as atomic
+        from .openie_build_queue import QUEUE_VERSION
+        from .openie_structured_output import STRUCTURED_OUTPUT_VERSION
+        result.update(source_verified_schema=SOURCE_VERIFIED_VERSION, atomic_recovery=atomic.ATOMIC_RECOVERY_VERSION,
+                      pending_queue=QUEUE_VERSION, stage_checkpoint='sqlite_per_stage_v1')
+        result.update(evidence_implementation=evidence.EVIDENCE_IMPLEMENTATION,
+                      atomic_implementation=atomic.ATOMIC_RECOVERY_IMPLEMENTATION,
+                      structured_output=STRUCTURED_OUTPUT_VERSION,
+                      evidence_prompt_sha256=digest(evidence.SYSTEM),
+                      atomic_prompt_sha256=digest(atomic.SYSTEM),
+                      atomic_schema_sha256=digest(atomic.SCHEMA))
+    return result
 
 
 class SharedQualityOpenIE(SourceVerifiedOpenIE):
@@ -89,6 +105,65 @@ def quality_hipporag_class(native_class):
     """Create a runtime adapter without changing files in the baseline repo."""
 
     class QualitySharedHippoRAG(native_class):
+        def _prepare_openie_progress(self, rows, chunks):
+            progress = OpenIECheckpoint(Path(self.working_dir) / 'openie_progress.sqlite', {
+                'provenance': self._current_openie_provenance(),
+                'corpus_ids_sha256': hashlib.sha256('\n'.join(sorted(chunks)).encode()).hexdigest(),
+            })
+            replayed = progress.overlay(rows, chunks)
+            rows[:] = replayed
+            self.openie.initial_rows = {row['idx']: row for row in rows}
+            self.openie.checkpoint = progress.save
+            self._strict_openie_progress = progress
+            return rows
+
+        def _openie_provenance_for_manifest(self):
+            if getattr(self, '_legacy_quality_manifest_probe', False):
+                provenance = copy.deepcopy(self._current_openie_provenance())
+                provenance['quality_profile'] = quality_profile(legacy=True)
+                return provenance
+            return super()._openie_provenance_for_manifest()
+
+        def _validate_or_create_index_manifest(self):
+            path = Path(self.index_manifest_path)
+            allowed = os.environ.get('HIPPO_ALLOW_INDEX_RESUME', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            if (allowed and path.is_file() and self.global_config.force_index_from_scratch
+                    and self.global_config.force_openie_from_scratch):
+                stored = json.loads(path.read_text())
+                old_profile = (stored.get('openie') or {}).get('quality_profile')
+                if old_profile == quality_profile(legacy=True):
+                    source_path = next((Path(candidate) for candidate in (
+                        getattr(self, 'openie_state_path', None), getattr(self, 'openie_results_path', None))
+                        if candidate and Path(candidate).is_file()), None)
+                    if source_path is not None:
+                        source_state = json.loads(source_path.read_text())
+                        if source_state.get('docs') and source_state.get('provenance') != stored['openie']:
+                            raise RuntimeError('Quality upgrade refused: source provenance differs from the native manifest.')
+                    if (self.graph.vcount() or Path(self._graph_pickle_filename).exists()
+                            or self.entity_embedding_store.get_all_ids() or self.fact_embedding_store.get_all_ids()):
+                        raise RuntimeError('Quality upgrade requires an unpublished index without derived graph/entity/fact state.')
+                    # Let the real native validator build and compare every
+                    # embedding/component/graph/producer field. The sole
+                    # temporary difference is its quality-contract field.
+                    self._legacy_quality_manifest_probe = True
+                    fresh_openie = self.global_config.force_openie_from_scratch
+                    self.global_config.force_openie_from_scratch = False
+                    try:
+                        super()._validate_or_create_index_manifest()
+                    finally:
+                        self.global_config.force_openie_from_scratch = fresh_openie
+                        self._legacy_quality_manifest_probe = False
+                    current = copy.deepcopy(stored)
+                    current['openie'] = self._current_openie_provenance()
+                    backup = path.with_name('index_manifest.before_quality_upgrade.json')
+                    if not backup.exists():
+                        backup.write_text(json.dumps(stored, ensure_ascii=False, indent=2))
+                    temporary = path.with_suffix('.json.tmp')
+                    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2))
+                    os.replace(temporary, path)
+                    LOG.info('Upgrading unpublished index to all-relation source evidence checks; existing extraction remains historical until re-audited.')
+            return super()._validate_or_create_index_manifest()
+
         def load_existing_openie(self, chunk_keys, force_reextract=False):
             """Resume only an explicitly authorized, unpublished checkpoint.
 
@@ -105,7 +180,17 @@ def quality_hipporag_class(native_class):
                 getattr(self, 'openie_results_path', None),
             ) if path and Path(path).is_file()), None)
             if not (allowed and force_reextract and checkpoint is not None):
-                return super().load_existing_openie(chunk_keys, force_reextract=force_reextract)
+                rows, pending = super().load_existing_openie(chunk_keys, force_reextract=force_reextract)
+                if force_reextract and hasattr(self, 'openie'):
+                    keys = list(chunk_keys)
+                    rows = self._prepare_openie_progress(rows, self.chunk_embedding_store.get_all_id_to_rows())
+                    by_key = {row['idx']: row for row in rows}
+                    pending = [key for key in keys if key not in by_key
+                               or not openie_row_is_verified_complete(self.openie, by_key[key])]
+                    if not pending:
+                        self._strict_openie_progress.close()
+                        self.openie.checkpoint = None
+                return rows, pending
             config = self.global_config
             if not (config.force_index_from_scratch and config.force_openie_from_scratch):
                 raise RuntimeError('Checkpoint resume requires both explicit fresh-index flags.')
@@ -138,6 +223,9 @@ def quality_hipporag_class(native_class):
                 triples = row.get('extracted_triples')
                 if not isinstance(triples, list) or validate_triples(triples).invalid_triples:
                     return True
+                if hasattr(self, 'openie'):
+                    if not openie_row_is_verified_complete(self.openie, row):
+                        return True
                 if not triples:
                     stage = metadata.get('triples') or {}
                     if not (stage.get('source_no_supported_relations') is True
@@ -150,6 +238,13 @@ def quality_hipporag_class(native_class):
             failed = [key for key in keys if key in by_key and incomplete(by_key[key])]
             pending_set = set(missing).union(failed)
             pending = [key for key in keys if key in pending_set]
+            if hasattr(self, 'openie'):
+                chunk_rows = self.chunk_embedding_store.get_all_id_to_rows()
+                self._prepare_openie_progress(rows, chunk_rows)
+                by_key = {row['idx']: row for row in rows}
+                pending = [key for key in keys if key not in by_key or incomplete(by_key[key])]
+                missing = [key for key in keys if key not in by_key]
+                failed = [key for key in keys if key in by_key and incomplete(by_key[key])]
             self._openie_resume_diagnostics = {
                 'schema': 'pathcondrag_unpublished_checkpoint_resume_v1',
                 'checkpoint': str(checkpoint),
@@ -167,7 +262,11 @@ def quality_hipporag_class(native_class):
             temporary.write_text(json.dumps(self._openie_resume_diagnostics, indent=2), encoding='utf-8')
             os.replace(temporary, target)
             LOG.info('Resuming unpublished OpenIE checkpoint: retained=%d, missing=%d, '
-                     'failed=%d, pending=%s', len(rows) - len(failed), len(missing), len(failed), pending)
+                     'failed=%d, pending_count=%d, first_pending=%s',
+                     len(rows) - len(failed), len(missing), len(failed), len(pending), pending[:10])
+            if not pending and hasattr(self, '_strict_openie_progress'):
+                self._strict_openie_progress.close()
+                self.openie.checkpoint = None
             return rows, pending
 
         def add_synonymy_edges(self, query_node_keys=None):
@@ -223,7 +322,13 @@ def quality_hipporag_class(native_class):
 
         def _validate_openie_provenance(self, provenance, source_path):
             validated = super()._validate_openie_provenance(provenance, source_path)
-            if validated.get('quality_profile') != quality_profile():
+            profile = validated.get('quality_profile')
+            authorized_upgrade = (os.environ.get('HIPPO_ALLOW_INDEX_RESUME', '').strip().lower()
+                                  in {'1', 'true', 'yes', 'on'}
+                                  and self.global_config.force_index_from_scratch
+                                  and self.global_config.force_openie_from_scratch
+                                  and profile == quality_profile(legacy=True))
+            if profile != quality_profile() and not authorized_upgrade:
                 raise RuntimeError(f'OpenIE quality profile is incompatible: {source_path}')
             return validated
 
@@ -238,6 +343,11 @@ def quality_hipporag_class(native_class):
                 self, all_openie_info, chunks_to_save, ner_results_dict, triple_results_dict,
             )
             incomplete = [row['idx'] for row in merged if openie_row_needs_retry(row)]
+            if hasattr(self, 'openie'):
+                for row in merged:
+                    verified = openie_row_is_verified_complete(self.openie, row)
+                    if not verified and row['idx'] not in incomplete:
+                        incomplete.append(row['idx'])
             for key in chunks_to_save:
                 for stage, outputs in (('ner', ner_results_dict), ('triples', triple_results_dict)):
                     result = outputs[key]
@@ -251,6 +361,10 @@ def quality_hipporag_class(native_class):
             self._openie_info = merged
             self._openie_provenance = self._current_openie_provenance()
             self._save_openie_state(merged)
+            progress = getattr(self, '_strict_openie_progress', None)
+            if progress is not None:
+                progress.close()
+                self.openie.checkpoint = None
             if incomplete:
                 raise RuntimeError(
                     f'OpenIE incomplete for {len(set(incomplete))} chunks; '

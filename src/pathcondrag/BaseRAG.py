@@ -18,6 +18,7 @@ from collections import defaultdict
 import re
 import time
 import tempfile
+import hashlib
 
 from .utils.openie_quality import validate_triples
 
@@ -339,6 +340,31 @@ class BaseRAG:
         all_openie_info, chunk_keys_to_process = self.load_existing_openie(
             chunk_to_rows.keys(), retry_failed=retry_failed_openie,
         )
+        progress = None
+        if isinstance(self.openie, OpenIE):
+            from .utils.openie_checkpoint import OpenIECheckpoint
+            from .utils.openie_source_evidence import VERIFIER_VERSION
+            from .utils.openie_build_queue import openie_row_is_verified_complete
+            from .utils.shared_index_builder import quality_profile
+            corpus_digest = hashlib.sha256('\n'.join(sorted(chunk_to_rows)).encode()).hexdigest()
+            progress = OpenIECheckpoint(os.path.join(
+                self.working_dir, f'openie_progress_{corpus_digest}.sqlite'), {
+                'llm_name': self.global_config.llm_name,
+                'endpoint': self.global_config.llm_base_url,
+                'verifier': VERIFIER_VERSION,
+                'temperature': self.global_config.temperature,
+                'seed': self.global_config.seed,
+                'ner_max_tokens': 512,
+                'triple_max_tokens': 2048,
+                'quality_profile': quality_profile(),
+                'corpus_ids_sha256': corpus_digest,
+            })
+            all_openie_info[:] = progress.overlay(all_openie_info, chunk_to_rows)
+            by_id = {row['idx']: row for row in all_openie_info}
+            chunk_keys_to_process = [key for key in chunk_to_rows if key not in by_id
+                or not openie_row_is_verified_complete(self.openie, by_id[key])]
+            self.openie.initial_rows = by_id
+            self.openie.checkpoint = progress.save
         new_openie_rows = {k : chunk_to_rows[k] for k in chunk_keys_to_process}
 
         # Replacing facts for an existing passage requires replacing its graph
@@ -350,6 +376,9 @@ class BaseRAG:
             invalid_cached = [row['idx'] for row in all_openie_info
                               if self._openie_row_has_invalid_graph_triples(row)]
             if replacing or invalid_cached:
+                if progress is not None:
+                    progress.close()
+                    self.openie.checkpoint = None
                 raise RuntimeError(
                     'OpenIE repair changes an existing graph. Use index(..., '
                     'rebuild_graph=True) in a separate index directory; '
@@ -357,11 +386,21 @@ class BaseRAG:
                     f'{len(invalid_cached)} cached passages contain invalid graph triples.'
                 )
 
-        if len(chunk_keys_to_process) > 0:
-            new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
-            self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
+        try:
+            if len(chunk_keys_to_process) > 0:
+                new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
+                self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
+        finally:
+            if progress is not None:
+                progress.close()
+                self.openie.checkpoint = None
 
         incomplete_rows = [row['idx'] for row in all_openie_info if openie_row_needs_retry(row)]
+        if isinstance(self.openie, OpenIE):
+            for row in all_openie_info:
+                verified = openie_row_is_verified_complete(self.openie, row)
+                if not verified and row['idx'] not in incomplete_rows:
+                    incomplete_rows.append(row['idx'])
         if incomplete_rows:
             # Diagnostic checkpoints are saved even when save_openie=False.
             # A partial graph must never be published as a completed index.

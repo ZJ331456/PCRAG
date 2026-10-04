@@ -123,7 +123,8 @@ def _extract(llm, passage, entities, context, max_calls):
     ]
     configured = getattr(getattr(llm, 'llm_config', None), 'generate_params', {}) or {}
     extra = copy.deepcopy(configured.get('extra_body') or {})
-    extra['guided_json'] = SCHEMA
+    from .openie_structured_output import guided_json_parameters
+    extra = guided_json_parameters(SCHEMA, extra)
     chat = dict(extra.get('chat_template_kwargs') or {})
     chat['enable_thinking'] = False
     extra['chat_template_kwargs'] = chat

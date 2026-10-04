@@ -16,6 +16,9 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from utils.fresh_index_validation import validate_fresh_index, unicode_normalize
+from pathcondrag.utils.openie_source_evidence import (
+    FLAGS, VERIFIER_VERSION, _base_audit, _evaluate, _quote_offsets,
+)
 
 
 def key(content, namespace):
@@ -97,6 +100,36 @@ class FreshIndexValidationTests(unittest.TestCase):
             semantic_verified=True, complete=True, requires_semantic_verification=False,
             quality_recovered=True, semantic_verifier_contract="source-verifier-test-v1",
             semantic_verification_history=[audit])
+        return audit
+
+    def mark_strict(self, *, recovered=False):
+        self.profile.update(name='pathcondrag_openie_quality_v3', schema_version=3,
+                            semantic_scope='all_final_relations',
+                            fresh_recovery_semantic_verifier=VERIFIER_VERSION)
+        row = self.rows[0]
+        passage, triples = row['passage'], row['extracted_triples']
+        quote = passage.split('\n', 1)[-1]
+        checks = []
+        for triple in triples:
+            verdict = {'supported': True, 'quote': quote, 'reason': 'Explicit original-source assertion.',
+                       'subject_roles': [{'source_subject': triple[0], 'mention': triple[0],
+                                          'relation_quote': quote, 'relation_supported': True}],
+                       **{flag: True for flag in FLAGS}}
+            checks.append(_evaluate(passage, triple, verdict))
+        audit = _base_audit(triples, checks, [], complete=True)
+        source_fields = {'source_has_supported_relations': bool(triples),
+                         'source_no_supported_relations': not triples,
+                         'source_evidence_quote': quote,
+                         'source_evidence_quote_offsets': _quote_offsets(passage, quote),
+                         'source_reason': 'Original source relation audit.', 'finish_reason': 'stop'}
+        batch = {**copy.deepcopy(audit), **source_fields}
+        audit.update(source_fields)
+        audit['batches'] = [batch]
+        row['openie_metadata']['triples'].update(
+            source_verified_schema='pathcondrag_fresh_source_verified_openie_v2',
+            semantic_verified=True, complete=True, requires_semantic_verification=False,
+            quality_recovered=recovered, semantic_verifier_contract=VERIFIER_VERSION,
+            semantic_verification_history=[audit], source_no_supported_relations=not triples)
         return audit
 
     def validate(self):
@@ -186,6 +219,105 @@ class FreshIndexValidationTests(unittest.TestCase):
         trace["complete"] = False
         self.json(self.model / "shared_build_execution.json", trace)
         with self.assertRaisesRegex(ValueError, "KNN execution profile"):
+            self.validate()
+
+    def test_strict_normal_extraction_cannot_bypass_source_audit(self):
+        self.profile.update(semantic_scope='all_final_relations',
+                            fresh_recovery_semantic_verifier=VERIFIER_VERSION)
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'Normal initial extraction bypassed'):
+            self.validate()
+
+    def test_strict_ordinary_evidence_audit_passes_without_marking_recovery(self):
+        self.mark_strict()
+        self.write_fixture()
+        report = self.validate()
+        self.assertEqual(report['audited_chunks'], 1)
+        self.assertEqual(report['recovered_chunks'], 0)
+        self.assertEqual(report['accepted_relations_final'], 1)
+
+    def test_strict_accepted_fact_requires_exact_quote_and_offsets(self):
+        audit = self.mark_strict()
+        check = audit['checks'][0]
+        quote = check.pop('quote')
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'no exact source evidence'):
+            self.validate()
+        check['quote'] = quote
+        check['quote_offsets'][0]['start'] += 1
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'offsets mismatch'):
+            self.validate()
+
+    def test_strict_positive_role_evidence_and_subject_coverage_are_recomputed(self):
+        audit = self.mark_strict()
+        audit['checks'][0]['subject_roles'][0]['mention'] = 'Paris'
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'source roles or coverage differ'):
+            self.validate()
+
+    def test_guided_quote_ids_preserve_resolved_exact_source_validation(self):
+        audit = self.mark_strict()
+        for item in [audit, *audit['batches']]:
+            item['source_evidence_quote_id'] = 'span-1'
+            item['checks'][0]['quote_id'] = 'span-1'
+            item['checks'][0]['subject_roles'][0]['relation_quote_id'] = 'span-1'
+        self.write_fixture()
+        self.assertEqual(self.validate()['accepted_relations_final'], 1)
+        audit['checks'][0]['quote_offsets'][0]['start'] += 1
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'offsets mismatch'):
+            self.validate()
+
+    def test_strict_empty_requires_independent_whole_source_verdict(self):
+        passage = 'A heading without a factual assertion'
+        self.rows[0].update(idx=key(passage, 'chunk'), passage=passage,
+                            extracted_entities=[], extracted_triples=[])
+        audit = self.mark_strict()
+        self.write_fixture()
+        self.assertEqual(self.validate()['legitimate_empty_chunks'], 1)
+        audit.pop('batches')
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'no independent evidence batches'):
+            self.validate()
+
+    def test_strict_atomic_empty_focus_requires_matching_independent_audit(self):
+        self.mark_strict(recovered=True)
+        metadata = self.rows[0]['openie_metadata']['triples']
+        metadata['unverified_empty_focuses'] = [[0, 4]]
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'focuses lack independent audits'):
+            self.validate()
+        focus_audit = _base_audit([], [], [], complete=True)
+        focus_audit.update(
+            source_scope='whole_source_with_original_focus',
+            source_relation_verdict_scope='original_focus_only',
+            source_focus={'start': 0, 'end': 4, 'text': self.passage[:4]},
+            source_has_supported_relations=False, source_no_supported_relations=True,
+            source_evidence_quote='Café', source_evidence_quote_offsets=_quote_offsets(self.passage, 'Café'),
+            source_reason='The original focus contains only the heading name.', finish_reason='stop')
+        metadata['atomic_empty_focus_audits'] = [focus_audit]
+        self.write_fixture()
+        self.assertEqual(self.validate()['audited_chunks'], 1)
+        focus_audit['source_focus']['end'] = 5
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'no complete independent no-relation verdict'):
+            self.validate()
+
+    def test_nonempty_focus_cannot_claim_deterministic_whitespace(self):
+        self.mark_strict()
+        metadata = self.rows[0]['openie_metadata']['triples']
+        metadata['unverified_empty_focuses'] = [[0, 4]]
+        focus_audit = _base_audit([], [], [], complete=True)
+        focus_audit.update(
+            source_scope='whole_source_with_original_focus',
+            source_relation_verdict_scope='original_focus_only',
+            source_focus={'start': 0, 'end': 4, 'text': self.passage[:4]},
+            source_has_supported_relations=False, source_no_supported_relations=True,
+            deterministic_empty_focus=True, source_reason='Pretended whitespace.', finish_reason='stop')
+        metadata['atomic_empty_focus_audits'] = [focus_audit]
+        self.write_fixture()
+        with self.assertRaisesRegex(ValueError, 'falsely marked as deterministic whitespace'):
             self.validate()
 
 

@@ -439,6 +439,10 @@ class OpenIE:
                         configured = getattr(getattr(self.llm_model, 'llm_config', None), 'generate_params', {}) or {}
                         kwargs['extra_body'] = dict(configured.get('extra_body') or {})
                         kwargs['extra_body']['guided_json'] = REPAIR_JSON_SCHEMA if repair_context else TRIPLE_JSON_SCHEMA
+                        if getattr(self, 'bounded_structured_output', False):
+                            from ..utils.openie_structured_output import guided_json_parameters
+                            kwargs['extra_body'] = guided_json_parameters(
+                                kwargs['extra_body']['guided_json'], kwargs['extra_body'])
                     attempt_count += 1
                     attempt_settings.append({key: value for key, value in kwargs.items() if key != 'messages'})
                     raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)

@@ -14,6 +14,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from pathcondrag.information_extraction.openie_openai import OpenIE
+from pathcondrag.information_extraction import source_verified_openie as source_module
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput
 from pathcondrag.utils.shared_index_builder import (
     SharedQualityOpenIE, quality_hipporag_class, quality_profile, run_shared_index_cli,
@@ -50,6 +51,7 @@ class SharedIndexBuilderTests(unittest.TestCase):
                          'endpoint': 'http://127.0.0.1:8035/v1', 'region': None},
         }
         runtime.openie_state_path = str(Path(directory) / 'openie_state.json')
+        runtime.openie = SharedQualityOpenIE(SimpleNamespace())
         return runtime
 
     def batch(self, status):
@@ -57,9 +59,17 @@ class SharedIndexBuilderTests(unittest.TestCase):
         metadata = {'finish_reason': 'stop', 'quality_status': status}
         if status in ('failed', 'partial'):
             metadata['openie_skipped'] = True
-        triples = {'chunk': TripleRawOutput('chunk', 'triples raw',
-                                            [] if status in ('failed', 'empty_valid') else [['Alpha', 'is', 'Beta']],
-                                            metadata)}
+        values = [] if status in ('failed', 'empty_valid') else [['Alpha', 'is', 'Beta']]
+        if status in ('success', 'empty_valid'):
+            metadata.update(source_verified_schema=source_module.SOURCE_VERIFIED_VERSION,
+                            semantic_verifier_contract=source_module.VERIFIER_VERSION,
+                            semantic_verified=True, complete=True,
+                            source_no_supported_relations=status == 'empty_valid',
+                            semantic_verification_history=[{
+                                'complete': True, 'n_unverified': 0,
+                                'source_no_supported_relations': status == 'empty_valid',
+                                'checks': [{'triple': value, 'supported': True} for value in values]}])
+        triples = {'chunk': TripleRawOutput('chunk', 'triples raw', values, metadata)}
         return ner, triples
 
     def test_native_identity_and_producer_remain_unchanged_with_explicit_quality_profile(self):
@@ -68,7 +78,8 @@ class SharedIndexBuilderTests(unittest.TestCase):
             provenance = runtime._current_openie_provenance()
             self.assertEqual(provenance['identity'], runtime.native_provenance['identity'])
             self.assertEqual(provenance['producer'], runtime.native_provenance['producer'])
-            self.assertEqual(provenance['quality_profile']['name'], 'pathcondrag_openie_quality_v2')
+            self.assertEqual(provenance['quality_profile']['name'], 'pathcondrag_openie_quality_v3')
+            self.assertEqual(provenance['quality_profile']['semantic_scope'], 'all_final_relations')
             self.assertIn('prompt_sha256', provenance['quality_profile'])
             self.assertEqual(runtime._validate_openie_provenance(provenance, 'state'), provenance)
             provenance['quality_profile']['prompt_sha256'] = 'other prompt'
@@ -98,16 +109,20 @@ class SharedIndexBuilderTests(unittest.TestCase):
                 self.assertTrue(Path(runtime.openie_state_path).is_file())
 
     def test_synthetic_window_completion_keeps_whole_chunk_finish_reason(self):
-        extractor = SharedQualityOpenIE.__new__(SharedQualityOpenIE)
+        extractor = SharedQualityOpenIE(SimpleNamespace())
         metadata = {'finish_reason': 'length', 'quality_status': 'success',
                     'window_recovery_complete': True, 'window_recovery': [{'metadata': {'finish_reason': 'stop'}}]}
         result = TripleRawOutput('chunk', 'window responses', [['Alpha', 'is', 'Beta']], metadata)
-        with patch.object(OpenIE, 'triple_extraction', return_value=result):
+        audit = {'complete': True, 'n_unverified': 0,
+                 'checks': [{'triple': result.triples[0], 'supported': True}]}
+        with patch.object(OpenIE, 'triple_extraction', return_value=result), \
+                patch.object(source_module, 'verify_repaired_triples', return_value=(result.triples, audit)):
             restored = extractor.triple_extraction('chunk', 'long passage', ['Alpha'])
         self.assertEqual(restored.metadata['finish_reason'], 'stop')
         self.assertEqual(restored.metadata['whole_chunk_finish_reason'], 'length')
         self.assertEqual(restored.metadata['finish_source'], 'all_windows_completed')
-        self.assertEqual(restored.response, 'window responses')
+        self.assertEqual(json.loads(restored.response)['extraction_responses'], ['window responses'])
+        self.assertTrue(extractor.is_verified_complete(restored))
 
     def test_constructor_uses_cfg_workers_and_rejects_changed_token_budgets(self):
         with patch.dict(os.environ, {'HIPPO_OPENIE_MAX_WORKERS': '1'}):
@@ -119,8 +134,17 @@ class SharedIndexBuilderTests(unittest.TestCase):
 
     def test_cfg_token_budgets_override_legacy_environment_in_actual_requests(self):
         calls = []
+        source = 'Alpha is Beta.'
+        verdict = {'supported': True, 'quote': source, 'subject_roles': [{
+            'source_subject': 'Alpha', 'mention': 'Alpha', 'relation_quote': source,
+            'relation_supported': True}], 'reason': 'The source explicitly identifies Alpha as Beta.'}
+        for flag in ('relation_supported', 'subject_scope_supported', 'object_scope_supported',
+                     'attribution_supported', 'polarity_and_qualifiers_supported'):
+            verdict[flag] = True
+        evidence = {'source_has_supported_relations': True, 'source_evidence_quote': source,
+                    'source_reason': 'The source contains an explicit relation.', 'verdicts': [verdict]}
         responses = iter(['{"named_entities":["Alpha","Beta"]}',
-                          '{"triples":[["Alpha","is","Beta"]]}'])
+                          '{"triples":[["Alpha","is","Beta"]]}', json.dumps(evidence)])
 
         def infer(**kwargs):
             calls.append(kwargs)
@@ -132,8 +156,27 @@ class SharedIndexBuilderTests(unittest.TestCase):
             extractor = SharedQualityOpenIE(llm)
             ner = extractor.ner('chunk', 'Alpha is Beta.')
             triples = extractor.triple_extraction('chunk', 'Alpha is Beta.', ner.unique_entities)
-        self.assertEqual([call['max_completion_tokens'] for call in calls], [512, 2048])
+        self.assertEqual([call['max_completion_tokens'] for call in calls], [512, 2048, 2048])
         self.assertEqual(triples.metadata['quality_status'], 'success')
+        self.assertTrue(extractor.is_verified_complete(triples))
+
+    def test_ner_retries_keep_512_and_add_validation_feedback(self):
+        calls = []
+        responses = iter([('{"named_entities":["Alpha"]}', {'finish_reason': 'length'}),
+                          ('{"named_entities":["Alpha"]}', {'finish_reason': 'stop'})])
+
+        def infer(**kwargs):
+            calls.append(copy.deepcopy(kwargs))
+            response, metadata = next(responses)
+            return response, metadata, False
+
+        extractor = SharedQualityOpenIE(SimpleNamespace(infer=infer))
+        ner = extractor.ner('chunk', 'Alpha is Beta.')
+        self.assertEqual(ner.unique_entities, ['Alpha'])
+        self.assertEqual([call['max_completion_tokens'] for call in calls], [512, 512])
+        self.assertNotEqual(calls[0]['messages'], calls[1]['messages'])
+        self.assertTrue(all(call['extra_body']['chat_template_kwargs']['enable_thinking'] is False
+                            for call in calls))
 
     def test_runpy_forwards_cli_and_restores_baseline_symbols_even_on_exit(self):
         with tempfile.TemporaryDirectory() as tmp:

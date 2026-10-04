@@ -7,3 +7,6 @@ name = "PathCondRAG"
 version = "0.1.0"
 description = "PathCondRAG: path-conditioned query decomposition for multi-hop RAG (PC3 + optional MPCE)"
 requires-python = ">=3.9"
+
+[project.optional-dependencies]
+index-quality = ["xgrammar==0.1.18"]

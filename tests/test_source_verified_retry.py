@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from pathcondrag.information_extraction.openie_openai import OpenIE
 from pathcondrag.information_extraction import source_verified_openie as module
 from pathcondrag.utils.misc_utils import TripleRawOutput
+from pathcondrag.utils.openie_semantic_validation import verify_repaired_triples as boolean_verifier
 
 
 class FakeLLM:
@@ -33,7 +34,12 @@ class IncompleteCompactRetryTests(unittest.TestCase):
     def call(self, recovery, responses=()):
         llm = FakeLLM(responses)
         initial = extraction([], quality_status='failed', openie_skipped=True)
-        with patch.object(OpenIE, 'triple_extraction', return_value=initial):
+        with patch.object(OpenIE, 'triple_extraction', return_value=initial), \
+                patch.object(module, 'verify_repaired_triples',
+                             side_effect=lambda llm, passage, values, **kwargs:
+                             boolean_verifier(llm, passage, values)), \
+                patch('pathcondrag.utils.openie_atomic_recovery.atomic_recovery',
+                      return_value=extraction([], complete=False, openie_skipped=True)):
             with patch.object(module, 'compact_recovery', side_effect=recovery) as fallback:
                 output = module.SourceVerifiedOpenIE(llm).triple_extraction(
                     'chunk', 'Ada and Bo are characters in Show C.', ['Ada', 'Bo', 'Show C'])
@@ -54,7 +60,7 @@ class IncompleteCompactRetryTests(unittest.TestCase):
         self.assertEqual(llm.calls[0]['max_completion_tokens'], 2048)
         self.assertFalse(llm.calls[0]['extra_body']['chat_template_kwargs']['enable_thinking'])
 
-    def test_second_incomplete_pass_stops_without_publishing_partial_candidates(self):
+    def test_second_incomplete_pass_uses_atomic_then_stops_without_publishing_partial_candidates(self):
         partial = extraction([['Ada', 'is parent of', 'Bo']], complete=False,
                              openie_skipped=True, quality_status='partial')
         output, fallback, llm = self.call([partial, partial])
@@ -62,7 +68,8 @@ class IncompleteCompactRetryTests(unittest.TestCase):
         self.assertEqual(output.triples, [])
         self.assertTrue(output.metadata['openie_skipped'])
         self.assertFalse(output.metadata['complete'])
-        self.assertEqual(len(output.metadata['fresh_extraction_history']), 3)
+        self.assertEqual(len(output.metadata['fresh_extraction_history']), 4)
+        self.assertEqual(output.metadata['fresh_extraction_history'][-1]['stage'], 'atomic')
         self.assertEqual(llm.calls, [])
 
     def test_first_complete_pass_does_not_add_a_second_request(self):
