@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from . import improvement_experiments as experiments
 from .common import read_json, write_json
+from pathcondrag.index.publication_policy import parse_bool
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = ROOT / 'outputs/pathcondrag_new_index_10_4'
@@ -151,11 +152,13 @@ def initialize_linked_case(out, name):
 
 
 def commands(args, out, datasets):
+    extraction_options = ['--openie_strict', str(getattr(args, 'openie_strict', True)).lower(),
+                          '--openie_prompt_version', getattr(args, 'openie_prompt_version', 'optimized')]
     common = ['--dataset', 'musique', '--sample_size', '2' if args.smoke else '0',
               '--sample_seed', '42', '--sample_indices_file', str(out / 'selected_indices.json'),
               '--llm_name', 'qwen3-8b', '--llm_base_url', args.llm_base_url,
               '--embedding_batch_size', '4', '--openie_max_workers', '8', '--llm_prefetch_workers', '8']
-    builder = [args.python, '-B', '-u', str(ROOT / 'scripts/build_shared_index.py')] + common + [
+    builder = [args.python, '-B', '-u', str(ROOT / 'scripts/build_shared_index.py')] + common + extraction_options + [
         '--datasets_dir', str(datasets), '--rag_type', 'hipporag',
         '--embedding_name', experiments.EMBEDDING_MODEL, '--embedding_provider', 'transformers',
         '--openie_mode', 'online', '--eval_mode', 'index_only',
@@ -173,7 +176,7 @@ def commands(args, out, datasets):
                 '--embedding_name', experiments.EMBEDDING_MODEL, '--embedding_provider', 'transformers',
                 '--save_dir_exact']
         else:
-            command = [args.python, '-B', '-u', str(ROOT / 'scripts/eval_dataset.py')] + retrieval + PC_ARGUMENTS + [
+            command = [args.python, '-B', '-u', str(ROOT / 'scripts/eval_dataset.py')] + retrieval + PC_ARGUMENTS + extraction_options + [
                 '--data_path', str(datasets / 'musique.json'), '--corpus_path', str(datasets / 'musique_corpus.json'),
                 '--corpus_mode', 'full', '--qa_top_k', '5', '--max_qa_steps', '1', '--max_new_tokens', '2048',
                 '--embedding_model_name', experiments.EMBEDDING_MODEL,
@@ -210,19 +213,21 @@ def run(args):
         elapsed = execute(builder, out / 'logs/index_build.log', env)
         from .fresh_index_validation import validate_fresh_index
         _, documents, _ = experiments.validated_dataset(prepare.data_path, prepare.corpus_path)
-        validate_fresh_index(out, out / 'shared_hipporag2_index', documents)
+        validate_fresh_index(out, out / 'shared_hipporag2_index', documents, strict=args.openie_strict)
         experiments.freeze_index(SimpleNamespace(out_root=str(out), elapsed=elapsed, vllm_log=str(server_log),
-                                                log_start=log_start, log_end=server_log.stat().st_size))
+                                                log_start=log_start, log_end=server_log.stat().st_size,
+                                                openie_strict=args.openie_strict))
     else:
         from .fresh_index_validation import validate_fresh_index
         _, documents, _ = experiments.validated_dataset(prepare.data_path, prepare.corpus_path)
-        validate_fresh_index(out, out / 'shared_hipporag2_index', documents)
+        validate_fresh_index(out, out / 'shared_hipporag2_index', documents, strict=args.openie_strict)
     source = out / 'shared_hipporag2_index'
     frozen = all_hashes(source)
     write_json(out / 'fresh_index_identity.json', {'builder': str(ROOT / 'scripts/build_shared_index.py'),
                'fresh_corpus': str(datasets / 'musique_corpus.json'), 'asset_sha256': frozen,
                'baseline_code_sha256': before_code, 'embedding_batch_size': 4, 'llm_workers': 8,
-               'thinking': False, 'triple_max_tokens': 2048, 'smoke': args.smoke})
+               'thinking': False, 'triple_max_tokens': 2048, 'smoke': args.smoke,
+               'openie_strict': args.openie_strict, 'openie_prompt_version': args.openie_prompt_version})
     for name in CASES:
         case_args = SimpleNamespace(out_root=str(out), name=name)
         if experiments.ready(case_args) == 0:
@@ -250,6 +255,9 @@ def main(argv=None):
     parser.add_argument('--llm-base-url', default='http://127.0.0.1:8035/v1')
     parser.add_argument('--vllm-log', default='/root/eval/logs/vllm_qwen3.log')
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--openie_strict', '--openie-strict', type=parse_bool, default=True)
+    parser.add_argument('--openie_prompt_version', '--openie-prompt-version',
+                        choices=['origin', 'optimized'], default='optimized')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     run(args)

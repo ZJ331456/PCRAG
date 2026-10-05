@@ -36,6 +36,9 @@ class SourceVerifiedOpenIE(SourceVerifiedNERMixin, OpenIE):
         self.initial_rows = {}
         self.checkpoint = None
         self.bounded_structured_output = True
+        # Prevent wrong task keys/four-field tuples before an expensive recovery.
+        # Semantic checks still audit every relation; grammar proves only shape.
+        self.structured_initial_triples = True
 
     @staticmethod
     def is_verified_complete(result):

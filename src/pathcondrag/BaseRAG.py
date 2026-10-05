@@ -135,6 +135,7 @@ class BaseRAG:
                 llm_model=self.llm_model,
                 max_workers=8 if openie_workers is None else openie_workers,
                 respect_env_workers=openie_workers is None,
+                prompt_version=self.global_config.openie_prompt_version,
             )
         elif self.global_config.openie_mode == 'offline':
             from .index.openie.openie_vllm_offline import VLLMOfflineOpenIE
@@ -356,7 +357,9 @@ class BaseRAG:
                 'seed': self.global_config.seed,
                 'ner_max_tokens': 512,
                 'triple_max_tokens': 2048,
-                'quality_profile': quality_profile(),
+                'quality_profile': quality_profile(
+                    strict=getattr(self.global_config, 'openie_strict', True),
+                    prompt_version=getattr(self.global_config, 'openie_prompt_version', 'optimized')),
                 'corpus_ids_sha256': corpus_digest,
             })
             all_openie_info[:] = progress.overlay(all_openie_info, chunk_to_rows)
@@ -401,7 +404,14 @@ class BaseRAG:
                 verified = openie_row_is_verified_complete(self.openie, row)
                 if not verified and row['idx'] not in incomplete_rows:
                     incomplete_rows.append(row['idx'])
-        if incomplete_rows:
+        from .index.publication_policy import apply_publication_policy
+        strict = getattr(self.global_config, 'openie_strict', True)
+        report = apply_publication_policy(
+            all_openie_info, incomplete_rows, strict=strict,
+            report_path=os.path.join(self.working_dir, 'openie_publication_report.json'))
+        self._openie_file_metadata = getattr(self, '_openie_file_metadata', {})
+        self._openie_file_metadata['publication_report'] = report
+        if incomplete_rows and strict:
             # Diagnostic checkpoints are saved even when save_openie=False.
             # A partial graph must never be published as a completed index.
             self.save_openie_results(all_openie_info)
@@ -410,6 +420,11 @@ class BaseRAG:
                 f'{self.openie_results_path}. No graph or entity/fact vectors were published. '
                 f'First chunks: {incomplete_rows[:5]}'
             )
+        if incomplete_rows:
+            logger.warning('openie_strict=False: continuing with %d failed chunks; '
+                           'their relations are excluded from the graph. First chunks: %s',
+                           len(incomplete_rows), incomplete_rows[:5])
+            self.save_openie_results(all_openie_info)
 
         ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
 

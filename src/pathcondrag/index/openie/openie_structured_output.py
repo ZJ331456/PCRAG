@@ -11,7 +11,7 @@ import hashlib
 import json
 
 
-STRUCTURED_OUTPUT_VERSION = 'pathcondrag_compact_json_portable_ebnf_v2'
+STRUCTURED_OUTPUT_VERSION = 'pathcondrag_compact_json_portable_ebnf_v3_exact_arrays'
 
 
 class StructuredOutputDependencyError(RuntimeError):
@@ -110,8 +110,10 @@ def _compile_grammar(serialized_schema):
             'No guided_json or unrestricted-whitespace fallback is permitted.'
         ) from error
     try:
+        schema = _fixed_array_schema(json.loads(serialized_schema))
         grammar = xgrammar.Grammar.from_json_schema(
-            serialized_schema, any_whitespace=False, indent=None,
+            json.dumps(schema, ensure_ascii=False, separators=(',', ':'), allow_nan=False),
+            any_whitespace=False, indent=None,
             separators=(',', ':'), strict_mode=True,
         )
         result = _strip_positive_lookaheads(str(grammar))
@@ -129,6 +131,28 @@ def _compile_grammar(serialized_schema):
         ) from error
     if not result.strip():
         raise StructuredOutputSchemaError('Xgrammar returned an empty strict OpenIE grammar')
+    return result
+
+
+def _fixed_array_schema(value):
+    """Express homogeneous fixed-length arrays as exact positional items.
+
+    Xgrammar 0.1.18 silently ignores minItems/maxItems on homogeneous arrays.
+    The equivalent prefixItems form really constrains three-field triples;
+    this only changes grammar compilation, not the public validation schema.
+    """
+    if isinstance(value, list):
+        return [_fixed_array_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: _fixed_array_schema(item) for key, item in value.items()}
+    count = result.get('minItems')
+    if (result.get('type') == 'array' and isinstance(count, int)
+            and not isinstance(count, bool) and count >= 0
+            and result.get('maxItems') == count
+            and isinstance(result.get('items'), dict) and 'prefixItems' not in result):
+        result['prefixItems'] = [copy.deepcopy(result['items']) for _ in range(count)]
+        result['items'] = False
     return result
 
 

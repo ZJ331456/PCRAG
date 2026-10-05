@@ -1,4 +1,5 @@
 import os
+import copy
 import asyncio
 import importlib.util
 from string import Template
@@ -76,7 +77,9 @@ class PromptTemplateManager:
                         logger.error(f"Module '{module_name}' does not define a 'prompt_template'.")
                         raise AttributeError(f"Module '{module_name}' does not define a 'prompt_template'.")
 
-                    prompt_template = module.prompt_template
+                    # Provider-specific role mapping must not mutate the shared
+                    # module or the preserved origin templates in another manager.
+                    prompt_template = copy.deepcopy(module.prompt_template)
                     logger.debug(f"Loaded template from {module_name}")
                     
                     if isinstance(prompt_template, Template):

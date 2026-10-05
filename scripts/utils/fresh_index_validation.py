@@ -231,13 +231,13 @@ def _audit_counts(metadata, triples, chunk_id, passage=None, *, evidence_require
     return counts
 
 
-def _validated_rows(rows, docs, quality_profile):
+def _validated_rows(rows, docs, quality_profile, *, strict=True):
     _require(isinstance(rows, list) and len(rows) == len(docs), "Fresh OpenIE coverage mismatch")
     entities, facts, chunks, passages = set(), set(), set(), set()
     counts = {"empty_chunks": 0, "legitimate_empty_chunks": 0, "recovered_chunks": 0,
               "audited_chunks": 0, "verification_passes": 0,
               "accepted_relations_final": 0, "accepted_assertions_across_passes": 0,
-              "rejected_assertions_across_passes": 0}
+              "rejected_assertions_across_passes": 0, "failed_chunks_excluded_from_graph": 0}
     strict_scope = quality_profile.get('semantic_scope') == 'all_final_relations'
     if quality_profile.get('name') == 'pathcondrag_openie_quality_v3':
         _require(strict_scope, 'A v3 fresh index must audit all final relations')
@@ -257,6 +257,22 @@ def _validated_rows(rows, docs, quality_profile):
                  f"Invalid fresh NER entities: {chunk_id}")
         metadata = row.get("openie_metadata")
         _require(isinstance(metadata, dict), f"Missing fresh extraction metadata: {chunk_id}")
+        publication = metadata.get('publication') or {}
+        if not strict and publication.get('skipped_from_graph') is True:
+            _require(quality_profile.get('openie_strict') is False
+                     and publication.get('openie_strict') is False
+                     and row.get('extracted_triples') == [],
+                     f'Tolerated extraction was not excluded from graph inputs: {chunk_id}')
+            _require(any((metadata.get(stage) or {}).get('quality_status') in ('failed', 'partial', 'pending')
+                         or (metadata.get(stage) or {}).get('error')
+                         or (metadata.get(stage) or {}).get('complete') is False
+                         or (metadata.get(stage) or {}).get('finish_reason') != 'stop'
+                         for stage in ('ner', 'triples'))
+                     or (metadata.get('triples') or {}).get('semantic_verified') is not True,
+                     f'Tolerated row lacks original failure diagnostics: {chunk_id}')
+            counts['failed_chunks_excluded_from_graph'] += 1
+            counts['empty_chunks'] += 1
+            continue
         for stage in ("ner", "triples"):
             stage_metadata = metadata.get(stage)
             _require(isinstance(stage_metadata, dict) and stage_metadata.get("finish_reason") == "stop"
@@ -342,7 +358,7 @@ def _validate_vectors(directory, namespace, needed):
     return ids, {"count": len(ids), "dimension": 4096, "finite": True, "normalized": True}
 
 
-def validate_fresh_index(out, index, docs):
+def validate_fresh_index(out, index, docs, *, strict=True):
     """Validate fresh artifacts and write OUT/fresh_index_validation.json."""
     import igraph as ig
 
@@ -364,7 +380,10 @@ def validate_fresh_index(out, index, docs):
     _require(isinstance(profile, dict)
              and str(profile.get("extractor", "")).endswith(".SourceVerifiedOpenIE"),
              "Fresh index was not built with source-verified PathCondRAG extraction")
-    needed, chunks, counts = _validated_rows(state.get("docs"), docs, profile)
+    if not strict:
+        _require(profile.get('openie_strict') is False,
+                 'Tolerant validation requires an explicit tolerant publication contract')
+    needed, chunks, counts = _validated_rows(state.get("docs"), docs, profile, strict=strict)
     vector_ids, vector_reports = {}, {}
     for namespace in ("chunk", "entity", "fact"):
         vector_ids[namespace], vector_reports[namespace] = _validate_vectors(
@@ -392,6 +411,7 @@ def validate_fresh_index(out, index, docs):
                  and trace.get("complete") is True,
                  "Observed shared KNN execution profile is inconsistent")
     report = {"complete": True, "index": str(index), "indexed_docs": len(docs),
+              "openie_strict": strict,
               "model_dir": directory.name, "invalid_records": 0,
               "quality_profile": profile, "vectors": vector_reports,
               "graph_nodes": graph.vcount(), "graph_edges": graph.ecount(),

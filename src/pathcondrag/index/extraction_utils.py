@@ -14,6 +14,13 @@ _LENGTH_RETRY_FREQUENCY_PENALTIES = (0.2, 0.5)
 _DEFAULT_QUALITY_MAX_RETRIES = 5
 
 
+def resolve_prompt_version(value='optimized'):
+    """Validate an explicit extraction prompt choice, independent of cache state."""
+    if value not in ('origin', 'optimized'):
+        raise ValueError('openie_prompt_version must be origin or optimized')
+    return value
+
+
 
 def _safe_env_int(name: str, default: int | None = None) -> int | None:
     raw = os.environ.get(name, "").strip()

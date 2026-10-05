@@ -18,6 +18,7 @@ from ..extraction_utils import (
     _LENGTH_RETRY_FREQUENCY_PENALTIES, _safe_env_int, _base_generate_seed,
     _length_retry_seed, _resolve_quality_max_retries,
     _extract_json_list_field, _extract_ner_from_response,
+    resolve_prompt_version,
 )
 
 logger = get_logger(__name__)
@@ -38,10 +39,11 @@ class LLMInput:
 
 class OpenIE(OpenAINERMixin):
     def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, respect_env_workers: bool = True,
-                 quality_max_retries=None, guided_recovery: bool = False):
+                 quality_max_retries=None, guided_recovery: bool = False,
+                 prompt_version: str = 'optimized'):
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1.")
-        self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
+        self._configure_prompts(prompt_version)
         self.llm_model = llm_model
         self.max_workers = max_workers
         self.respect_env_workers = respect_env_workers
@@ -49,6 +51,13 @@ class OpenIE(OpenAINERMixin):
         # Optional vLLM 0.8.x guided_json is used only for error recovery. The
         # client continues to enforce enable_thinking=False for Qwen3.
         self.guided_recovery = guided_recovery
+
+    def _configure_prompts(self, prompt_version='optimized'):
+        self.prompt_template_manager = PromptTemplateManager()
+        self.prompt_version = resolve_prompt_version(prompt_version)
+        if self.prompt_version == 'origin':
+            for name in ('ner', 'triple_extraction'):
+                self.prompt_template_manager.templates[name] = self.prompt_template_manager.get_template('origin_' + name + '_prompt')
 
     def worker_limits(self) -> Tuple[int, int]:
         """Resolve NER/triple limits; explicit config takes priority over legacy env."""
@@ -265,7 +274,8 @@ class OpenIE(OpenAINERMixin):
                         penalties.append(penalty)
                     if attempt:
                         length_retry_count += 1
-                    if (last_error or repair_context) and getattr(self, 'guided_recovery', False):
+                    if ((last_error or repair_context or getattr(self, 'structured_initial_triples', False))
+                            and getattr(self, 'guided_recovery', False)):
                         configured = getattr(getattr(self.llm_model, 'llm_config', None), 'generate_params', {}) or {}
                         kwargs['extra_body'] = dict(configured.get('extra_body') or {})
                         kwargs['extra_body']['guided_json'] = REPAIR_JSON_SCHEMA if repair_context else TRIPLE_JSON_SCHEMA

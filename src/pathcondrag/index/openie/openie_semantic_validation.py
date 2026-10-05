@@ -38,14 +38,21 @@ def _qwen_tokenizer():
     return AutoTokenizer.from_pretrained('/root/models/Qwen3-8B', local_files_only=True)
 
 
+@lru_cache(maxsize=512)
+def _qwen_prompt_length(serialized_messages):
+    """Reuse exact token counts for the preflight and the identical real request."""
+    tokens = _qwen_tokenizer().apply_chat_template(
+        json.loads(serialized_messages), tokenize=True, add_generation_prompt=True,
+        enable_thinking=False)
+    return len(tokens)
+
+
 def _prompt_tokens(llm, messages):
     counter = getattr(llm, 'count_prompt_tokens', None)
     if callable(counter):
         return counter(messages)
     if str(getattr(llm, 'llm_name', '')).lower() == 'qwen3-8b':
-        tokens = _qwen_tokenizer().apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, enable_thinking=False)
-        return len(tokens)
+        return _qwen_prompt_length(json.dumps(messages, ensure_ascii=False, separators=(',', ':')))
     # Minimal test doubles have no tokenizer/model identity. Actual Qwen
     # clients always take the exact local-tokenizer branch above.
     return None

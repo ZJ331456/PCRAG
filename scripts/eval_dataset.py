@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(PCRAG_ROOT, "src"))
 
 from pathcondrag import PathCondRAG, PathCondRAGConfig, PCRAG, PCRAGConfig
 from pathcondrag.evaluation.result_export import detailed_result
+from pathcondrag.index.publication_policy import parse_bool
 from eval_utils import (
     build_docs_from_full_corpus,
     build_docs_from_samples,
@@ -168,6 +169,8 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         max_qa_steps=int(args.max_qa_steps),
         embedding_batch_size=int(args.embedding_batch_size),
         openie_max_workers=getattr(args, "openie_max_workers", None),
+        openie_strict=getattr(args, "openie_strict", True),
+        openie_prompt_version=getattr(args, "openie_prompt_version", "optimized"),
         llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 8)),
         improvement_stage=int(getattr(args, "improvement_stage", 0)),
         evidence_ablation_mode=getattr(args, "evidence_ablation_mode", "normal"),
@@ -550,6 +553,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_qa_steps", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--embedding_batch_size", type=int, default=2)
+    parser.add_argument("--openie_strict", type=parse_bool, default=True,
+                        help="true aborts on final extraction failure; false excludes failed relations and continues.")
+    parser.add_argument("--openie_prompt_version", choices=["origin", "optimized"], default="optimized")
     parser.add_argument("--openie_max_workers", type=_openie_worker_count, default=None,
                         help="Online indexing NER/triple concurrency (1..8). Explicit values override all HIPPO_OPENIE_* worker env settings; omitted uses env or 8. HTTP ceiling still applies.")
     parser.add_argument("--llm_prefetch_workers", type=int, default=8,

@@ -58,6 +58,21 @@ class StructuredOutputTests(unittest.TestCase):
             self.assertFalse(self.accepts(grammar, valid[:1] + whitespace + valid[1:]))
             self.assertFalse(self.accepts(grammar, valid + whitespace))
 
+    def test_nested_triples_really_require_exactly_three_fields(self):
+        schema = {'type': 'object', 'properties': {'triples': {
+            'type': 'array', 'items': {'type': 'array',
+                'items': {'type': 'string', 'minLength': 1},
+                'minItems': 3, 'maxItems': 3}}},
+            'required': ['triples'], 'additionalProperties': False}
+        original = copy.deepcopy(schema)
+        grammar = self.xgrammar.Grammar.from_ebnf(
+            structured.guided_json_parameters(schema)['guided_grammar'])
+        for count in (0, 1, 2, 3, 4, 5):
+            output = json.dumps({'triples': [list('ABCDE'[:count])]}, separators=(',', ':'))
+            self.assertEqual(self.accepts(grammar, output), count == 3, count)
+        self.assertTrue(self.accepts(grammar, '{"triples":[]}'))
+        self.assertEqual(schema, original)
+
     def test_strings_preserve_spaces_and_unicode(self):
         grammar = self.grammar()
         for value in ('classical theater', 'Alpha' + ' ' * 2048 + 'Beta',

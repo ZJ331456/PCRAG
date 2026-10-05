@@ -507,6 +507,7 @@ def _verify_batch(llm, source, triples, retry_context='', focus=None):
             messages = _messages(source, triples, retry_context, focus) + [
                 {'role': 'assistant', 'content': diagnostic},
                 {'role': 'user', 'content': (
+                    f'Evidence repair attempt {index + 2}/{MAX_SHAPE_REPAIRS + 1}. '
                     f'The evidence audit was incomplete/invalid: {message}\n'
                     'Recheck the unchanged SOURCE and original candidates. Return the entire required JSON. '
                     'Copy real original quote substrings; the subject role mention must occur in its '

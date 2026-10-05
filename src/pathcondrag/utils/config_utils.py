@@ -118,6 +118,11 @@ class BaseConfig:
         default=None,
         metadata={"help": "Online NER/triple workers (1..8). None preserves legacy HIPPO_OPENIE_* worker settings, with fallback 8."}
     )
+    openie_strict: bool = field(
+        default=True,
+        metadata={"help": "Abort publication on any unresolved OpenIE chunk; False skips its relations and continues."}
+    )
+    openie_prompt_version: Literal['origin', 'optimized'] = field(default='optimized')
     skip_graph: bool = field(
         default=False,
         metadata={"help": "Whether to skip graph construction or not. Set it to be true when running vllm offline indexing for the first time."}
@@ -229,6 +234,10 @@ class BaseConfig:
     
     
     def __post_init__(self):
+        if not isinstance(self.openie_strict, bool):
+            raise ValueError('openie_strict must be a bool')
+        if self.openie_prompt_version not in ('origin', 'optimized'):
+            raise ValueError('openie_prompt_version must be origin or optimized')
         if self.openie_max_workers is not None and (
             isinstance(self.openie_max_workers, bool)
             or not isinstance(self.openie_max_workers, int)

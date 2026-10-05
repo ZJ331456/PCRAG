@@ -242,6 +242,7 @@ def index_ready(args):
 
 
 def freeze_index(args):
+    strict = getattr(args, 'openie_strict', True)
     root, manifest = Path(args.out_root).resolve(), manifest_at(args.out_root)
     require(manifest.get("index_build_mode") == "fresh", "freeze-index requires fresh build mode")
     if manifest.get("index_build_status") == "ready":
@@ -263,7 +264,11 @@ def freeze_index(args):
             "index_only did not report successful index completion")
     require(result.get("indexed_docs") == len(docs) and result.get("openie_document_count") == len(docs),
             "fresh index/OpenIE document coverage is incomplete")
-    require(result.get("openie_failure_count") == 0, "fresh OpenIE has failed documents")
+    if strict:
+        require(result.get("openie_failure_count") == 0, "fresh OpenIE has failed documents")
+    else:
+        require((result.get('runtime_config') or {}).get('openie_strict') is False,
+                'Tolerant freezing requires an explicit tolerant build report')
     openie_path = source / "openie_results_ner_qwen3-8b.json"
     openie_rows = read_json(openie_path).get("docs")
     require(isinstance(openie_rows, list) and len(openie_rows) == len(docs),
@@ -277,6 +282,11 @@ def freeze_index(args):
         require(isinstance(row.get("extracted_entities"), list)
                 and isinstance(row.get("extracted_triples"), list), "fresh OpenIE extraction output is invalid")
         metadata = row.get("openie_metadata") or {}
+        publication = metadata.get('publication') or {}
+        if not strict and publication.get('skipped_from_graph') is True:
+            require(publication.get('openie_strict') is False and row['extracted_triples'] == [],
+                    'Tolerated failed extraction retained graph facts')
+            continue
         for stage in ("ner", "triples"):
             stage_meta = metadata.get(stage) or {}
             finished_ok = (
@@ -285,6 +295,11 @@ def freeze_index(args):
                 and stage_meta.get("quality_status") not in ("failed", "partial")
             )
             require(finished_ok, f"fresh OpenIE {stage} did not finish successfully: {row['idx']}")
+    if not strict:
+        excluded = sum(((row.get('openie_metadata') or {}).get('publication') or {}).get('skipped_from_graph') is True
+                       for row in openie_rows)
+        require(result.get('openie_failure_count') == excluded,
+                'Tolerant build failure count differs from explicitly excluded chunks')
     config = result.get("runtime_config") or {}
     for key in ("embedding_model_name", "llm_name", "embedding_batch_size", "openie_max_workers",
                 "llm_prefetch_workers", "max_new_tokens"):
@@ -293,13 +308,13 @@ def freeze_index(args):
             "fresh index must rebuild both graph and OpenIE")
     require(config.get("openie_mode") == "online", "fresh OpenIE must use online LLM extraction")
     stats = result.get("llm_request_stats") or {}
-    require(stats.get("failures") == 0 and stats.get("max_in_flight") == 8,
+    require((not strict or stats.get("failures") == 0) and stats.get("max_in_flight") == 8,
             "fresh indexing LLM failures/concurrency mismatch")
     require(isinstance(stats.get("http_attempts"), int) and stats["http_attempts"] > 0,
             "fresh OpenIE build did not make actual LLM HTTP requests")
     require(args.log_start >= 0 and args.log_end >= args.log_start, "vLLM index-build log rotated/truncated")
     status = http_status_counts(args.vllm_log, args.log_start, args.log_end)
-    require(bool(status) and not any(code != "200" for code in status),
+    require(bool(status) and (not strict or not any(code != "200" for code in status)),
             f"fresh indexing missing statuses or non-200 HTTP responses: {status}")
     hashes = asset_hashes(source, manifest["model_dir"])
     require((source / "llm_cache").is_dir(), "fresh indexing LLM cache is missing")
@@ -311,7 +326,8 @@ def freeze_index(args):
     require(cache_hashes(snapshot) == current_cache, "fresh LLM cache changed during freeze")
     output = {
         "validated": True, "index_build_mode": "fresh", "indexed_docs": len(docs),
-        "openie_document_count": result["openie_document_count"], "openie_failure_count": 0,
+        "openie_document_count": result["openie_document_count"],
+        "openie_failure_count": result.get('openie_failure_count', 0), 'openie_strict': strict,
         "seconds": args.elapsed, "runtime_config": config, "llm_request_stats": stats,
         "http_status_in_log": status, "source_asset_sha256": hashes,
         "initial_cache_sha256": current_cache,

@@ -25,29 +25,40 @@ from .openie.openie_compact_recovery import RECOVERY_VERSION
 from .openie.openie_source_evidence import VERIFIER_VERSION
 from .openie_checkpoint import OpenIECheckpoint
 from .openie_build_queue import openie_row_is_verified_complete
-from ..prompts.templates.triple_extraction import prompt_template
 from ..utils.misc_utils import openie_row_needs_retry
 from .openie.openie_quality import TRIPLE_JSON_SCHEMA, validate_triples
+from .publication_policy import (
+    apply_publication_policy, parse_bool, STRICT_FAILURE_POLICY, LENIENT_FAILURE_POLICY,
+)
+from .extraction_utils import resolve_prompt_version
 
 
 QUALITY_SCHEMA = 'pathcondrag_openie_quality_v3'
 LOG = logging.getLogger(__name__)
 
 
-def quality_profile(*, legacy=False):
+def quality_profile(*, strict=True, prompt_version='optimized', legacy=False):
     """Identity of the extra extraction contract, independent of native config."""
     digest = lambda value: hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')
     ).hexdigest()
+    prompt_version = 'origin' if legacy else resolve_prompt_version(prompt_version)
+    if prompt_version == 'origin':
+        from ..prompts.templates.origin_triple_extraction_prompt import prompt_template as selected_triples
+        from ..prompts.templates.origin_ner_prompt import prompt_template as selected_ner
+    else:
+        from ..prompts.templates.triple_extraction import prompt_template as selected_triples
+        from ..prompts.templates.ner import prompt_template as selected_ner
+    serialize = lambda template: [
+        {'role': row['role'], 'content': row['content'].template
+         if isinstance(row['content'], Template) else row['content']}
+        for row in template
+    ]
     result = {
         'schema_version': 2 if legacy else 3,
         'name': 'pathcondrag_openie_quality_v2' if legacy else QUALITY_SCHEMA,
         'prompt_schema': 'pathcondrag_source_grounded_triples_v2',
-        'prompt_sha256': digest([
-            {'role': row['role'], 'content': row['content'].template
-             if isinstance(row['content'], Template) else row['content']}
-            for row in prompt_template
-        ]),
+        'prompt_sha256': digest(serialize(selected_triples)),
         'triple_json_schema_sha256': digest(TRIPLE_JSON_SCHEMA),
         # Stable producer label shared with existing index manifests.
         'extractor': 'pathcondrag.information_extraction.source_verified_openie.SourceVerifiedOpenIE',
@@ -56,12 +67,18 @@ def quality_profile(*, legacy=False):
         'fresh_recovery': RECOVERY_VERSION,
         'fresh_recovery_semantic_verifier': 'pathcondrag_source_only_entailment_v1' if legacy else VERIFIER_VERSION,
         'semantic_scope': 'fresh_recovered_and_empty_only' if legacy else 'all_final_relations',
-        'failure_policy': 'checkpoint_then_abort_before_graph_publication',
+        'failure_policy': STRICT_FAILURE_POLICY,
         'ner_max_tokens': 512,
         'triple_max_tokens': 2048,
         'native_identity_scope': 'baseline_configuration_compatibility',
     }
     if not legacy:
+        from .ner.source_verified import NER_RECOVERY_VERSION
+        result.update(prompt_version=prompt_version,
+                      ner_prompt_sha256=digest(serialize(selected_ner)),
+                      structured_initial_triples=True,
+                      ner_recovery=NER_RECOVERY_VERSION,
+                      retry_feedback='attempt_scoped_v1')
         from .openie import openie_source_evidence as evidence
         from .openie import openie_atomic_recovery as atomic
         from .openie_build_queue import QUEUE_VERSION
@@ -74,6 +91,8 @@ def quality_profile(*, legacy=False):
                       evidence_prompt_sha256=digest(evidence.SYSTEM),
                       atomic_prompt_sha256=digest(atomic.SYSTEM),
                       atomic_schema_sha256=digest(atomic.SCHEMA))
+        if not strict:
+            result.update(openie_strict=False, failure_policy=LENIENT_FAILURE_POLICY)
     return result
 
 
@@ -102,10 +121,13 @@ class SharedQualityOpenIE(SourceVerifiedOpenIE):
         return result
 
 
-def quality_hipporag_class(native_class):
+def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='optimized'):
     """Create a runtime adapter without changing files in the baseline repo."""
 
     class QualitySharedHippoRAG(native_class):
+        def _quality_profile(self, *, legacy=False):
+            return quality_profile(strict=openie_strict, prompt_version=prompt_version, legacy=legacy)
+
         def _prepare_openie_progress(self, rows, chunks):
             progress = OpenIECheckpoint(Path(self.working_dir) / 'openie_progress.sqlite', {
                 'provenance': self._current_openie_provenance(),
@@ -121,7 +143,7 @@ def quality_hipporag_class(native_class):
         def _openie_provenance_for_manifest(self):
             if getattr(self, '_legacy_quality_manifest_probe', False):
                 provenance = copy.deepcopy(self._current_openie_provenance())
-                provenance['quality_profile'] = quality_profile(legacy=True)
+                provenance['quality_profile'] = self._quality_profile(legacy=True)
                 return provenance
             return super()._openie_provenance_for_manifest()
 
@@ -132,7 +154,7 @@ def quality_hipporag_class(native_class):
                     and self.global_config.force_openie_from_scratch):
                 stored = json.loads(path.read_text())
                 old_profile = (stored.get('openie') or {}).get('quality_profile')
-                if old_profile == quality_profile(legacy=True):
+                if old_profile == self._quality_profile(legacy=True):
                     source_path = next((Path(candidate) for candidate in (
                         getattr(self, 'openie_state_path', None), getattr(self, 'openie_results_path', None))
                         if candidate and Path(candidate).is_file()), None)
@@ -256,7 +278,7 @@ def quality_hipporag_class(native_class):
                 'pending_chunk_ids': pending, 'reextract_count': len(pending),
                 'explicit_resume_permission': True,
                 'completed_graph_present': False, 'derived_entity_fact_state_present': False,
-                'quality_profile': quality_profile(),
+                'quality_profile': self._quality_profile(),
             }
             target = Path(self.working_dir) / 'openie_resume_diagnostics.json'
             temporary = target.with_suffix('.json.tmp')
@@ -318,7 +340,7 @@ def quality_hipporag_class(native_class):
 
         def _current_openie_provenance(self):
             provenance = copy.deepcopy(super()._current_openie_provenance())
-            provenance['quality_profile'] = quality_profile()
+            provenance['quality_profile'] = self._quality_profile()
             return provenance
 
         def _validate_openie_provenance(self, provenance, source_path):
@@ -328,8 +350,8 @@ def quality_hipporag_class(native_class):
                                   in {'1', 'true', 'yes', 'on'}
                                   and self.global_config.force_index_from_scratch
                                   and self.global_config.force_openie_from_scratch
-                                  and profile == quality_profile(legacy=True))
-            if profile != quality_profile() and not authorized_upgrade:
+                                  and profile == self._quality_profile(legacy=True))
+            if profile != self._quality_profile() and not authorized_upgrade:
                 raise RuntimeError(f'OpenIE quality profile is incompatible: {source_path}')
             return validated
 
@@ -359,6 +381,9 @@ def quality_hipporag_class(native_class):
                             if row['idx'] == key:
                                 row['openie_metadata'][stage] = copy.deepcopy(result.metadata)
                         incomplete.append(key)
+            self._openie_publication_report = apply_publication_policy(
+                merged, incomplete, strict=openie_strict,
+                report_path=Path(self.openie_state_path).with_name('openie_publication_report.json'))
             self._openie_info = merged
             self._openie_provenance = self._current_openie_provenance()
             self._save_openie_state(merged)
@@ -366,12 +391,16 @@ def quality_hipporag_class(native_class):
             if progress is not None:
                 progress.close()
                 self.openie.checkpoint = None
-            if incomplete:
+            if incomplete and openie_strict:
                 raise RuntimeError(
                     f'OpenIE incomplete for {len(set(incomplete))} chunks; '
                     f'diagnostics checkpoint saved at {self.openie_state_path}. '
                     'No completed graph was published.'
                 )
+            if incomplete:
+                LOG.warning('openie_strict=False: skipped relations for %d failed chunks; '
+                            'all passages remain indexed. First chunks: %s',
+                            len(set(incomplete)), incomplete[:5])
             return merged
 
     QualitySharedHippoRAG.__name__ = 'QualitySharedHippoRAG'
@@ -381,6 +410,13 @@ def quality_hipporag_class(native_class):
 def run_shared_index_cli(argv=None, *, hippo_root=None):
     """Forward the baseline CLI in-process, restoring patched symbols on exit."""
     argv = list(sys.argv[1:] if argv is None else argv)
+    path_parser = argparse.ArgumentParser(add_help=False)
+    path_parser.add_argument('--openie_strict', type=parse_bool, default=True,
+                             help='Abort on failed chunks (true); skip their relations and continue (false).')
+    path_parser.add_argument('--openie_prompt_version', choices=('origin', 'optimized'), default='optimized')
+    path_options, argv = path_parser.parse_known_args(argv)
+    if '--help' in argv or '-h' in argv:
+        path_parser.print_help()
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--eval_mode', default='rag_qa')
     parser.add_argument('--openie_mode', default='online')
@@ -406,8 +442,23 @@ def run_shared_index_cli(argv=None, *, hippo_root=None):
         module = importlib.import_module('hipporag.HippoRAG')
         original_class, original_openie = module.HippoRAG, module.OpenIE
         module.OpenIE = SharedQualityOpenIE
-        module.HippoRAG = quality_hipporag_class(original_class)
+        if path_options.openie_prompt_version != 'optimized':
+            class ConfiguredOpenIE(SharedQualityOpenIE):
+                def __init__(self, *args, **kwargs):
+                    kwargs['prompt_version'] = path_options.openie_prompt_version
+                    super().__init__(*args, **kwargs)
+            module.OpenIE = ConfiguredOpenIE
+        module.HippoRAG = quality_hipporag_class(
+            original_class, openie_strict=path_options.openie_strict,
+            prompt_version=path_options.openie_prompt_version)
         sys.argv = [str(main_path), *argv]
+        if not path_options.openie_strict:
+            from .build_report import tolerant_index_build_report
+            entry = runpy.run_path(str(main_path), run_name='__pathcondrag_shared_main__')
+            # The report is owned by the baseline entry, not its imported class.
+            # Replace only this invocation's globals; leave the checkout intact.
+            entry['main'].__globals__['index_build_report'] = tolerant_index_build_report
+            return entry['main']()
         return runpy.run_path(str(main_path), run_name='__main__')
     finally:
         if module is not None and original_class is not None:
