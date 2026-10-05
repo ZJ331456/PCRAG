@@ -1,1 +1,1 @@
-"""Index construction, OpenIE quality checks, recovery and checkpoints."""
+"""Index construction with separate NER and OpenIE extraction stages."""

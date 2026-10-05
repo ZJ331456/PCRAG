@@ -9,8 +9,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from pathcondrag.index.openie_quality import validate_triples
-from pathcondrag.index.openie_source_evidence import (
+from pathcondrag.index.openie.openie_quality import validate_triples
+from pathcondrag.index.openie.openie_source_evidence import (
     FLAGS, VERIFIER_VERSION, _evaluate, _quote_offsets,
 )
 

@@ -20,12 +20,12 @@ import time
 import tempfile
 import hashlib
 
-from .index.openie_quality import validate_triples
+from .index.openie.openie_quality import validate_triples
 
 from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
 from .embedding_store import EmbeddingStore
-from .information_extraction.source_verified_openie import SourceVerifiedOpenIE as OpenIE
+from .index.openie.source_verified_openie import SourceVerifiedOpenIE as OpenIE
 from .evaluation.retrieval_eval import RetrievalRecall
 from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
@@ -137,10 +137,10 @@ class BaseRAG:
                 respect_env_workers=openie_workers is None,
             )
         elif self.global_config.openie_mode == 'offline':
-            from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
+            from .index.openie.openie_vllm_offline import VLLMOfflineOpenIE
             self.openie = VLLMOfflineOpenIE(self.global_config)
         elif self.global_config.openie_mode ==  'Transformers-offline':
-            from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
+            from .index.openie.openie_transformers_offline import TransformersOfflineOpenIE
             self.openie = TransformersOfflineOpenIE(self.global_config)
 
         self.graph = self.initialize_graph()
@@ -343,7 +343,7 @@ class BaseRAG:
         progress = None
         if isinstance(self.openie, OpenIE):
             from .index.openie_checkpoint import OpenIECheckpoint
-            from .index.openie_source_evidence import VERIFIER_VERSION
+            from .index.openie.openie_source_evidence import VERIFIER_VERSION
             from .index.openie_build_queue import openie_row_is_verified_complete
             from .index.shared_index_builder import quality_profile
             corpus_digest = hashlib.sha256('\n'.join(sorted(chunk_to_rows)).encode()).hexdigest()

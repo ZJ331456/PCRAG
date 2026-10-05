@@ -20,14 +20,14 @@ import sys
 from string import Template
 
 from ..BaseRAG import BaseRAG
-from ..information_extraction.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
-from .openie_compact_recovery import RECOVERY_VERSION
-from .openie_source_evidence import VERIFIER_VERSION
+from .openie.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
+from .openie.openie_compact_recovery import RECOVERY_VERSION
+from .openie.openie_source_evidence import VERIFIER_VERSION
 from .openie_checkpoint import OpenIECheckpoint
 from .openie_build_queue import openie_row_is_verified_complete
 from ..prompts.templates.triple_extraction import prompt_template
 from ..utils.misc_utils import openie_row_needs_retry
-from .openie_quality import TRIPLE_JSON_SCHEMA, validate_triples
+from .openie.openie_quality import TRIPLE_JSON_SCHEMA, validate_triples
 
 
 QUALITY_SCHEMA = 'pathcondrag_openie_quality_v3'
@@ -49,6 +49,7 @@ def quality_profile(*, legacy=False):
             for row in prompt_template
         ]),
         'triple_json_schema_sha256': digest(TRIPLE_JSON_SCHEMA),
+        # Stable producer label shared with existing index manifests.
         'extractor': 'pathcondrag.information_extraction.source_verified_openie.SourceVerifiedOpenIE',
         'validation': 'three_nonempty_unicode_strings_v2',
         'recovery': 'source_grounded_feedback_and_windows_v2' if legacy else 'whole_context_source_units_v3',
@@ -61,10 +62,10 @@ def quality_profile(*, legacy=False):
         'native_identity_scope': 'baseline_configuration_compatibility',
     }
     if not legacy:
-        from . import openie_source_evidence as evidence
-        from . import openie_atomic_recovery as atomic
+        from .openie import openie_source_evidence as evidence
+        from .openie import openie_atomic_recovery as atomic
         from .openie_build_queue import QUEUE_VERSION
-        from .openie_structured_output import STRUCTURED_OUTPUT_VERSION
+        from .openie.openie_structured_output import STRUCTURED_OUTPUT_VERSION
         result.update(source_verified_schema=SOURCE_VERIFIED_VERSION, atomic_recovery=atomic.ATOMIC_RECOVERY_VERSION,
                       pending_queue=QUEUE_VERSION, stage_checkpoint='sqlite_per_stage_v1')
         result.update(evidence_implementation=evidence.EVIDENCE_IMPLEMENTATION,

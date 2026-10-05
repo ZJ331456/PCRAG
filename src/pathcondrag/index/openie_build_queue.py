@@ -10,7 +10,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import logging
 
 from ..utils.misc_utils import NerRawOutput, TripleRawOutput
-from .openie_quality import validate_triples
+from .openie.openie_quality import validate_triples
 
 
 logger = logging.getLogger(__name__)

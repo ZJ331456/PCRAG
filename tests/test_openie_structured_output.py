@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 # Load this standard-library-only helper without importing the retriever package
 # and its unrelated embedding/graph dependencies into the vLLM test environment.
-MODULE_PATH = Path(__file__).resolve().parents[1] / 'src/pathcondrag/index/openie_structured_output.py'
+MODULE_PATH = Path(__file__).resolve().parents[1] / 'src/pathcondrag/index/openie/openie_structured_output.py'
 SPEC = importlib.util.spec_from_file_location('openie_structured_output_cpu_test', MODULE_PATH)
 structured = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(structured)

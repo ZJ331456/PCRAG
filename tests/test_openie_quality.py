@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pathcondrag.information_extraction.openie_openai import OpenIE
-from pathcondrag.index.openie_quality import (
+from pathcondrag.index.openie.openie_openai import OpenIE
+from pathcondrag.index.openie.openie_quality import (
     entity_argument_issues, extract_triple_list, support_quote_error_feedback, validate_triples,
 )
 

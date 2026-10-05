@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pathcondrag.BaseRAG import BaseRAG  # noqa: E402
-from pathcondrag.information_extraction import openie_openai  # noqa: E402
+from pathcondrag.index.openie import openie_openai  # noqa: E402
 from pathcondrag.utils.misc_utils import (  # noqa: E402
     NerRawOutput, TripleRawOutput, compute_mdhash_id,
 )

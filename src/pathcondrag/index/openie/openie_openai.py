@@ -1,35 +1,26 @@
 import json
-import os
 from dataclasses import dataclass
 from typing import Dict, Any, List, TypedDict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-from ..prompts import PromptTemplateManager
-from ..utils.logging_utils import get_logger
-from ..index.openie_quality import (
+from ...prompts import PromptTemplateManager
+from ...utils.logging_utils import get_logger
+from .openie_quality import (
     REPAIR_JSON_SCHEMA, TRIPLE_JSON_SCHEMA, extract_triple_payload, merge_triples,
     entity_argument_issues, normalize_repair_payload, support_quote_error_feedback, validate_triples,
 )
-from ..utils.misc_utils import TripleRawOutput, NerRawOutput
-from ..llm.openai_gpt import CacheOpenAI, LLM_MAX_IN_FLIGHT
+from ...utils.misc_utils import TripleRawOutput, NerRawOutput
+from ...llm.openai_gpt import CacheOpenAI, LLM_MAX_IN_FLIGHT
+
+from ..ner.openai import OpenAINERMixin
+from ..extraction_utils import (
+    _LENGTH_RETRY_FREQUENCY_PENALTIES, _safe_env_int, _base_generate_seed,
+    _length_retry_seed, _resolve_quality_max_retries,
+    _extract_json_list_field, _extract_ner_from_response,
+)
 
 logger = get_logger(__name__)
-_LENGTH_RETRY_FREQUENCY_PENALTIES = (0.2, 0.5)
-_DEFAULT_QUALITY_MAX_RETRIES = 5
-
-
-def _safe_env_int(name: str, default: int | None = None) -> int | None:
-    raw = os.environ.get(name, "").strip()
-    if raw == "":
-        return default
-    try:
-        val = int(raw)
-        if val <= 0:
-            return default
-        return val
-    except Exception:
-        return default
 
 
 class ChunkInfo(TypedDict):
@@ -45,59 +36,7 @@ class LLMInput:
     input_message: List[Dict]
 
 
-def _extract_json_list_field(response: str, field_name: str) -> List:
-    decoder = json.JSONDecoder()
-    for start_index, character in enumerate(response):
-        if character != "{":
-            continue
-        try:
-            payload, _ = decoder.raw_decode(response[start_index:])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or field_name not in payload:
-            continue
-        value = payload[field_name]
-        if not isinstance(value, list):
-            raise ValueError(f"OpenIE response field {field_name!r} must be a list.")
-        return value
-    raise ValueError(f"OpenIE response does not contain a valid JSON object with {field_name!r}.")
-
-
-def _extract_ner_from_response(real_response):
-    return _extract_json_list_field(real_response, "named_entities")
-
-
-def _base_generate_seed(llm_model: CacheOpenAI) -> int:
-    config = getattr(llm_model, "llm_config", None)
-    params = getattr(config, "generate_params", {}) or {}
-    base_seed = params.get("seed")
-    if base_seed is None:
-        base_seed = 0
-    if not isinstance(base_seed, int) or isinstance(base_seed, bool):
-        raise ValueError(f"OpenIE retry requires an integer or null seed, got {base_seed!r}")
-    return base_seed
-
-
-def _length_retry_seed(llm_model: CacheOpenAI) -> int:
-    """Change the cache key once without changing the decoding settings."""
-    return _base_generate_seed(llm_model) + 1
-
-
-def _resolve_quality_max_retries(explicit):
-    if explicit is not None:
-        if explicit < 0:
-            raise ValueError("quality_max_retries cannot be negative.")
-        return explicit
-    raw = os.environ.get("HIPPO_OPENIE_QUALITY_MAX_RETRIES", "").strip()
-    if raw:
-        value = int(raw)
-        if value < 0:
-            raise ValueError("HIPPO_OPENIE_QUALITY_MAX_RETRIES cannot be negative.")
-        return value
-    return _DEFAULT_QUALITY_MAX_RETRIES
-
-
-class OpenIE:
+class OpenIE(OpenAINERMixin):
     def __init__(self, llm_model: CacheOpenAI, max_workers: int = 8, respect_env_workers: bool = True,
                  quality_max_retries=None, guided_recovery: bool = False):
         if max_workers < 1:
@@ -119,115 +58,6 @@ class OpenIE:
         return (
             _safe_env_int('HIPPO_OPENIE_NER_WORKERS', openie_workers),
             _safe_env_int('HIPPO_OPENIE_TRIPLE_WORKERS', openie_workers),
-        )
-
-    def ner(self, chunk_key: str, passage: str) -> NerRawOutput:
-        # PREPROCESSING
-        ner_input_message = self.prompt_template_manager.render(name='ner', passage=passage)
-        raw_response = ""
-        metadata = {}
-        # Align with HippoRAG: default 512, escalate to 1024 on parse failure or truncation.
-        ner_max_tokens = getattr(self, 'ner_max_tokens', _safe_env_int('HIPPO_OPENIE_NER_MAX_TOKENS', 512))
-        token_budgets = [ner_max_tokens]
-        if ner_max_tokens < 1024:
-            token_budgets.append(1024)
-        final_budget = token_budgets[-1]
-        attempts = [(budget, None) for budget in token_budgets]
-        attempts.append((final_budget, "seed"))
-        attempts.extend(
-            (final_budget, penalty)
-            for penalty in _LENGTH_RETRY_FREQUENCY_PENALTIES
-        )
-        length_observed_count = 0
-        length_retry_count = 0
-        length_retry_penalties_attempted = []
-        openie_attempt_settings = []
-        previous_was_length = False
-        attempt_count = 0
-        try:
-            unique_entities = []
-            for attempt, (max_new_tokens, retry_setting) in enumerate(attempts):
-                # Decoding changes are reached only after the final budget was truncated.
-                kwargs = {"messages": ner_input_message, "max_completion_tokens": max_new_tokens}
-                if retry_setting == "seed":
-                    kwargs["seed"] = _length_retry_seed(self.llm_model)
-                elif retry_setting is not None:
-                    kwargs["frequency_penalty"] = retry_setting
-                    length_retry_penalties_attempted.append(retry_setting)
-                if previous_was_length:
-                    length_retry_count += 1
-                attempt_count += 1
-                openie_attempt_settings.append({key: value for key, value in kwargs.items()
-                                                if key != "messages"})
-                raw_response, response_metadata, cache_hit = self.llm_model.infer(**kwargs)
-                metadata = dict(response_metadata)
-                metadata.update({
-                    'cache_hit': cache_hit,
-                    'ner_max_tokens_used': max_new_tokens,
-                    'openie_attempt_count': attempt_count,
-                    'length_retry_count': length_retry_count,
-                    'length_observed_count': length_observed_count,
-                    'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
-                    'openie_attempt_settings': list(openie_attempt_settings),
-                })
-                if retry_setting == "seed":
-                    metadata['length_retry_seed'] = kwargs['seed']
-                elif retry_setting is not None:
-                    metadata['length_retry_frequency_penalty'] = retry_setting
-                if metadata.get('finish_reason') == 'length':
-                    length_observed_count += 1
-                    metadata['length_observed_count'] = length_observed_count
-                    previous_was_length = True
-                    if attempt + 1 == len(attempts):
-                        raise RuntimeError(
-                            f"NER chunk {chunk_key} remains truncated (finish_reason=length) "
-                            f"after {attempt + 1} attempts"
-                        )
-                    logger.warning(
-                        "NER response truncated for %s at max_new_tokens=%s; retrying",
-                        chunk_key, max_new_tokens,
-                    )
-                    continue
-                previous_was_length = False
-                try:
-                    extracted_entities = _extract_ner_from_response(raw_response)
-                    unique_entities = list(dict.fromkeys(extracted_entities))
-                    break
-                except Exception as parse_error:
-                    if attempt + 1 < len(token_budgets):
-                        logger.warning(
-                            "NER parse failed for %s with max_new_tokens=%s (%s); retrying with %s",
-                            chunk_key,
-                            max_new_tokens,
-                            parse_error,
-                            token_budgets[attempt + 1],
-                        )
-                        continue
-                    raise
-
-        except Exception as e:
-            # For any other unexpected exceptions, log them and return with the error message
-            logger.warning(e)
-            metadata.update({
-                'error': f'{type(e).__name__}: {e}',
-                'openie_attempt_count': attempt_count,
-                'length_retry_count': length_retry_count,
-                'length_observed_count': length_observed_count,
-                'length_retry_penalties_attempted': list(length_retry_penalties_attempted),
-                'openie_attempt_settings': list(openie_attempt_settings),
-            })
-            return NerRawOutput(
-                chunk_id=chunk_key,
-                response=raw_response,  # Store the error message in metadata
-                unique_entities=[],
-                metadata=metadata  # Store the error message in metadata
-            )
-
-        return NerRawOutput(
-            chunk_id=chunk_key,
-            response=raw_response,
-            unique_entities=unique_entities,
-            metadata=metadata
         )
 
     def _triple_messages(self, passage, named_entities, error=None, previous_response=None,
@@ -440,7 +270,7 @@ class OpenIE:
                         kwargs['extra_body'] = dict(configured.get('extra_body') or {})
                         kwargs['extra_body']['guided_json'] = REPAIR_JSON_SCHEMA if repair_context else TRIPLE_JSON_SCHEMA
                         if getattr(self, 'bounded_structured_output', False):
-                            from ..index.openie_structured_output import guided_json_parameters
+                            from .openie_structured_output import guided_json_parameters
                             kwargs['extra_body'] = guided_json_parameters(
                                 kwargs['extra_body']['guided_json'], kwargs['extra_body'])
                     attempt_count += 1

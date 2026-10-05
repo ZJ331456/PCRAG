@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from pathcondrag.index import openie_atomic_recovery as module
+from pathcondrag.index.openie import openie_atomic_recovery as module
 
 
 def reply(triple=None, quote=None, status=None, complete=True):

@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from utils.fresh_index_validation import validate_fresh_index, unicode_normalize
-from pathcondrag.index.openie_source_evidence import (
+from pathcondrag.index.openie.openie_source_evidence import (
     FLAGS, VERIFIER_VERSION, _base_audit, _evaluate, _quote_offsets,
 )
 
@@ -39,7 +39,7 @@ class FreshIndexValidationTests(unittest.TestCase):
                       "extracted_triples": [["Café", "located in", "Paris"]],
                       "openie_metadata": {"ner": {"finish_reason": "stop"},
                                           "triples": {"finish_reason": "stop", "quality_status": "success"}}}]
-        self.profile = {"extractor": "pathcondrag.information_extraction.source_verified_openie.SourceVerifiedOpenIE",
+        self.profile = {"extractor": "pathcondrag.index.openie.source_verified_openie.SourceVerifiedOpenIE",
                         "fresh_recovery_semantic_verifier": "source-verifier-test-v1"}
         self.provenance = {"quality_profile": self.profile}
         self.write_fixture()

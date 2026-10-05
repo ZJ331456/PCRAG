@@ -12,7 +12,7 @@ import json
 import re
 import time
 
-from ..utils.misc_utils import TripleRawOutput
+from ...utils.misc_utils import TripleRawOutput
 from .openie_quality import REPAIR_JSON_SCHEMA, merge_triples, validate_triples
 from .openie_semantic_validation import CONTEXT_TOKENS, MAX_COMPLETION_TOKENS, _prompt_tokens
 from .openie_structured_output import guided_json_parameters

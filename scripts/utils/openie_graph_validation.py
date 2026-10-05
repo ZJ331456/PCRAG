@@ -10,7 +10,7 @@ import math
 from collections import defaultdict
 from numbers import Real
 
-from pathcondrag.index.openie_quality import validate_triples
+from pathcondrag.index.openie.openie_quality import validate_triples
 
 
 EDGE_ATTRIBUTES = {

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from eval_dataset import build_parser  # noqa: E402
 from pathcondrag.config import PCRAGConfig  # noqa: E402
-from pathcondrag.information_extraction.openie_openai import OpenIE  # noqa: E402
+from pathcondrag.index.openie.openie_openai import OpenIE  # noqa: E402
 from pathcondrag.utils.config_utils import BaseConfig  # noqa: E402
 
 

@@ -32,7 +32,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pathcondrag.information_extraction.openie_openai import OpenIE  # noqa: E402
+from pathcondrag.index.openie.openie_openai import OpenIE  # noqa: E402
 from pathcondrag.llm.openai_gpt import CacheOpenAI, LLM_MAX_IN_FLIGHT  # noqa: E402
 from pathcondrag.utils.config_utils import BaseConfig  # noqa: E402
 from pathcondrag.utils.misc_utils import compute_mdhash_id  # noqa: E402
@@ -258,7 +258,9 @@ def run(args: argparse.Namespace) -> int:
     code_paths = (
         Path(__file__),
         ROOT / "src/pathcondrag/llm/openai_gpt.py",
-        ROOT / "src/pathcondrag/information_extraction/openie_openai.py",
+        ROOT / "src/pathcondrag/index/openie/openie_openai.py",
+        ROOT / "src/pathcondrag/index/extraction_utils.py",
+        ROOT / "src/pathcondrag/index/ner/openai.py",
         ROOT / "src/pathcondrag/prompts/templates/ner.py",
         ROOT / "src/pathcondrag/prompts/templates/triple_extraction.py",
     )

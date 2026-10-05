@@ -8,7 +8,7 @@ import copy
 import json
 
 from pathcondrag.utils.misc_utils import TripleRawOutput
-from pathcondrag.index.openie_quality import TRIPLE_JSON_SCHEMA, merge_triples, validate_triples
+from pathcondrag.index.openie.openie_quality import TRIPLE_JSON_SCHEMA, merge_triples, validate_triples
 
 from .openie_semantic_validation import CONTEXT_TOKENS, MAX_COMPLETION_TOKENS, _prompt_tokens
 

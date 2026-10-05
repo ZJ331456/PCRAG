@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from pathcondrag.information_extraction.openie_openai import OpenIE
-from pathcondrag.information_extraction import source_verified_openie as source_module
+from pathcondrag.index.openie.openie_openai import OpenIE
+from pathcondrag.index.openie import source_verified_openie as source_module
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput
 from pathcondrag.index.shared_index_builder import (
     SharedQualityOpenIE, quality_hipporag_class, quality_profile, run_shared_index_cli,

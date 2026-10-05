@@ -20,8 +20,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from pathcondrag.information_extraction.openie_openai import OpenIE
-from pathcondrag.index.openie_quality import merge_triples, validate_triples
+from pathcondrag.index.openie.openie_openai import OpenIE
+from pathcondrag.index.openie.openie_quality import merge_triples, validate_triples
 
 ROOT = Path(__file__).resolve().parents[2]
 REPAIR_VERSION = "pathcondrag_openie_quality_v2"
@@ -291,7 +291,11 @@ def repair(args, smoke=False):
         "pid": os.getpid(), "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "pending_chunks": len(pending), "smoke": smoke,
         "server_log_start": log_start, "workers": 8, "triple_max_tokens": 2048,
-        "extractor_sha256": sha256(ROOT / "src/pathcondrag/information_extraction/openie_openai.py"),
+        "extractor_sha256": sha256(ROOT / "src/pathcondrag/index/openie/openie_openai.py"),
+        "extractor_dependencies_sha256": {
+            "index/extraction_utils.py": sha256(ROOT / "src/pathcondrag/index/extraction_utils.py"),
+            "index/ner/openai.py": sha256(ROOT / "src/pathcondrag/index/ner/openai.py"),
+        },
     })
     LOG.info("[repair] pending=%s workers=8 max_tokens=2048 thinking=false smoke=%s", len(pending), smoke)
     completed = []
@@ -328,8 +332,12 @@ def repair(args, smoke=False):
         "schema": REPAIR_VERSION, "scope": "validated_base_openie_plus_source_grounded_local_repairs",
         "base_prompt_schema": manifest["openie"]["identity"]["prompt_schema"],
         "repair_extractor": "pathcondrag.information_extraction.openie_openai.OpenIE",
-        "extractor_sha256": sha256(ROOT / "src/pathcondrag/information_extraction/openie_openai.py"),
-        "validation_sha256": sha256(ROOT / "src/pathcondrag/index/openie_quality.py"),
+        "extractor_sha256": sha256(ROOT / "src/pathcondrag/index/openie/openie_openai.py"),
+        "extractor_dependencies_sha256": {
+            "index/extraction_utils.py": sha256(ROOT / "src/pathcondrag/index/extraction_utils.py"),
+            "index/ner/openai.py": sha256(ROOT / "src/pathcondrag/index/ner/openai.py"),
+        },
+        "validation_sha256": sha256(ROOT / "src/pathcondrag/index/openie/openie_quality.py"),
         "compact_recovery_sha256": sha256(ROOT / "scripts/utils/openie_compact_recovery.py"),
         "source_openie_sha256": snapshot["asset_sha256"]["openie_state.json"],
         "repaired_chunks": len(summaries), "thinking": False, "triple_max_tokens": 2048,

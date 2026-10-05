@@ -14,11 +14,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from pathcondrag.BaseRAG import BaseRAG
-from pathcondrag.information_extraction.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
+from pathcondrag.index.openie.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput, compute_mdhash_id
-from pathcondrag.index.openie_source_evidence import VERIFIER_VERSION
+from pathcondrag.index.openie.openie_source_evidence import VERIFIER_VERSION
 from pathcondrag.index.shared_index_builder import quality_profile
-from pathcondrag.index.openie_atomic_recovery import ATOMIC_RECOVERY_IMPLEMENTATION
+from pathcondrag.index.openie.openie_atomic_recovery import ATOMIC_RECOVERY_IMPLEMENTATION
 
 
 class InterruptedStage(RuntimeError):
