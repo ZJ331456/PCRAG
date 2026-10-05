@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
@@ -226,6 +227,27 @@ class BuildQueueTests(unittest.TestCase):
         run_openie_queue(extractor, self.chunks(*keys))
         self.assertLessEqual(extractor.maximum_active, 8)
         self.assertGreater(extractor.maximum_active, 1)
+
+    def test_queue_uses_named_tqdm_bars_for_ner_and_triples(self):
+        class RecordingProgress:
+            calls = []
+
+            def __init__(self, iterable, **kwargs):
+                RecordingProgress.calls.append(kwargs)
+                self.iterable = iterable
+
+            def __iter__(self):
+                return iter(self.iterable)
+
+            def set_postfix(self, **kwargs):
+                return None
+
+        RecordingProgress.calls = []
+        with patch('pathcondrag.index.openie_build_queue.tqdm', RecordingProgress):
+            run_openie_queue(Extractor(), self.chunks('a', 'b'))
+        self.assertEqual([call.get('desc') for call in RecordingProgress.calls],
+                         ['NER', 'Extracting triples'])
+        self.assertEqual([call.get('total') for call in RecordingProgress.calls], [2, 2])
 
 
 if __name__ == '__main__':

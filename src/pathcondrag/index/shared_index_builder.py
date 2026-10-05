@@ -21,6 +21,7 @@ from string import Template
 
 from ..BaseRAG import BaseRAG
 from .openie.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
+from .openie.structural_openie import StructuralOpenIE, STRUCTURAL_VERSION, RECOVERY_BUDGET
 from .openie.openie_compact_recovery import RECOVERY_VERSION
 from .openie.openie_source_evidence import VERIFIER_VERSION
 from .openie_checkpoint import OpenIECheckpoint
@@ -34,10 +35,12 @@ from .extraction_utils import resolve_prompt_version
 
 
 QUALITY_SCHEMA = 'pathcondrag_openie_quality_v3'
+VALIDATION_MODES = ('source_verified', 'structural')
 LOG = logging.getLogger(__name__)
 
 
-def quality_profile(*, strict=True, prompt_version='optimized', legacy=False):
+def quality_profile(*, strict=True, prompt_version='optimized', legacy=False,
+                    validation_mode='source_verified'):
     """Identity of the extra extraction contract, independent of native config."""
     digest = lambda value: hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')
@@ -54,6 +57,35 @@ def quality_profile(*, strict=True, prompt_version='optimized', legacy=False):
          if isinstance(row['content'], Template) else row['content']}
         for row in template
     ]
+    if validation_mode not in VALIDATION_MODES:
+        raise ValueError(f'Unknown OpenIE validation mode: {validation_mode}')
+    if validation_mode == 'structural':
+        if legacy:
+            raise ValueError('Structural extraction has no legacy semantic-verification profile.')
+        from .openie_build_queue import QUEUE_VERSION
+        from .ner.source_verified import NER_RECOVERY_VERSION
+        return {
+            'schema_version': 1, 'name': 'pathcondrag_openie_structural_quality_v1',
+            'extractor': 'pathcondrag.index.openie.structural_openie.StructuralOpenIE',
+            'prompt_version': prompt_version,
+            'prompt_schema': 'pathcondrag_source_grounded_triples_v2',
+            'prompt_sha256': digest(serialize(selected_triples)),
+            'ner_prompt_sha256': digest(serialize(selected_ner)),
+            'ner_recovery': NER_RECOVERY_VERSION,
+            'triple_json_schema_sha256': digest(TRIPLE_JSON_SCHEMA),
+            'validation': 'three_nonempty_unicode_strings_v2',
+            'validation_mode': 'structural', 'validation_scope': 'structural',
+            'semantic_scope': 'none', 'semantic_verified': False,
+            'structural_schema': STRUCTURAL_VERSION,
+            'recovery': 'bounded_structural_format_retry_v1',
+            'recovery_budget': RECOVERY_BUDGET,
+            'recovery_budget_scope': 'triple_stage_new_profile_logical_infer_calls',
+            'ner_max_tokens': 512, 'triple_max_tokens': 2048,
+            'pending_queue': QUEUE_VERSION, 'stage_checkpoint': 'sqlite_per_stage_v1',
+            'openie_strict': strict,
+            'failure_policy': STRICT_FAILURE_POLICY if strict else LENIENT_FAILURE_POLICY,
+            'native_identity_scope': 'baseline_configuration_compatibility',
+        }
     result = {
         'schema_version': 2 if legacy else 3,
         'name': 'pathcondrag_openie_quality_v2' if legacy else QUALITY_SCHEMA,
@@ -121,12 +153,26 @@ class SharedQualityOpenIE(SourceVerifiedOpenIE):
         return result
 
 
-def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='optimized'):
+class SharedStructuralOpenIE(StructuralOpenIE):
+    """Use the native constructor with a bounded, structural-only extractor."""
+
+    def __init__(self, llm_model, max_workers=8, ner_max_tokens=512,
+                 triple_max_tokens=2048, **kwargs):
+        if ner_max_tokens != 512 or triple_max_tokens != 2048:
+            raise ValueError('The shared quality builder requires NER=512 and triples=2048 tokens.')
+        self.ner_max_tokens, self.triple_max_tokens = ner_max_tokens, triple_max_tokens
+        super().__init__(llm_model=llm_model, max_workers=max_workers,
+                         respect_env_workers=False, **kwargs)
+
+
+def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='optimized',
+                          validation_mode='source_verified'):
     """Create a runtime adapter without changing files in the baseline repo."""
 
     class QualitySharedHippoRAG(native_class):
         def _quality_profile(self, *, legacy=False):
-            return quality_profile(strict=openie_strict, prompt_version=prompt_version, legacy=legacy)
+            return quality_profile(strict=openie_strict, prompt_version=prompt_version, legacy=legacy,
+                                   validation_mode=validation_mode)
 
         def _prepare_openie_progress(self, rows, chunks):
             progress = OpenIECheckpoint(Path(self.working_dir) / 'openie_progress.sqlite', {
@@ -150,7 +196,8 @@ def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='
         def _validate_or_create_index_manifest(self):
             path = Path(self.index_manifest_path)
             allowed = os.environ.get('HIPPO_ALLOW_INDEX_RESUME', '').strip().lower() in {'1', 'true', 'yes', 'on'}
-            if (allowed and path.is_file() and self.global_config.force_index_from_scratch
+            if (validation_mode == 'source_verified' and allowed and path.is_file()
+                    and self.global_config.force_index_from_scratch
                     and self.global_config.force_openie_from_scratch):
                 stored = json.loads(path.read_text())
                 old_profile = (stored.get('openie') or {}).get('quality_profile')
@@ -249,7 +296,7 @@ def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='
                 if hasattr(self, 'openie'):
                     if not openie_row_is_verified_complete(self.openie, row):
                         return True
-                if not triples:
+                if not triples and validation_mode != 'structural':
                     stage = metadata.get('triples') or {}
                     if not (stage.get('source_no_supported_relations') is True
                             and stage.get('semantic_verified') is True
@@ -346,7 +393,8 @@ def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='
         def _validate_openie_provenance(self, provenance, source_path):
             validated = super()._validate_openie_provenance(provenance, source_path)
             profile = validated.get('quality_profile')
-            authorized_upgrade = (os.environ.get('HIPPO_ALLOW_INDEX_RESUME', '').strip().lower()
+            authorized_upgrade = (validation_mode == 'source_verified'
+                                  and os.environ.get('HIPPO_ALLOW_INDEX_RESUME', '').strip().lower()
                                   in {'1', 'true', 'yes', 'on'}
                                   and self.global_config.force_index_from_scratch
                                   and self.global_config.force_openie_from_scratch
@@ -414,6 +462,8 @@ def run_shared_index_cli(argv=None, *, hippo_root=None):
     path_parser.add_argument('--openie_strict', type=parse_bool, default=True,
                              help='Abort on failed chunks (true); skip their relations and continue (false).')
     path_parser.add_argument('--openie_prompt_version', choices=('origin', 'optimized'), default='optimized')
+    path_parser.add_argument('--openie_validation_mode', choices=VALIDATION_MODES, default='structural',
+                             help='Local structural checks or independent source-verification LLM audits.')
     path_options, argv = path_parser.parse_known_args(argv)
     if '--help' in argv or '-h' in argv:
         path_parser.print_help()
@@ -441,18 +491,20 @@ def run_shared_index_cli(argv=None, *, hippo_root=None):
         sys.path.insert(0, str(baseline_root / 'src'))
         module = importlib.import_module('hipporag.HippoRAG')
         original_class, original_openie = module.HippoRAG, module.OpenIE
-        module.OpenIE = SharedQualityOpenIE
+        selected_openie = SharedStructuralOpenIE if path_options.openie_validation_mode == 'structural' else SharedQualityOpenIE
+        module.OpenIE = selected_openie
         if path_options.openie_prompt_version != 'optimized':
-            class ConfiguredOpenIE(SharedQualityOpenIE):
+            class ConfiguredOpenIE(selected_openie):
                 def __init__(self, *args, **kwargs):
                     kwargs['prompt_version'] = path_options.openie_prompt_version
                     super().__init__(*args, **kwargs)
             module.OpenIE = ConfiguredOpenIE
         module.HippoRAG = quality_hipporag_class(
             original_class, openie_strict=path_options.openie_strict,
-            prompt_version=path_options.openie_prompt_version)
+            prompt_version=path_options.openie_prompt_version,
+            validation_mode=path_options.openie_validation_mode)
         sys.argv = [str(main_path), *argv]
-        if not path_options.openie_strict:
+        if not path_options.openie_strict or path_options.openie_validation_mode == 'structural':
             from .build_report import tolerant_index_build_report
             entry = runpy.run_path(str(main_path), run_name='__pathcondrag_shared_main__')
             # The report is owned by the baseline entry, not its imported class.

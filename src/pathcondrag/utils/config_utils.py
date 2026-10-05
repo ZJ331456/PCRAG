@@ -123,6 +123,10 @@ class BaseConfig:
         metadata={"help": "Abort publication on any unresolved OpenIE chunk; False skips its relations and continues."}
     )
     openie_prompt_version: Literal['origin', 'optimized'] = field(default='optimized')
+    openie_validation_mode: Literal['structural', 'source_verified'] = field(
+        default='structural',
+        metadata={"help": "structural validates locally; source_verified additionally audits every relation with the LLM."}
+    )
     skip_graph: bool = field(
         default=False,
         metadata={"help": "Whether to skip graph construction or not. Set it to be true when running vllm offline indexing for the first time."}
@@ -238,6 +242,8 @@ class BaseConfig:
             raise ValueError('openie_strict must be a bool')
         if self.openie_prompt_version not in ('origin', 'optimized'):
             raise ValueError('openie_prompt_version must be origin or optimized')
+        if self.openie_validation_mode not in ('structural', 'source_verified'):
+            raise ValueError('openie_validation_mode must be structural or source_verified')
         if self.openie_max_workers is not None and (
             isinstance(self.openie_max_workers, bool)
             or not isinstance(self.openie_max_workers, int)

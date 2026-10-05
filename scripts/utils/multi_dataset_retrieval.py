@@ -92,11 +92,12 @@ def layout(out, name):
 def commands(args, metadata, index, datasets, name):
     options = ['--openie_strict', str(args.openie_strict).lower(),
                '--openie_prompt_version', args.openie_prompt_version]
+    validation = ['--openie_validation_mode', getattr(args, 'openie_validation_mode', 'structural')]
     common = ['--dataset', name, '--sample_size', '2' if args.smoke else '0',
               '--sample_seed', '42', '--sample_indices_file', str(metadata / 'selected_indices.json'),
               '--llm_name', 'qwen3-8b', '--llm_base_url', args.llm_base_url,
               '--embedding_batch_size', '4', '--openie_max_workers', '8', '--llm_prefetch_workers', '8']
-    builder = [args.python, '-B', '-u', str(ROOT / 'scripts/build_shared_index.py')] + common + options + [
+    builder = [args.python, '-B', '-u', str(ROOT / 'scripts/build_shared_index.py')] + common + options + validation + [
         '--datasets_dir', str(datasets), '--rag_type', 'hipporag',
         '--embedding_name', experiments.EMBEDDING_MODEL, '--embedding_provider', 'transformers',
         '--openie_mode', 'online', '--eval_mode', 'index_only',
@@ -114,7 +115,7 @@ def commands(args, metadata, index, datasets, name):
                 '--embedding_name', experiments.EMBEDDING_MODEL, '--embedding_provider', 'transformers',
                 '--save_dir_exact']
         else:
-            command = [args.python, '-B', '-u', str(ROOT / 'scripts/eval_dataset.py')] + retrieval + PC_ARGUMENTS + options + [
+            command = [args.python, '-B', '-u', str(ROOT / 'scripts/eval_dataset.py')] + retrieval + PC_ARGUMENTS + options + validation + [
                 '--data_path', str(datasets / f'{name}.json'),
                 '--corpus_path', str(datasets / f'{name}_corpus.json'),
                 '--corpus_mode', 'full', '--qa_top_k', '5', '--max_qa_steps', '1', '--max_new_tokens', '2048',
@@ -226,6 +227,7 @@ def run(args):
     stage_file = out / 'stage_status.json'
     protocol = {'datasets': list(DATASETS), 'cases': list(CASES), 'smoke': args.smoke,
                 'openie_strict': args.openie_strict, 'openie_prompt_version': args.openie_prompt_version,
+                'openie_validation_mode': getattr(args, 'openie_validation_mode', 'structural'),
                 'embedding_model': experiments.EMBEDDING_MODEL, 'embedding_batch_size': 4,
                 'llm_name': 'qwen3-8b', 'llm_workers': 8, 'ner_max_tokens': 512,
                 'triple_max_tokens': 2048, 'enable_thinking': False,
@@ -336,6 +338,10 @@ def main(argv=None):
     parser.add_argument('--openie-strict', '--openie_strict', type=parse_bool, default=False)
     parser.add_argument('--openie-prompt-version', '--openie_prompt_version',
                         choices=['origin', 'optimized'], default='optimized')
+    parser.add_argument('--openie-validation-mode', '--openie_validation_mode',
+                        choices=['structural', 'source_verified'], default='structural',
+                        help='Structural checks match the normal HippoRAG extraction cost; '
+                             'source_verified adds expensive LLM evidence audits.')
     args = parser.parse_args(argv)
     args.out_root = args.out_root or str(DEFAULT_OUT.with_name(DEFAULT_OUT.name + '_smoke') if args.smoke else DEFAULT_OUT)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')

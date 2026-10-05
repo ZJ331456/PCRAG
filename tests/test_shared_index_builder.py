@@ -197,7 +197,8 @@ class SharedIndexBuilderTests(unittest.TestCase):
             with patch('pathcondrag.index.shared_index_builder.importlib.import_module', return_value=module), \
                     patch('pathcondrag.index.shared_index_builder.runpy.run_path', side_effect=run_entry):
                 with self.assertRaises(SystemExit):
-                    run_shared_index_cli(['--eval_mode', 'index_only', '--embedding_batch_size', '4'], hippo_root=tmp)
+                    run_shared_index_cli(['--eval_mode', 'index_only', '--embedding_batch_size', '4',
+                                          '--openie_validation_mode', 'source_verified'], hippo_root=tmp)
             self.assertIs(module.OpenIE, native_openie)
             self.assertIs(module.HippoRAG, native_class)
             self.assertEqual(sys.argv, argv_before)

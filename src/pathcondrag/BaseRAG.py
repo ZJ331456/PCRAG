@@ -26,6 +26,7 @@ from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
 from .embedding_store import EmbeddingStore
 from .index.openie.source_verified_openie import SourceVerifiedOpenIE as OpenIE
+from .index.openie.structural_openie import StructuralOpenIE, STRUCTURAL_VERSION
 from .evaluation.retrieval_eval import RetrievalRecall
 from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
@@ -131,7 +132,9 @@ class BaseRAG:
 
         if self.global_config.openie_mode == 'online':
             openie_workers = self.global_config.openie_max_workers
-            self.openie = OpenIE(
+            extractor_class = (StructuralOpenIE if self.global_config.openie_validation_mode == 'structural'
+                               else OpenIE)
+            self.openie = extractor_class(
                 llm_model=self.llm_model,
                 max_workers=8 if openie_workers is None else openie_workers,
                 respect_env_workers=openie_workers is None,
@@ -342,24 +345,27 @@ class BaseRAG:
             chunk_to_rows.keys(), retry_failed=retry_failed_openie,
         )
         progress = None
-        if isinstance(self.openie, OpenIE):
+        if isinstance(self.openie, (OpenIE, StructuralOpenIE)):
             from .index.openie_checkpoint import OpenIECheckpoint
             from .index.openie.openie_source_evidence import VERIFIER_VERSION
             from .index.openie_build_queue import openie_row_is_verified_complete
             from .index.shared_index_builder import quality_profile
+            validation_mode = getattr(self.global_config, 'openie_validation_mode',
+                                      'structural' if isinstance(self.openie, StructuralOpenIE) else 'source_verified')
             corpus_digest = hashlib.sha256('\n'.join(sorted(chunk_to_rows)).encode()).hexdigest()
             progress = OpenIECheckpoint(os.path.join(
                 self.working_dir, f'openie_progress_{corpus_digest}.sqlite'), {
                 'llm_name': self.global_config.llm_name,
                 'endpoint': self.global_config.llm_base_url,
-                'verifier': VERIFIER_VERSION,
+                'verifier': STRUCTURAL_VERSION if validation_mode == 'structural' else VERIFIER_VERSION,
                 'temperature': self.global_config.temperature,
                 'seed': self.global_config.seed,
                 'ner_max_tokens': 512,
                 'triple_max_tokens': 2048,
                 'quality_profile': quality_profile(
                     strict=getattr(self.global_config, 'openie_strict', True),
-                    prompt_version=getattr(self.global_config, 'openie_prompt_version', 'optimized')),
+                    prompt_version=getattr(self.global_config, 'openie_prompt_version', 'optimized'),
+                    validation_mode=validation_mode),
                 'corpus_ids_sha256': corpus_digest,
             })
             all_openie_info[:] = progress.overlay(all_openie_info, chunk_to_rows)
@@ -399,7 +405,7 @@ class BaseRAG:
                 self.openie.checkpoint = None
 
         incomplete_rows = [row['idx'] for row in all_openie_info if openie_row_needs_retry(row)]
-        if isinstance(self.openie, OpenIE):
+        if isinstance(self.openie, (OpenIE, StructuralOpenIE)):
             for row in all_openie_info:
                 verified = openie_row_is_verified_complete(self.openie, row)
                 if not verified and row['idx'] not in incomplete_rows:

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from pathcondrag.BaseRAG import BaseRAG
 from pathcondrag.index.openie.source_verified_openie import SourceVerifiedOpenIE, SOURCE_VERIFIED_VERSION
+from pathcondrag.index.openie.structural_openie import StructuralOpenIE, STRUCTURAL_VERSION
 from pathcondrag.utils.misc_utils import NerRawOutput, TripleRawOutput, compute_mdhash_id
 from pathcondrag.index.openie.openie_source_evidence import VERIFIER_VERSION
 from pathcondrag.index.shared_index_builder import quality_profile
@@ -48,7 +49,7 @@ class GenericCheckpointTests(unittest.TestCase):
         rag.working_dir = str(directory)
         rag.global_config = SimpleNamespace(force_index_from_scratch=False,
             openie_mode='online', llm_name='qwen3-8b', llm_base_url='http://127.0.0.1:8035/v1',
-            temperature=0.0, seed=None, save_openie=True)
+            temperature=0.0, seed=None, save_openie=True, openie_validation_mode='source_verified')
         rag.graph = SimpleNamespace(vcount=lambda: 0)
         rag.chunk_embedding_store = PassageStore()
         rag.openie = SourceVerifiedOpenIE.__new__(SourceVerifiedOpenIE)
@@ -92,6 +93,44 @@ class GenericCheckpointTests(unittest.TestCase):
     def journal(self, directory, keys):
         digest = hashlib.sha256('\n'.join(sorted(keys)).encode()).hexdigest()
         return Path(directory) / f'openie_progress_{digest}.sqlite'
+
+    def test_structural_mode_journals_and_reuses_completed_stage_without_extra_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rag = self.runtime(directory)
+            rag.global_config.openie_validation_mode = 'structural'
+            rag.openie = StructuralOpenIE.__new__(StructuralOpenIE)
+
+            def batch(chunks):
+                rag.batch_calls.append(list(chunks))
+                ner, triples = {}, {}
+                for key, source in chunks.items():
+                    metadata = {'structural_schema': STRUCTURAL_VERSION,
+                                'validation_scope': 'structural', 'semantic_verified': False,
+                                'structural_infer_calls': 1, 'quality_status': 'success',
+                                'complete': True, 'finish_reason': 'stop'}
+                    ner[key] = NerRawOutput(key, '{"named_entities":["Alpha","Beta"]}', ['Alpha', 'Beta'],
+                                            {'complete': True, 'finish_reason': 'stop'})
+                    triples[key] = TripleRawOutput(key, '{"triples":[["Alpha","is","Beta"]]}',
+                                                  [['Alpha', 'is', 'Beta']], metadata)
+                    rag.openie.checkpoint({'idx': key, 'passage': source['content'],
+                                          'extracted_entities': ner[key].unique_entities,
+                                          'extracted_triples': triples[key].triples,
+                                          'openie_metadata': {'ner': ner[key].metadata, 'triples': metadata}})
+                return ner, triples
+
+            rag.openie.batch_openie = batch
+            with self.assertRaises(OpenIEPrepared):
+                rag.index(['Alpha is Beta.'])
+            path = self.journal(directory, rag.chunk_embedding_store.rows)
+            with sqlite3.connect(path) as journal:
+                identity = json.loads(journal.execute('SELECT value FROM identity WHERE key=?', ('contract',)).fetchone()[0])
+            self.assertEqual(identity['quality_profile']['validation_scope'], 'structural')
+            self.assertEqual(identity['verifier'], STRUCTURAL_VERSION)
+            rag.batch_calls.clear()
+            with self.assertRaises(OpenIEPrepared):
+                rag.index(['Alpha is Beta.'])
+            self.assertEqual(rag.batch_calls, [])
+            self.assertFalse(rag.cached_rows[0]['openie_metadata']['triples']['semantic_verified'])
 
     def test_same_corpus_completed_stage_replayed_after_interruption(self):
         with tempfile.TemporaryDirectory() as directory:

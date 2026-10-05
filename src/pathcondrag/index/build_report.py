@@ -1,4 +1,4 @@
-"""Path-owned completion report for explicitly tolerant shared builds."""
+"""Path-owned completion report with explicit extraction validation scope."""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -6,7 +6,7 @@ from .publication_policy import apply_publication_policy
 
 
 def tolerant_index_build_report(rag, docs, config, seconds):
-    """Retain native coverage/storage checks and report tolerated failures."""
+    """Retain coverage/storage checks and report the publication policy."""
     expected_docs = set(docs)
     indexed_docs = set(rag.chunk_embedding_store.get_all_texts())
     chunk_ids = set(rag.chunk_embedding_store.get_all_ids())
@@ -36,9 +36,12 @@ def tolerant_index_build_report(rag, docs, config, seconds):
     stats = rag.llm_model.get_request_stats()
     if stats.get('http_attempts', 0) <= 0:
         raise RuntimeError(f'Fresh index did not perform LLM requests: {stats}')
+    profile = rag._quality_profile()
+    mode = profile.get('validation_mode', profile.get('openie_validation_mode', 'source_verified'))
     runtime = asdict(config)
-    runtime.update(openie_strict=False,
-                   openie_prompt_version=rag._quality_profile()['prompt_version'])
+    runtime.update(openie_strict=publication.get('openie_strict', False),
+                   openie_prompt_version=profile['prompt_version'],
+                   openie_validation_mode=mode)
     return {
         'dataset': config.dataset, 'method': 'hipporag2', 'eval_mode': 'index_only',
         'save_dir': config.save_dir, 'indexed_docs': len(indexed_docs),
@@ -50,5 +53,9 @@ def tolerant_index_build_report(rag, docs, config, seconds):
         'force_index_from_scratch': config.force_index_from_scratch,
         'force_openie_from_scratch': config.force_openie_from_scratch,
         'reuse_index': False, 'shared_index': True, 'index_build_complete': True,
-        'all_openie_verified': not failed, 'publication_report': publication,
+        'all_openie_complete': not failed,
+        'all_openie_verified': not failed and mode == 'source_verified',
+        'semantic_verification_applied': mode == 'source_verified',
+        'openie_validation_scope': 'structural' if mode == 'structural' else 'all_final_relations',
+        'publication_report': publication,
     }

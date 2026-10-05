@@ -9,6 +9,8 @@ import copy
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import logging
 
+from tqdm import tqdm
+
 from ..utils.misc_utils import NerRawOutput, TripleRawOutput
 from .openie.openie_quality import validate_triples
 
@@ -225,20 +227,25 @@ def run_openie_queue(extractor, chunks, initial_rows=None, checkpoint=None):
                 return recover(key, chunks[key]['content'], previous, round_number)
             return extractor.ner(key, chunks[key]['content'])
 
-        for processed, (key, result) in enumerate(
-                _bounded_results(ner_pending, ner_workers, extract_ner, 'ner'), 1):
+        ner_failed = 0
+        ner_bar = tqdm(_bounded_results(ner_pending, ner_workers, extract_ner, 'ner'),
+                       total=len(ner_pending), desc='NER')
+        for processed, (key, result) in enumerate(ner_bar, 1):
             ner_results[key] = _record_history(
                 'ner', key, ner_results.get(key), result, round_number,
                 'recover_pending_ner' if round_number > 1 else 'ner')
-            if not _ner_complete(result) and key not in triple_results:
-                # NER failure blocks publication through its own metadata. Do
-                # not discard an independently completed triple stage on resume.
-                triple_results[key] = _record_history(
-                    'triples', key, None, _pending_triples(key), round_number, 'await_ner')
+            if not _ner_complete(result):
+                ner_failed += 1
+                if key not in triple_results:
+                    # NER failure blocks publication through its own metadata. Do
+                    # not discard an independently completed triple stage on resume.
+                    triple_results[key] = _record_history(
+                        'triples', key, None, _pending_triples(key), round_number, 'await_ner')
             save(key)
+            ner_bar.set_postfix(pending_in_processed=ner_failed, refresh=False)
             if processed % 100 == 0 or processed == len(ner_pending):
-                logger.info('OpenIE queue round %d NER checkpointed: %d/%d',
-                            round_number, processed, len(ner_pending))
+                logger.info('OpenIE queue round %d NER checkpointed: %d/%d, pending_in_processed=%d',
+                            round_number, processed, len(ner_pending), ner_failed)
 
         triple_pending = [key for key in chunks
                           if _ner_complete(ner_results.get(key))
@@ -266,8 +273,10 @@ def run_openie_queue(extractor, chunks, initial_rows=None, checkpoint=None):
                     round_number, sum(not _ner_complete(ner_results.get(key)) for key in chunks),
                     len(triple_pending))
         round_failed = 0
-        for processed, (key, result) in enumerate(
-                _bounded_results(triple_pending, triple_workers, extract_triples, 'triples'), 1):
+        triple_bar = tqdm(
+            _bounded_results(triple_pending, triple_workers, extract_triples, 'triples'),
+            total=len(triple_pending), desc='Extracting triples')
+        for processed, (key, result) in enumerate(triple_bar, 1):
             triple_attempts[key] += 1
             previous = triple_results.get(key)
             result = _record_history('triples', key, previous, result, round_number,
@@ -281,6 +290,7 @@ def run_openie_queue(extractor, chunks, initial_rows=None, checkpoint=None):
                                            'Current source-verification contract is incomplete')
             triple_results[key] = result
             save(key)
+            triple_bar.set_postfix(pending_in_processed=round_failed, refresh=False)
             if processed % 100 == 0 or processed == len(triple_pending):
                 logger.info('OpenIE queue round %d triples checkpointed: %d/%d, pending_in_processed=%d',
                             round_number, processed, len(triple_pending), round_failed)

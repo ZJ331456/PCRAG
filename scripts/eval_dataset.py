@@ -171,6 +171,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         openie_max_workers=getattr(args, "openie_max_workers", None),
         openie_strict=getattr(args, "openie_strict", True),
         openie_prompt_version=getattr(args, "openie_prompt_version", "optimized"),
+        openie_validation_mode=getattr(args, "openie_validation_mode", "structural"),
         llm_prefetch_workers=int(getattr(args, "llm_prefetch_workers", 8)),
         improvement_stage=int(getattr(args, "improvement_stage", 0)),
         evidence_ablation_mode=getattr(args, "evidence_ablation_mode", "normal"),
@@ -556,6 +557,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openie_strict", type=parse_bool, default=True,
                         help="true aborts on final extraction failure; false excludes failed relations and continues.")
     parser.add_argument("--openie_prompt_version", choices=["origin", "optimized"], default="optimized")
+    parser.add_argument("--openie_validation_mode", choices=["structural", "source_verified"], default="structural",
+                        help="Index extraction: local structure checks (default) or extra LLM source evidence audits.")
     parser.add_argument("--openie_max_workers", type=_openie_worker_count, default=None,
                         help="Online indexing NER/triple concurrency (1..8). Explicit values override all HIPPO_OPENIE_* worker env settings; omitted uses env or 8. HTTP ceiling still applies.")
     parser.add_argument("--llm_prefetch_workers", type=int, default=8,

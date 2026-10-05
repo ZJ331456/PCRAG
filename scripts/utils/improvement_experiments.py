@@ -345,6 +345,9 @@ def freeze_index(args):
                    embedding_model=manifest["runtime"]["embedding_model_name"],
                    embedding_provider=manifest.get("embedding_provider") or manifest["runtime"].get("embedding_provider"),
                    model_dir=manifest["model_dir"])
+    index_manifest = read_json(source / manifest['model_dir'] / 'index_manifest.json')
+    quality = (index_manifest.get('openie') or {}).get('quality_profile') or {}
+    validation_scope = quality.get('validation_scope') or quality.get('semantic_scope') or 'baseline_structural'
     result = read_json(root / "index_build_result.json")
     require(result.get("eval_mode") == "index_only" and result.get("index_build_complete") is True,
             "index_only did not report successful index completion")
@@ -361,6 +364,11 @@ def freeze_index(args):
             "fresh OpenIE artifact has incomplete document coverage")
     require({row.get("passage") for row in openie_rows} == docs,
             "fresh OpenIE artifact does not cover the full corpus")
+    if quality:
+        # Choose the declared contract instead of imposing a semantic audit on
+        # structural-only extraction or treating a structural record as audited.
+        from .fresh_index_validation import _validated_rows
+        _validated_rows(openie_rows, docs, quality, strict=strict)
     for row in openie_rows:
         passage = row["passage"]
         require(row.get("idx") == "chunk-" + hashlib.md5(passage.encode()).hexdigest(),
@@ -414,6 +422,9 @@ def freeze_index(args):
         "validated": True, "index_build_mode": "fresh", "indexed_docs": len(docs),
         "openie_document_count": result["openie_document_count"],
         "openie_failure_count": result.get('openie_failure_count', 0), 'openie_strict': strict,
+        'validation_scope': validation_scope,
+        'quality_profile': quality,
+        'semantic_verified': False if validation_scope == 'structural' else None,
         "seconds": args.elapsed, "runtime_config": config, "llm_request_stats": stats,
         "http_status_in_log": status, "source_asset_sha256": hashes,
         "initial_cache_sha256": current_cache,

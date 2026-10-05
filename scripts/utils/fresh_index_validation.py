@@ -239,6 +239,17 @@ def _validated_rows(rows, docs, quality_profile, *, strict=True):
               "accepted_relations_final": 0, "accepted_assertions_across_passes": 0,
               "rejected_assertions_across_passes": 0, "failed_chunks_excluded_from_graph": 0}
     strict_scope = quality_profile.get('semantic_scope') == 'all_final_relations'
+    structural_scope = quality_profile.get('validation_scope') == 'structural'
+    if structural_scope:
+        from pathcondrag.index.openie.structural_openie import STRUCTURAL_VERSION, RECOVERY_BUDGET
+        _require(quality_profile.get('name') == 'pathcondrag_openie_structural_quality_v1'
+                 and quality_profile.get('validation_mode') == 'structural'
+                 and quality_profile.get('semantic_scope') == 'none'
+                 and quality_profile.get('semantic_verified') is False
+                 and quality_profile.get('structural_schema') == STRUCTURAL_VERSION
+                 and quality_profile.get('recovery_budget') == RECOVERY_BUDGET,
+                 'Structural fresh index has an inconsistent validation contract')
+        counts.update(structurally_checked_chunks=0, structural_empty_chunks=0)
     if quality_profile.get('name') == 'pathcondrag_openie_quality_v3':
         _require(strict_scope, 'A v3 fresh index must audit all final relations')
     if strict_scope:
@@ -268,7 +279,8 @@ def _validated_rows(rows, docs, quality_profile, *, strict=True):
                          or (metadata.get(stage) or {}).get('complete') is False
                          or (metadata.get(stage) or {}).get('finish_reason') != 'stop'
                          for stage in ('ner', 'triples'))
-                     or (metadata.get('triples') or {}).get('semantic_verified') is not True,
+                     or (not structural_scope
+                         and (metadata.get('triples') or {}).get('semantic_verified') is not True),
                      f'Tolerated row lacks original failure diagnostics: {chunk_id}')
             counts['failed_chunks_excluded_from_graph'] += 1
             counts['empty_chunks'] += 1
@@ -287,6 +299,34 @@ def _validated_rows(rows, docs, quality_profile, *, strict=True):
         _require(validation.raw_count == len(validation.valid_triples),
                  f'Duplicate fresh triples: {chunk_id}')
         triple_metadata = metadata["triples"]
+        if structural_scope:
+            from pathcondrag.index.openie.structural_openie import StructuralOpenIE, RECOVERY_BUDGET
+            from pathcondrag.utils.misc_utils import TripleRawOutput
+            _require(StructuralOpenIE.is_verified_complete(TripleRawOutput(
+                chunk_id, '', triples, triple_metadata)),
+                f'Incomplete structural triple validation: {chunk_id}')
+            calls = triple_metadata.get('structural_infer_calls')
+            _require(type(calls) is int and 0 <= calls <= RECOVERY_BUDGET,
+                     f'Structural triple inference budget exceeded: {chunk_id}')
+            _require(not triple_metadata.get('semantic_verification_history')
+                     and not triple_metadata.get('source_verified_schema')
+                     and not triple_metadata.get('requires_semantic_verification'),
+                     f'Structural extraction falsely retains semantic verification: {chunk_id}')
+            if not triples:
+                _require(triple_metadata.get('deterministically_empty_source') is True
+                         and not passage.strip(),
+                         f'Structural empty extraction lacks a deterministic empty source: {chunk_id}')
+                counts['empty_chunks'] += 1
+                counts['structural_empty_chunks'] += 1
+            counts['structurally_checked_chunks'] += 1
+            counts['recovered_chunks'] += bool(triple_metadata.get('quality_recovered'))
+            counts['accepted_relations_final'] += len(triples)
+            for triple in triples:
+                normalized = tuple(unicode_normalize(field) for field in triple)
+                _require(all(normalized), f"Empty normalized fresh triple field: {chunk_id}")
+                entities.update((normalized[0], normalized[2]))
+                facts.add(str(normalized))
+            continue
         recovered = bool(triple_metadata.get("quality_recovered")
                          or triple_metadata.get("source_verified_schema"))
         _require(not strict_scope or recovered,
@@ -377,9 +417,11 @@ def validate_fresh_index(out, index, docs, *, strict=True):
     _require(isinstance(provenance, dict) and manifest.get("openie") == provenance,
              "Fresh index manifest and OpenIE provenance differ")
     profile = provenance.get("quality_profile")
-    _require(isinstance(profile, dict)
-             and str(profile.get("extractor", "")).endswith(".SourceVerifiedOpenIE"),
-             "Fresh index was not built with source-verified PathCondRAG extraction")
+    _require(isinstance(profile, dict), "Fresh index has no PathCondRAG quality profile")
+    structural = profile.get('validation_scope') == 'structural'
+    expected_extractor = '.StructuralOpenIE' if structural else '.SourceVerifiedOpenIE'
+    _require(str(profile.get("extractor", "")).endswith(expected_extractor),
+             "Fresh index was not built with its declared PathCondRAG extraction contract")
     if not strict:
         _require(profile.get('openie_strict') is False,
                  'Tolerant validation requires an explicit tolerant publication contract')
@@ -412,6 +454,8 @@ def validate_fresh_index(out, index, docs, *, strict=True):
                  "Observed shared KNN execution profile is inconsistent")
     report = {"complete": True, "index": str(index), "indexed_docs": len(docs),
               "openie_strict": strict,
+              "validation_scope": 'structural' if structural else profile.get('semantic_scope', 'source_verified'),
+              "semantic_verified": False if structural else counts['audited_chunks'] == len(docs),
               "model_dir": directory.name, "invalid_records": 0,
               "quality_profile": profile, "vectors": vector_reports,
               "graph_nodes": graph.vcount(), "graph_edges": graph.ecount(),

@@ -24,6 +24,11 @@ from pathcondrag.utils.config_utils import BaseConfig  # noqa: E402
 class OpenIEConcurrencyConfigTests(unittest.TestCase):
     def test_defaults_preserve_openie_environment_and_use_retrieval_eight(self):
         self.assertIsNone(BaseConfig().openie_max_workers)
+        self.assertEqual(BaseConfig().openie_validation_mode, 'structural')
+        self.assertEqual(build_parser().parse_args(["--dataset", "musique"]).openie_validation_mode, 'structural')
+        self.assertEqual(build_parser().parse_args(
+            ["--dataset", "musique", "--openie_validation_mode", "source_verified"]).openie_validation_mode,
+            'source_verified')
         self.assertIsNone(build_parser().parse_args(["--dataset", "musique"]).openie_max_workers)
         config = PCRAGConfig(openie_max_workers=8, llm_prefetch_workers=4)
         self.assertEqual(config.openie_max_workers, 8)
@@ -33,6 +38,8 @@ class OpenIEConcurrencyConfigTests(unittest.TestCase):
         self.assertEqual(PCRAGConfig(llm_prefetch_workers=1).llm_prefetch_workers, 1)
 
     def test_invalid_explicit_limits_fail_without_clamping(self):
+        with self.assertRaisesRegex(ValueError, 'structural or source_verified'):
+            BaseConfig(openie_validation_mode='unknown')
         for value in (0, -1, 9, True, 1.5, "4"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 BaseConfig(openie_max_workers=value)
@@ -63,14 +70,17 @@ class OpenIEConcurrencyConfigTests(unittest.TestCase):
             pass
 
         with tempfile.TemporaryDirectory() as temporary:
-            for workers, prompt_version in ((None, 'optimized'), (4, 'optimized'),
-                                            (8, 'optimized'), (8, 'origin')):
-                with self.subTest(workers=workers, prompt_version=prompt_version):
+            for mode, workers, prompt_version in (
+                    (mode, workers, prompt) for mode in ('structural', 'source_verified')
+                    for workers, prompt in ((None, 'optimized'), (4, 'optimized'),
+                                            (8, 'optimized'), (8, 'origin'))):
+                with self.subTest(workers=workers, prompt_version=prompt_version, mode=mode):
                     config = BaseConfig(save_dir=temporary, openie_max_workers=workers,
-                                        openie_prompt_version=prompt_version)
+                                        openie_prompt_version=prompt_version, openie_validation_mode=mode)
                     llm = object()
                     with patch.object(module, "_get_llm_class", return_value=llm):
-                        with patch.object(module, "OpenIE", side_effect=StopBeforeEmbedding) as constructor:
+                        selected = 'StructuralOpenIE' if mode == 'structural' else 'OpenIE'
+                        with patch.object(module, selected, side_effect=StopBeforeEmbedding) as constructor:
                             with self.assertRaises(StopBeforeEmbedding):
                                 module.BaseRAG(global_config=config)
                     constructor.assert_called_once_with(
