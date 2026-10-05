@@ -9,6 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from .common import http_status_counts, read_json, write_json
+from eval_utils import get_benchmark_hops, get_gold_docs
 
 
 MODEL_DIR = "qwen3-8b__root_models_Qwen3-Embedding-8B"
@@ -30,6 +31,7 @@ ASSETS = (
     "entity_embeddings/vdb_entity.parquet",
     "fact_embeddings/vdb_fact.parquet",
 )
+DATASETS = ("hotpotqa", "2wikimultihopqa", "musique")
 
 
 def model_dir_name(embedding_model):
@@ -66,34 +68,103 @@ def passage_text(item):
     return item["title"] + "\n" + (item.get("text") or item.get("paragraph_text", ""))
 
 
-def gold_docs(sample):
-    return set(passage_text(p) for p in sample["paragraphs"] if p.get("is_supporting") is not False)
+def dataset_name_for(data_path=None, sample=None, dataset_name=None):
+    """Resolve the benchmark while retaining the historical MuSiQue default."""
+    if dataset_name:
+        require(dataset_name in DATASETS, f"unsupported retrieval dataset: {dataset_name}")
+        return dataset_name
+    if data_path and Path(data_path).stem in DATASETS:
+        return Path(data_path).stem
+    sample = sample or {}
+    if "question_decomposition" in sample or "paragraphs" in sample:
+        return "musique"
+    if "evidences" in sample:
+        return "2wikimultihopqa"
+    if "supporting_facts" in sample and "context" in sample:
+        return "hotpotqa"
+    raise ValueError("cannot identify retrieval dataset from its path/schema")
 
 
-def validated_dataset(data_path, corpus_path):
+def sample_identity(sample, index):
+    """Match detailed_result's id/_id/query-index export policy exactly."""
+    return sample.get("id", sample.get("_id", index))
+
+
+def benchmark_hop_policy(dataset_name):
+    """State whether a supplied hop value is an oracle label or dataset prior."""
+    return {
+        "scope": "per_question_decomposition" if dataset_name == "musique" else "dataset_prior",
+        "source": "question_decomposition_length" if dataset_name == "musique" else "dataset_prior:2",
+        "uses_gold_relations": False,
+        "baseline_export_scope": "per_question_id" if dataset_name == "musique" else "unavailable",
+    }
+
+
+def gold_docs(sample, dataset_name=None):
+    name = dataset_name_for(sample=sample, dataset_name=dataset_name)
+    return set(get_gold_docs([sample], name)[0])
+
+
+def validated_dataset(data_path, corpus_path, dataset_name=None):
     data, corpus = read_json(data_path), read_json(corpus_path)
     require(isinstance(data, list) and bool(data), "dataset must be a non-empty list")
     require(isinstance(corpus, list) and bool(corpus), "corpus must be a non-empty list")
+    require(all(isinstance(sample, dict) for sample in data), "dataset contains non-object samples")
+    name = dataset_name_for(data_path, data[0], dataset_name)
+    require(all(isinstance(p, dict) and isinstance(p.get("title"), str)
+                and isinstance(p.get("text") or p.get("paragraph_text", ""), str)
+                for p in corpus), "corpus contains invalid title/text passages")
     docs = set(passage_text(p) for p in corpus)
-    hops = []
+    # Use the same reader as the actual retrieval entry point. Gold relations
+    # are used only to validate exports; they never enter retrieval planning.
+    if name == "musique":
+        for i, sample in enumerate(data):
+            decomposition = sample.get("question_decomposition")
+            require(isinstance(decomposition, list) and len(decomposition) in (2, 3, 4)
+                    and all(isinstance(step, dict) and isinstance(step.get("question"), str)
+                            and bool(step["question"].strip()) for step in decomposition),
+                    f"dataset[{i}] lacks valid 2/3/4-hop annotations")
+    hops = get_benchmark_hops(data, name)
     ids = set()
     for i, sample in enumerate(data):
         require(isinstance(sample.get("question"), str) and bool(sample["question"].strip()),
                 f"dataset[{i}] lacks a question")
-        decomposition = sample.get("question_decomposition")
-        require(isinstance(decomposition, list) and len(decomposition) in (2, 3, 4)
-                and all(isinstance(s, dict) and isinstance(s.get("question"), str)
-                        and bool(s["question"].strip()) for s in decomposition),
-                f"dataset[{i}] lacks valid 2/3/4-hop annotations")
-        hop = len(decomposition)
-        match = re.match(r"([234])hop\d*(?:__|_)", str(sample.get("id", "")))
-        require(match is not None and int(match[1]) == hop, f"dataset[{i}] hop ID mismatch")
-        require(sample["id"] not in ids, f"duplicate sample ID: {sample['id']}")
-        ids.add(sample["id"])
-        gold = gold_docs(sample)
+        if name == "musique":
+            match = re.match(r"([234])hop\d*(?:__|_)", str(sample.get("id", "")))
+            require(match is not None and int(match[1]) == hops[i], f"dataset[{i}] hop ID mismatch")
+        else:
+            require(isinstance(sample.get("supporting_facts"), list)
+                    and bool(sample["supporting_facts"])
+                    and all(isinstance(fact, (list, tuple)) and len(fact) == 2
+                            and isinstance(fact[0], str) for fact in sample["supporting_facts"]),
+                    f"dataset[{i}] lacks valid supporting facts")
+            require(isinstance(sample.get("context"), list), f"dataset[{i}] lacks context passages")
+            require(all(isinstance(item, (list, tuple)) and len(item) == 2
+                        and isinstance(item[0], str) and isinstance(item[1], list)
+                        and all(isinstance(sentence, str) for sentence in item[1])
+                        for item in sample["context"]), f"dataset[{i}] has invalid context passages")
+            support_titles = {fact[0] for fact in sample["supporting_facts"]}
+            require(support_titles <= {item[0] for item in sample["context"]},
+                    f"dataset[{i}] supporting titles absent from context")
+        identity = sample_identity(sample, i)
+        require(isinstance(identity, (str, int)) and not isinstance(identity, bool),
+                f"dataset[{i}] has invalid sample ID")
+        require(identity not in ids, f"duplicate sample ID: {identity}")
+        ids.add(identity)
+        gold = gold_docs(sample, name)
         require(bool(gold) and gold <= docs, f"dataset[{i}] gold passages absent from corpus")
-        hops.append(hop)
     return data, docs, hops
+
+
+def fresh_index_path(root, dataset_name=None, shared_output_root=None):
+    """Declare exactly one dataset's persistent shared-index location."""
+    if shared_output_root:
+        shared_root = Path(shared_output_root).resolve()
+        require(dataset_name in DATASETS, "a shared output root requires an explicit dataset")
+        require(root == shared_root / "metadata" / dataset_name,
+                "shared dataset metadata must be in SHARED_OUTPUT_ROOT/metadata/DATASET")
+        return shared_root / "shared_indexes" / dataset_name
+    return root / "shared_hipporag2_index"
 
 
 def load_indices(path, total):
@@ -125,13 +196,16 @@ def index_identity(source, docs, embedding_model=None, embedding_provider=None, 
 def prepare(args):
     out, source = Path(args.out_root).resolve(), Path(args.source_index).resolve()
     fresh = bool(getattr(args, "build_shared_index", False))
+    requested_dataset = getattr(args, "dataset", None)
+    shared_output_root = getattr(args, "shared_output_root", None)
     if fresh:
-        require(source == out / "shared_hipporag2_index",
-                "fresh source_index must equal OUT_ROOT/shared_hipporag2_index")
+        expected = fresh_index_path(out, requested_dataset, shared_output_root)
+        require(source == expected, f"fresh source_index must equal OUT_ROOT declared shared index: {expected}")
     else:
         require(source != out and source not in out.parents and out not in source.parents,
                 "source index and output directory must be separate")
-    data, docs, hops = validated_dataset(args.data_path, args.corpus_path)
+    data, docs, hops = validated_dataset(args.data_path, args.corpus_path, requested_dataset)
+    dataset = dataset_name_for(args.data_path, data[0], requested_dataset)
     require(0 <= args.sample_size <= len(data), "sample_size must be between 0 and dataset size")
     if args.sample_indices_file:
         indices = load_indices(args.sample_indices_file, len(data))
@@ -139,8 +213,9 @@ def prepare(args):
     elif not args.sample_size:
         indices = list(range(len(data)))
     elif args.sample_size == 2:
-        require(2 in hops and 4 in hops, "two-question smoke requires both 2-hop and 4-hop samples")
-        indices = [hops.index(2), hops.index(4)]
+        # Keep the MuSiQue smoke's 2/4-hop coverage, and select two real
+        # questions for datasets without a 4-hop label in the supplied subset.
+        indices = [hops.index(2), hops.index(4)] if 2 in hops and 4 in hops else [0, 1]
     else:
         indices = sorted(random.Random(args.sample_seed).sample(range(len(data)), args.sample_size))
     names = args.cases.split() if args.cases else list(CASES)
@@ -171,7 +246,7 @@ def prepare(args):
         "source_asset_sha256": hashes, "initial_cache_sha256": initial_cache,
         "indexed_docs": len(docs), "dataset_size": len(data),
         "sample_size_requested": args.sample_size, "sample_seed": args.sample_seed,
-        "selected_indices": indices, "selected_sample_ids": [data[i]["id"] for i in indices],
+        "selected_indices": indices, "selected_sample_ids": [sample_identity(data[i], i) for i in indices],
         "benchmark_hops": [hops[i] for i in indices],
         "hop_distribution": dict(Counter(str(hops[i]) for i in indices)),
         "dataset_hop_distribution": dict(Counter(map(str, hops))),
@@ -183,6 +258,15 @@ def prepare(args):
                     "max_new_tokens": 2048, "enable_thinking": False,
                     "retrieval_top_k": 200, "result_top_k": 10, "candidate_output_top_k": 200},
     }
+    # Omit these additions for historical MuSiQue callers so frozen manifests
+    # from the seven-case experiment remain resumable without rewriting them.
+    if requested_dataset or dataset != "musique" or shared_output_root:
+        manifest["dataset"] = dataset
+        manifest["benchmark_hop_policy"] = benchmark_hop_policy(dataset)
+        manifest["gold_support_count_distribution"] = dict(Counter(
+            str(len(gold_docs(data[i], dataset))) for i in indices))
+    if shared_output_root:
+        manifest["shared_output_root"] = str(Path(shared_output_root).resolve())
     out.mkdir(parents=True, exist_ok=True)
     manifest_path = out / "manifest.json"
     snapshot = out / "initial_llm_cache"
@@ -243,6 +327,7 @@ def index_ready(args):
 
 def freeze_index(args):
     strict = getattr(args, 'openie_strict', True)
+    require(type(strict) is bool, "openie_strict must be a boolean")
     root, manifest = Path(args.out_root).resolve(), manifest_at(args.out_root)
     require(manifest.get("index_build_mode") == "fresh", "freeze-index requires fresh build mode")
     if manifest.get("index_build_status") == "ready":
@@ -251,10 +336,11 @@ def freeze_index(args):
         return
     require(manifest.get("index_build_status") == "pending", "invalid shared index state")
     source = Path(manifest["source_index"]).resolve()
-    require(source == root / "shared_hipporag2_index", "fresh shared index path mismatch")
+    require(source == fresh_index_path(root, manifest.get("dataset"), manifest.get("shared_output_root")),
+            "fresh shared index path mismatch")
     require(sha256(manifest["data_path"]) == manifest["data_sha256"], "dataset changed during index build")
     require(sha256(manifest["corpus_path"]) == manifest["corpus_sha256"], "corpus changed during index build")
-    _, docs, _ = validated_dataset(manifest["data_path"], manifest["corpus_path"])
+    _, docs, _ = validated_dataset(manifest["data_path"], manifest["corpus_path"], manifest.get("dataset"))
     index_identity(source, docs,
                    embedding_model=manifest["runtime"]["embedding_model_name"],
                    embedding_provider=manifest.get("embedding_provider") or manifest["runtime"].get("embedding_provider"),
@@ -392,6 +478,12 @@ def recall(gold, docs):
 
 def validate_result(result, manifest, name, data, corpus, expected_stage=None):
     indices = manifest["selected_indices"]
+    if manifest.get("dataset"):
+        require(result.get("dataset") == manifest["dataset"], "result dataset mismatch")
+        require(result.get("eval_mode") == "retrieve" and not result.get("qa_metrics"),
+                "multi-dataset experiment must perform retrieval only")
+        indexed_count = result.get("n_docs") if name == "hipporag2" else result.get("indexed_docs")
+        require(indexed_count == len(corpus), "retrieval index does not cover the declared full corpus")
     require(result.get("selected_indices") == indices, "selected indices mismatch")
     require(result.get("sample_size_effective") == len(indices), "sample count mismatch")
     require(result.get("result_top_k") == 10 and result.get("candidate_output_top_k") == 200,
@@ -413,9 +505,14 @@ def validate_result(result, manifest, name, data, corpus, expected_stage=None):
     measurements = []
     for position, (row, index) in enumerate(zip(rows, indices)):
         sample, hop = data[index], manifest["benchmark_hops"][position]
-        require(row.get("query_index") == index and row.get("sample_id") == sample["id"],
+        require(row.get("query_index") == index and row.get("sample_id") == sample_identity(sample, index),
                 f"row {position}: sample identity mismatch")
-        require(row.get("benchmark_hops") == hop and row.get("question") == sample["question"],
+        dataset = dataset_name_for(sample=sample, dataset_name=manifest.get("dataset"))
+        # Native Hippo only exports MuSiQue hops parsed from its question ID.
+        # Hotpot/2Wiki have no per-question hop field in that baseline output;
+        # the PathCondRAG reader still supplies the existing dataset prior.
+        exported_hop = None if name == "hipporag2" and dataset != "musique" else hop
+        require(row.get("benchmark_hops") == exported_hop and row.get("question") == sample["question"],
                 f"row {position}: question/hop mismatch")
         docs, candidates = row.get("docs"), row.get("candidate_docs")
         require(isinstance(docs, list) and len(docs) == 10 and len(set(docs)) == 10,
@@ -429,7 +526,7 @@ def validate_result(result, manifest, name, data, corpus, expected_stage=None):
             require(isinstance(scores, list) and len(scores) == count
                     and all(isinstance(s, (int, float)) and math.isfinite(s) for s in scores),
                     f"row {position}: invalid {key}")
-        gold = gold_docs(sample)
+        gold = gold_docs(sample, manifest.get("dataset"))
         require(set(row.get("gold_docs") or []) == gold, f"row {position}: exported gold docs mismatch")
         metrics = {f"Recall@{k}": recall(gold, candidates[:k]) for k in (1, 2, 5, 10, 20, 200)}
         published_row = row.get("retrieval_metrics") or {}
@@ -463,7 +560,7 @@ def report(args):
     require(name in manifest["cases"], "case not selected")
     require(sha256(manifest["data_path"]) == manifest["data_sha256"], "dataset changed")
     require(sha256(manifest["corpus_path"]) == manifest["corpus_sha256"], "corpus changed")
-    data, corpus, _ = validated_dataset(manifest["data_path"], manifest["corpus_path"])
+    data, corpus, _ = validated_dataset(manifest["data_path"], manifest["corpus_path"], manifest.get("dataset"))
     case = root / "cases" / name
     result = read_json(case / "result.json")
     measurements, metrics = validate_result(result, manifest, name, data, corpus)
@@ -482,7 +579,7 @@ def report(args):
     require(stats.get("max_in_flight") == 8, "HTTP in-flight ceiling must be 8")
     require(not stats.get("http_attempts") or bool(status), "HTTP attempts have no vLLM status accounting")
     stratified = {}
-    for hop in (2, 3, 4):
+    for hop in sorted({m["hops"] for m in measurements}):
         subset = [m for m in measurements if m["hops"] == hop]
         if subset:
             stratified[str(hop)] = {
@@ -503,6 +600,10 @@ def report(args):
         "asset_sha256_before": before["asset_sha256"], "asset_sha256_after": after,
         "per_question": measurements,
     }
+    if manifest.get("dataset"):
+        output["dataset"] = manifest["dataset"]
+        output["benchmark_hop_policy"] = manifest["benchmark_hop_policy"]
+        output["gold_support_count_distribution"] = manifest["gold_support_count_distribution"]
     write_json(case / "report.json", output)
     write_json(case / "validated.ok", {"result_sha256": sha256(case / "result.json"),
                                       "report_sha256": sha256(case / "report.json"),
@@ -539,6 +640,9 @@ def register_commands(subparsers):
     parser.add_argument("--source-index", required=True)
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--corpus-path", required=True)
+    parser.add_argument("--dataset", choices=DATASETS)
+    parser.add_argument("--shared-output-root",
+                        help="persistent multi-dataset root containing metadata/ and shared_indexes/")
     parser.add_argument("--sample-size", type=int, default=0)
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--sample-indices-file")
@@ -558,7 +662,12 @@ def register_commands(subparsers):
     parser.add_argument("--vllm-log", required=True)
     parser.add_argument("--log-start", type=int, required=True)
     parser.add_argument("--log-end", type=int, required=True)
-    parser.set_defaults(handler=freeze_index)
+    parser.add_argument("--openie-strict", choices=("true", "false"), default="true",
+                        type=lambda value: value.lower(), dest="openie_strict_choice")
+    def freeze_cli(args):
+        args.openie_strict = args.openie_strict_choice == "true"
+        return freeze_index(args)
+    parser.set_defaults(handler=freeze_cli)
     for command, handler in (("improvement-initialize-case", initialize_case), ("improvement-ready", ready)):
         parser = subparsers.add_parser(command)
         parser.add_argument("--out-root", required=True)
