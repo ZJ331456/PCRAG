@@ -10,7 +10,8 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from pathcondrag.index.checkpoint_migration import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from utils.openie_checkpoint_migration import (
     migrate_source_verified_checkpoint, validate_migration_identity,
 )
 from pathcondrag.index.openie_checkpoint import OpenIECheckpoint

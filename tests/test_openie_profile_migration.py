@@ -11,7 +11,8 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from pathcondrag.index import profile_migration as migration
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from utils import openie_profile_migration as migration
 from pathcondrag.index.openie_checkpoint import OpenIECheckpoint
 from pathcondrag.index.shared_index_builder import quality_profile
 

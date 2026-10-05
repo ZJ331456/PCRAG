@@ -20,6 +20,10 @@
 信息抽取实现统一位于 `ner/` 与 `openie/`，项目内部均引用这些新路径。
 离线模型依赖只在构造相应后端时加载。
 
+手工检查点迁移工具位于 `scripts/utils/openie_checkpoint_migration.py` 和
+`scripts/utils/openie_profile_migration.py`，入口为 `scripts/migrate_structural_index.py`。
+正常建库和续跑使用 `openie_checkpoint.py`，不会自动执行模式迁移。
+
 ## 失败策略与提示词
 
 构建入口可以追加以下参数，`eval_dataset.py` 和新索引对比脚本也支持它们：

@@ -14,8 +14,8 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from .openie_checkpoint import OpenIECheckpoint
-from .openie.openie_quality import validate_triples
+from pathcondrag.index.openie_checkpoint import OpenIECheckpoint
+from pathcondrag.index.openie.openie_quality import validate_triples
 
 
 MIGRATION_VERSION = 'pathcondrag_source_to_structural_checkpoint_v1'

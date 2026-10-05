@@ -15,8 +15,8 @@ import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .checkpoint_migration import migrate_source_verified_checkpoint
-from .shared_index_builder import quality_profile
+from .openie_checkpoint_migration import migrate_source_verified_checkpoint
+from pathcondrag.index.shared_index_builder import quality_profile
 
 MODEL_DIR = 'qwen3-8b__root_models_Qwen3-Embedding-8B'
 
