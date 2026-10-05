@@ -478,6 +478,7 @@ def recall(gold, docs):
 
 def validate_result(result, manifest, name, data, corpus, expected_stage=None):
     indices = manifest["selected_indices"]
+    expected_candidates = min(200, len(corpus))
     if manifest.get("dataset"):
         require(result.get("dataset") == manifest["dataset"], "result dataset mismatch")
         require(result.get("eval_mode") == "retrieve" and not result.get("qa_metrics"),
@@ -517,11 +518,12 @@ def validate_result(result, manifest, name, data, corpus, expected_stage=None):
         docs, candidates = row.get("docs"), row.get("candidate_docs")
         require(isinstance(docs, list) and len(docs) == 10 and len(set(docs)) == 10,
                 f"row {position}: need 10 unique result documents")
-        require(isinstance(candidates, list) and len(candidates) == 200 and len(set(candidates)) == 200,
-                f"row {position}: need 200 unique candidate documents")
+        require(isinstance(candidates, list) and len(candidates) == expected_candidates
+                and len(set(candidates)) == expected_candidates,
+                f"row {position}: need {expected_candidates} unique candidate documents")
         require(docs == candidates[:10], f"row {position}: result/candidate prefixes differ")
         require(set(candidates) <= corpus, f"row {position}: document absent from corpus")
-        for key, count in (("doc_scores", 10), ("candidate_doc_scores", 200)):
+        for key, count in (("doc_scores", 10), ("candidate_doc_scores", expected_candidates)):
             scores = row.get(key)
             require(isinstance(scores, list) and len(scores) == count
                     and all(isinstance(s, (int, float)) and math.isfinite(s) for s in scores),

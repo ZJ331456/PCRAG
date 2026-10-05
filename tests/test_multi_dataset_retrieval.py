@@ -108,7 +108,7 @@ class MultiDatasetRunnerTests(unittest.TestCase):
             self.assertEqual(json.loads((directory / 'hotpotqa.json').read_text()), samples)
             _, docs, hops = experiments.validated_dataset(directory / 'hotpotqa.json',
                                                           directory / 'hotpotqa_corpus.json')
-            self.assertEqual(len(docs), 200)
+            self.assertEqual(len(docs), 20)
             self.assertEqual(hops, [2, 2])
 
     def test_failed_case_keeps_running_other_methods_and_reports_failure(self):

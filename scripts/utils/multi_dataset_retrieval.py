@@ -35,7 +35,7 @@ def sample_id(sample, position):
 
 
 def smoke_dataset(out, source, name):
-    """Keep original questions/gold passages plus intact distractors to Top200."""
+    """Keep original questions/gold passages plus 20 intact source passages."""
     from eval_utils import get_gold_docs
 
     data, _, hops = experiments.validated_dataset(
@@ -57,10 +57,10 @@ def smoke_dataset(out, source, name):
         text = experiments.passage_text(row)
         if len(text.partition('\n')[2]) >= 80:
             selected[text] = row
-        if len(selected) >= 200:
+        if len(selected) >= 20:
             break
-    if len(selected) < 200:
-        raise ValueError(f'{name}: smoke needs 200 unique source passages')
+    if len(selected) < 20:
+        raise ValueError(f'{name}: smoke needs 20 unique source passages')
     destination = out / 'smoke_datasets'
     destination.mkdir(parents=True, exist_ok=True)
     write_json(destination / f'{name}.json', samples)

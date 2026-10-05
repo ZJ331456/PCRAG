@@ -80,7 +80,7 @@ class MultiDatasetProtocolTests(unittest.TestCase):
                          "benchmark_hops": (None if name == "hipporag2" and manifest["dataset"] != "musique"
                                             else manifest["benchmark_hops"][len(rows)]),
                          "docs": candidates[:10], "doc_scores": [1.0] * 10,
-                         "candidate_docs": candidates, "candidate_doc_scores": [1.0] * 200,
+                         "candidate_docs": candidates, "candidate_doc_scores": [1.0] * len(candidates),
                          "gold_docs": sorted(gold), "retrieval_metrics": metrics,
                          "gold_document_ranks": [{"doc": doc, "rank": candidates.index(doc) + 1}
                                                  for doc in sorted(gold)],
@@ -130,6 +130,22 @@ class MultiDatasetProtocolTests(unittest.TestCase):
                     result["results"][0]["sample_id"] = "wrong-sample"
                     with self.assertRaisesRegex(ValueError, "sample identity"):
                         protocol.validate_result(result, manifest, name, data, docs)
+
+    def test_tiny_corpus_exports_available_candidates_without_padding(self):
+        self.corpus = self.corpus[:20]
+        _, data, manifest = self.prepare("hotpotqa")
+        docs = {protocol.passage_text(item) for item in self.corpus}
+        for name in manifest["cases"]:
+            with self.subTest(case=name):
+                result = self.result(manifest, data, name)
+                measurements, metrics = protocol.validate_result(result, manifest, name, data, docs)
+                self.assertEqual(len(measurements), 2)
+                self.assertEqual(metrics["Recall@200"], 1.0)
+                self.assertEqual(len(result["results"][0]["docs"]), 10)
+                self.assertEqual(len(result["results"][0]["candidate_docs"]), 20)
+                result["results"][0]["candidate_doc_scores"].pop()
+                with self.assertRaisesRegex(ValueError, "invalid candidate_doc_scores"):
+                    protocol.validate_result(result, manifest, name, data, docs)
 
     def test_missing_support_and_duplicate_identity_are_rejected(self):
         args, data, _ = self.prepare("hotpotqa")
