@@ -62,8 +62,12 @@ class PCRAG(BaseRAG):
         self.evidence_runtime = None
         if self.pcrag_config.improvement_stage >= 2:
             if self.pcrag_config.evidence_ablation_mode == "normal":
-                from .evidence_retrieval import EvidenceRetrieval
-                self.evidence_runtime = EvidenceRetrieval(self)
+                if self.pcrag_config.evidence_improvements:
+                    from .evidence_improvements import ImprovedEvidenceRetrieval
+                    self.evidence_runtime = ImprovedEvidenceRetrieval(self)
+                else:
+                    from .evidence_retrieval import EvidenceRetrieval
+                    self.evidence_runtime = EvidenceRetrieval(self)
             else:
                 from .evidence_ablation import EvidenceAblation
                 self.evidence_runtime = EvidenceAblation(self)

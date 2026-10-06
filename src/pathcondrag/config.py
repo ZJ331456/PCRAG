@@ -24,6 +24,11 @@ class PCRAGConfig(BaseConfig):
     evidence_binding_mode: str = "literal"
     evidence_selection_mode: str = "coverage"
     evidence_ablation_inputs_file: str = ""
+    # Optional, independently evaluated extensions to online stage-4 retrieval.
+    evidence_improvements: str = ""
+    evidence_plan_node_budget: int = 6
+    evidence_plan_depth_budget: int = 4
+    evidence_selection_top_k: int = 10
 
     # Hop estimation
     use_enhanced_hop_estimation: bool = field(default=True)
@@ -145,6 +150,18 @@ class PCRAGConfig(BaseConfig):
         super().__post_init__()
         if self.improvement_stage not in range(6):
             raise ValueError("improvement_stage must be 0 through 5")
+        flags = {f.strip() for f in self.evidence_improvements.split(",") if f.strip()}
+        if flags - {"planning", "selection", "binding", "closure", "adaptive"}:
+            raise ValueError("Unknown evidence_improvements flag")
+        if flags and (self.improvement_stage != 4 or self.evidence_ablation_mode != "normal"):
+            raise ValueError("Evidence improvements require normal stage-4 retrieval")
+        self.evidence_improvements = ",".join(sorted(flags))
+        if not 1 <= int(self.evidence_plan_node_budget) <= 8:
+            raise ValueError("evidence_plan_node_budget must be 1 through 8")
+        if not 1 <= int(self.evidence_plan_depth_budget) <= 4:
+            raise ValueError("evidence_plan_depth_budget must be 1 through 4")
+        if not 1 <= int(self.evidence_selection_top_k) <= 20:
+            raise ValueError("evidence_selection_top_k must be 1 through 20")
         if self.evidence_ablation_mode not in {"normal", "budget_dag", "budget_qd", "budget_iterative", "fixed_pool", "validation", "selection"}:
             raise ValueError("Unknown evidence_ablation_mode")
         if self.evidence_binding_mode not in {"string", "literal", "relation"}:

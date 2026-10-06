@@ -382,6 +382,10 @@ class EvidenceRetrieval:
             -self._beam_score(b, total), tuple(sorted(b["bindings"].items()))))
         return ordered[:self.beam_width]
 
+    def _verification_documents(self, ids: List[int]) -> Dict[int, str]:
+        """The original verifier receives the first three bounded passages."""
+        return {doc_id: self._document(doc_id)[:4000] for doc_id in ids[:3]}
+
     def _dependency_search(self, states: List[dict], executor):
         active = [s for s in states if s.get("_evidence_plan")]
         for state in active:
@@ -407,8 +411,8 @@ class EvidenceRetrieval:
                         if not ids:
                             continue
                         # The verifier sees exactly these spans, not unbounded full documents.
-                        docs = {doc_id: self._document(doc_id)[:4000] for doc_id in ids[:3]}
-                        task = (state, node, beam_index, ids[:3], question, docs)
+                        docs = self._verification_documents(ids)
+                        task = (state, node, beam_index, list(docs), question, docs)
                         task_lookup[(id(state), node["id"], beam_index)] = len(tasks)
                         tasks.append(task)
             results = self._collect_jobs(executor, [
