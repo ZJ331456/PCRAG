@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import sqlite3
 from types import SimpleNamespace
@@ -444,13 +445,17 @@ def full(args, contexts, env, summary, summary_file):
               'original full results preserved, no duplicate baseline labeled as improvement.', flush=True)
         return
     summary.setdefault('full', {})
+    case_name = getattr(args, 'final_case_name', None) or FINAL_CASE
     for dataset, context in contexts.items():
         indices = list(context['manifest']['selected_indices'])
-        report, _ = run_case(args, context, Path(args.out_root) / 'cases' / dataset / FINAL_CASE,
+        print(f'[full-start] {dataset}/{case_name} n={len(indices)} flags={flags_name(flags)}', flush=True)
+        report, _ = run_case(args, context, Path(args.out_root) / 'cases' / dataset / case_name,
                             indices, flags, env)
         summary['full'][dataset] = compact(report)
         write_json(summary_file, summary)
     summary['full_complete'] = True
+    if args.mode == 'reviewed-full':
+        summary['selection_status'] = '48_screen_positive_full_validation_completed'
     write_json(summary_file, summary)
 
 
@@ -520,6 +525,114 @@ def protocol_for(args, contexts):
             'screen_size': args.screen_size, 'confirm_size': args.confirm_size, 'seed': 42}
 
 
+def require_reviewed_protocol(summary, protocol):
+    """A user-reviewed full run may change this orchestration file, nothing else."""
+    old = summary.get('protocol')
+    if not isinstance(old, dict):
+        raise ValueError('A signed screening protocol is required for reviewed-full')
+    expected_hash = hashlib.sha256(json.dumps(old, sort_keys=True).encode()).hexdigest()
+    if summary.get('protocol_sha256') != expected_hash:
+        raise ValueError('Original screening protocol signature differs')
+    previous, current = deepcopy(old), deepcopy(protocol)
+    runner_path = 'scripts/utils/exp4_improvements.py'
+    for item in (previous, current):
+        if runner_path not in item.get('algorithm_code_sha256', {}):
+            raise ValueError('Screening protocol omits the orchestration code hash')
+        item['algorithm_code_sha256'].pop(runner_path)
+    if previous != current:
+        raise ValueError('Reviewed-full requires unchanged core algorithm, inputs, cache and runtime; '
+                         'only this orchestration file may change')
+    if summary.get('reviewed_full_protocol') and summary['reviewed_full_protocol'] != protocol:
+        raise ValueError('Existing reviewed-full protocol changed; refusing incompatible resume')
+
+
+def reviewed_case_name(suffix):
+    if not isinstance(suffix, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,80}', suffix):
+        raise ValueError('Case suffix must contain only letters, digits or underscores')
+    return FINAL_CASE + '_' + suffix
+
+
+def verify_trial_report(case):
+    marker = read_json(case / 'validated.ok')
+    for field, filename in [('result_sha256', 'result.json'), ('report_sha256', 'report.json'),
+                            ('manifest_sha256', 'manifest.json')]:
+        if marker.get(field) != experiments.sha256(case / filename):
+            raise ValueError(f'Screening artifact changed before cleanup: {case / filename}')
+    report, manifest = read_json(case / 'report.json'), read_json(case / 'manifest.json')
+    rows = report.get('per_question') or []
+    if (report.get('validated') is not True or len(rows) != report.get('n_samples') or
+            [row['query_index'] for row in rows] != manifest['selected_indices']):
+        raise ValueError(f'Incomplete screening measurements: {case}')
+    return report
+
+
+def prepare_reviewed_full(args, contexts, summary, summary_file, protocol):
+    require_smoke(summary)
+    require_reviewed_protocol(summary, protocol)
+    tokens = [part.strip() for part in (args.flags or '').split(',') if part.strip()]
+    flags = frozenset(tokens)
+    if not flags or len(tokens) != len(flags) or not flags <= set(FLAGS):
+        raise ValueError('Reviewed-full requires explicit, unique known --flags')
+    args.final_case_name = reviewed_case_name(args.case_suffix)
+    name = flags_name(flags)
+    candidate = summary.get('screen', {}).get('variants', {}).get(name)
+    if not candidate or candidate.get('eligible') is not True or set(candidate.get('flags', [])) != flags:
+        raise ValueError('Explicit flags must identify a completed positive screening variant')
+    reports = candidate.get('reports', {})
+    if set(reports) != set(DATASETS) or any(report.get('validated') is not True for report in reports.values()):
+        raise ValueError('Reviewed variant needs validated reports from all three datasets')
+    temp = Path(args.out_root).resolve() / TEMP_NAME
+    already_prepared = bool(summary.get('reviewed_full_decision'))
+    if already_prepared:
+        decision = summary['reviewed_full_decision']
+        if decision['flags'] != [flag for flag in FLAGS if flag in flags] or decision['case_name'] != args.final_case_name:
+            raise ValueError('Reviewed-full decision differs from the existing full run')
+    else:
+        # Recheck selected reports and their paired controls before deleting raw
+        # trials. Hash markers cover exported results, reports and manifests.
+        for dataset, context in contexts.items():
+            for variant in ('baseline', name):
+                case = temp / 'screen' / dataset / variant
+                report = verify_trial_report(case)
+                if experiments.asset_hashes(case / 'index', context['manifest']['model_dir']) != context['manifest']['source_asset_sha256']:
+                    raise ValueError(f'Screened private index differs from public frozen index: {case}')
+                saved = (summary['screen']['baselines'][dataset] if variant == 'baseline' else reports[dataset])
+                if report != saved:
+                    raise ValueError(f'Saved screening statistics differ from validated report: {case}')
+        before_file = summary_file.with_name('selection_before_reviewed_full.json')
+        if not before_file.exists():
+            write_json(before_file, summary)
+        archive = {}
+        for phase in ('smoke', 'screen', 'confirmation'):
+            for report_path in sorted((temp / phase).glob('*/*/report.json')):
+                case = report_path.parent
+                if not (case / 'validated.ok').is_file():
+                    continue
+                report = verify_trial_report(case)
+                archive[str(case.relative_to(temp))] = report
+        summary['reviewed_archived_trial_reports'] = archive
+        summary['reviewed_full_decision'] = {
+            'flags': [flag for flag in FLAGS if flag in flags], 'case_name': args.final_case_name,
+            'basis': 'explicit user request to proceed from positive 48-question screening to full evaluation',
+            'user_requested_skip_confirmation': True, 'confirmation_passed': False,
+            'prior_selection_status': summary.get('selection_status'),
+            'screening_variant': name,
+            'original_selection_snapshot': str(before_file),
+            'original_selection_snapshot_sha256': experiments.sha256(before_file),
+            'known_disabled_component_issue': 'Closure fallback may exclude accepted documents; '
+                                              'core algorithm is frozen and closure is not enabled for adaptive-only.',
+            'closure_enabled': 'closure' in flags,
+        }
+    summary['reviewed_full_protocol'] = protocol
+    summary['reviewed_full_protocol_sha256'] = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+    summary['chosen_flags'] = [flag for flag in FLAGS if flag in flags]
+    summary['chosen_name'] = name
+    summary['selection_status'] = '48_screen_positive_full_validation_pending'
+    write_json(summary_file, summary)
+    print(f'[reviewed-full] flags={name} case={args.final_case_name}; '
+          '48-question screening reused, no new smoke/screen/24-question confirmation will run.', flush=True)
+
+
 def run(args):
     out = Path(args.out_root).resolve()
     if not out.is_relative_to(ROOT / 'outputs') or out == ROOT / 'outputs':
@@ -570,10 +683,15 @@ def run(args):
                     'node_budget': 6, 'depth_budget': 4, 'selection_top_k': 10},
     }
     protocol = protocol_for(args, contexts)
-    if summary.get('protocol') and summary['protocol'] != protocol:
+    if args.mode == 'reviewed-full':
+        print('[reviewed-full-preflight] checking frozen indexes, existing reports and unchanged algorithm; '
+              'this is CPU validation, not a new 48-question retrieval.', flush=True)
+        prepare_reviewed_full(args, contexts, summary, summary_file, protocol)
+    elif summary.get('protocol') and summary['protocol'] != protocol:
         raise ValueError('Algorithm source, input indexes, cache or runtime protocol changed; do not resume incompatible trials')
-    summary['protocol'] = protocol
-    summary['protocol_sha256'] = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+    if args.mode != 'reviewed-full':
+        summary['protocol'] = protocol
+        summary['protocol_sha256'] = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
     write_json(summary_file, summary)
     if args.mode in ('smoke', 'all'):
         smoke(args, contexts, temp, env, summary)
@@ -581,7 +699,7 @@ def run(args):
     if args.mode in ('screen', 'all'):
         require_smoke(summary)
         screen(args, contexts, temp, env, summary, summary_file)
-    if args.mode in ('full', 'all'):
+    if args.mode in ('full', 'all', 'reviewed-full'):
         require_smoke(summary)
         cleanup_trial_results(out, summary, summary_file)
         full(args, contexts, env, summary, summary_file)
@@ -597,7 +715,9 @@ def run(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('smoke', 'screen', 'full', 'clean', 'all'), default='all')
+    parser.add_argument('--mode', choices=('smoke', 'screen', 'full', 'clean', 'all', 'reviewed-full'), default='all')
+    parser.add_argument('--flags', help='Explicit positive screened flags for reviewed-full only')
+    parser.add_argument('--case-suffix', help='Letters/digits/underscores suffix for reviewed-full output cases')
     parser.add_argument('--screen-size', type=int, default=48)
     parser.add_argument('--confirm-size', type=int, default=24)
     parser.add_argument('--out-root', '--output-root', default=str(DEFAULT_OUT))
@@ -607,5 +727,7 @@ def main(argv=None):
     parser.add_argument('--llm-base-url', default='http://127.0.0.1:8035/v1')
     parser.add_argument('--vllm-log', default=str(DEFAULT_OUT / 'logs/vllm.log'))
     args = parser.parse_args(argv)
+    if args.mode != 'reviewed-full' and (args.flags is not None or args.case_suffix is not None):
+        parser.error('--flags and --case-suffix are available only with --mode reviewed-full')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     return run(args)

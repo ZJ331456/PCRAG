@@ -1,4 +1,7 @@
 from contextlib import closing
+from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -149,6 +152,94 @@ class ImprovementRunnerTests(unittest.TestCase):
                 runner.snapshot_cache(source, out / 'two')
             self.assertEqual(runner.experiments.cache_hashes(out / 'one'),
                              runner.experiments.cache_hashes(out / 'two'))
+
+    def protocol_fixture(self):
+        return {'algorithm_code_sha256': {'scripts/utils/exp4_improvements.py': 'old-driver',
+                                         'src/pathcondrag/evidence_retrieval.py': 'unchanged-core'},
+                'runtime': {'embedding_batch_size': 4, 'llm_workers': 8},
+                'sources': {'frozen': 'same'}, 'screen_size': 48, 'confirm_size': 24}
+
+    def signed_summary(self):
+        summary = self.valid_summary()
+        summary['protocol'] = self.protocol_fixture()
+        summary['protocol_sha256'] = hashlib.sha256(json.dumps(summary['protocol'], sort_keys=True).encode()).hexdigest()
+        return summary
+
+    def test_reviewed_protocol_allows_only_runner_change_and_preserves_old_signature(self):
+        summary = self.signed_summary()
+        current = deepcopy(summary['protocol'])
+        current['algorithm_code_sha256']['scripts/utils/exp4_improvements.py'] = 'new-driver'
+        runner.require_reviewed_protocol(summary, current)
+        self.assertEqual(summary['protocol']['algorithm_code_sha256']['scripts/utils/exp4_improvements.py'], 'old-driver')
+        current['algorithm_code_sha256']['src/pathcondrag/evidence_retrieval.py'] = 'changed-core'
+        with self.assertRaisesRegex(ValueError, 'unchanged core'):
+            runner.require_reviewed_protocol(summary, current)
+        current = deepcopy(summary['protocol'])
+        current['runtime']['llm_workers'] = 16
+        with self.assertRaisesRegex(ValueError, 'unchanged core'):
+            runner.require_reviewed_protocol(summary, current)
+        summary['protocol_sha256'] = 'tampered'
+        with self.assertRaisesRegex(ValueError, 'signature differs'):
+            runner.require_reviewed_protocol(summary, summary['protocol'])
+
+    def test_reviewed_suffix_rejects_traversal_and_is_explicit(self):
+        self.assertEqual(runner.reviewed_case_name('adaptive'), runner.FINAL_CASE + '_adaptive')
+        for suffix in (None, '', '../adaptive', 'adaptive/test', 'foo-bar', 'a' * 81):
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                runner.reviewed_case_name(suffix)
+
+    def test_reviewed_mode_reuses_validated_stats_and_marks_confirmation_skipped(self):
+        with tempfile.TemporaryDirectory() as name:
+            out = Path(name)
+            summary = self.signed_summary()
+            summary['screen'] = {'baselines': {}, 'variants': {'adaptive': {
+                'eligible': True, 'flags': ['adaptive'], 'reports': {}}}}
+            contexts = {}
+            for dataset in runner.DATASETS:
+                contexts[dataset] = {'manifest': {'model_dir': 'model', 'source_asset_sha256': {'graph': 'frozen'}}}
+                for variant in ('baseline', 'adaptive'):
+                    case = out / runner.TEMP_NAME / 'screen' / dataset / variant
+                    case.mkdir(parents=True)
+                    report = {'validated': True, 'n_samples': 1,
+                              'per_question': [{'query_index': 0}], 'improvements': [] if variant == 'baseline' else ['adaptive']}
+                    runner.write_json(case / 'result.json', {'dummy': True})
+                    runner.write_json(case / 'report.json', report)
+                    runner.write_json(case / 'manifest.json', {'selected_indices': [0]})
+                    runner.write_json(case / 'validated.ok', {
+                        'result_sha256': runner.experiments.sha256(case / 'result.json'),
+                        'report_sha256': runner.experiments.sha256(case / 'report.json'),
+                        'manifest_sha256': runner.experiments.sha256(case / 'manifest.json')})
+                    if variant == 'baseline':
+                        summary['screen']['baselines'][dataset] = report
+                    else:
+                        summary['screen']['variants']['adaptive']['reports'][dataset] = report
+            args = SimpleNamespace(out_root=str(out), flags='adaptive', case_suffix='adaptive')
+            current = deepcopy(summary['protocol'])
+            current['algorithm_code_sha256']['scripts/utils/exp4_improvements.py'] = 'new-driver'
+            with patch.object(runner.experiments, 'asset_hashes', return_value={'graph': 'frozen'}):
+                runner.prepare_reviewed_full(args, contexts, summary, out / 'selection.json', current)
+            self.assertEqual(summary['selection_status'], '48_screen_positive_full_validation_pending')
+            self.assertEqual(summary['chosen_flags'], ['adaptive'])
+            self.assertTrue(summary['reviewed_full_decision']['user_requested_skip_confirmation'])
+            self.assertFalse(summary['reviewed_full_decision']['confirmation_passed'])
+            self.assertEqual(len(summary['reviewed_archived_trial_reports']), 6)
+            self.assertEqual(args.final_case_name, runner.FINAL_CASE + '_adaptive')
+            self.assertTrue((out / 'selection_before_reviewed_full.json').is_file())
+            report_file = out / runner.TEMP_NAME / 'screen/hotpotqa/adaptive/report.json'
+            report_file.write_text('{}')
+            with self.assertRaisesRegex(ValueError, 'artifact changed'):
+                runner.verify_trial_report(report_file.parent)
+
+    def test_reviewed_mode_refuses_negative_or_incomplete_variants(self):
+        summary = self.signed_summary()
+        summary['screen'] = {'variants': {'adaptive': {'eligible': False, 'flags': ['adaptive']}}}
+        args = SimpleNamespace(flags='adaptive', case_suffix='adaptive', out_root='/unused')
+        with self.assertRaisesRegex(ValueError, 'positive screening variant'):
+            runner.prepare_reviewed_full(args, {}, summary, Path('/unused/selection.json'), summary['protocol'])
+        summary['screen']['variants']['adaptive']['eligible'] = True
+        summary['screen']['variants']['adaptive']['reports'] = {'hotpotqa': {'validated': True}}
+        with self.assertRaisesRegex(ValueError, 'all three datasets'):
+            runner.prepare_reviewed_full(args, {}, summary, Path('/unused/selection.json'), summary['protocol'])
 
 
 if __name__ == '__main__':
