@@ -388,6 +388,7 @@ class BindingTests(unittest.TestCase):
         quote = "On the Mediterranean coast, Haifa Port is the country's oldest and largest port."
         docs = {0: "Israel\n" + intro + " " + quote}
         implicit, explicit, strict = Engine(), Engine("legacy"), Engine("strict_relation")
+        conservative = Engine("conservative_relation")
         implicit._verify("Where is Israel located?", "place", docs)
         explicit._verify("Where is Israel located?", "place", docs)
         accepted, _, _ = strict._verify("Where is Israel located?", "place", docs)
@@ -396,6 +397,144 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(len(strict.calls), 2)
         self.assertIn("Strict relation mode", strict.calls[0][0]["content"])
         self.assertEqual(strict._verification_diagnostics["Where is Israel located?::0"]["attempts"], 2)
+        self.assertFalse(conservative._verify("Where is Israel located?", "place", docs)[0])
+        self.assertEqual(len(conservative.calls), 2)
+
+    def test_category_labels_are_not_part_of_the_requested_work(self):
+        quote = "Tammy and the T-Rex is a film directed by Stewart Raffill."
+        for label in ("film", "the movie"):
+            with self.subTest(label=label):
+                accepted, rejected = verify(hypothesis("Stewart Raffill", quote, "Tammy And The T-Rex", "director"),
+                                             "Tammy and the T-Rex\n" + quote,
+                                             "Who is the director of " + label + " Tammy And The T-Rex?",
+                                             "person", "conservative_relation")
+                self.assertFalse(rejected)
+                self.assertTrue(accepted)
+        self.assertEqual(binding.relation_spec("Who is the author of The Book Thief?")["subject"], "The Book Thief")
+        self.assertEqual(binding.relation_spec("Who directed The Book of Eli?")["subject"], "The Book of Eli")
+
+    def test_creator_attribution_film_by_director_and_book_by_author(self):
+        film = "JIHAD: a story of the others is a 2015 documentary film by Emmy and Peabody Award winning Norwegian director Deeyah Khan."
+        accepted, rejected = verify(hypothesis("Deeyah Khan", film, "Jihad: A Story of the Others", "director"),
+                                     "Jihad: A Story of the Others\n" + film,
+                                     "Who is the director of Jihad: A Story of the Others?", "person", "conservative_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted[0]["relation_supported"])
+        quote = "Based on The Book Thief by Markus Zusak"
+        accepted, rejected = verify(hypothesis("Markus Zusak", quote, "The Book Thief", "author"),
+                                     "The Book Thief (film)\n" + quote,
+                                     "Who is the author of book The Book Thief?", "person", "conservative_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted[0]["relation_supported"])
+
+    def test_leading_article_allows_correct_location(self):
+        quote = "The Christian Science Pleasant View Home is a historic senior citizen residential facility located at 227 Pleasant Street in Concord, New Hampshire, in the United States."
+        accepted, rejected = verify(hypothesis("Concord, New Hampshire", quote, "Christian Science Pleasant View Home", "location"),
+                                     "Christian Science Pleasant View Home\n" + quote,
+                                     "Where was Christian Science Pleasant View Home located?", "place", "conservative_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_conservative_rejects_known_wrong_owner_location(self):
+        intro = "Israel is a country in the Middle East."
+        for quote in ("On the Mediterranean coast, Haifa Port is the country's oldest and largest port.",
+                      "Israel's ports are located on the Mediterranean coast.",
+                      "The port in Israel is located on the Mediterranean coast."):
+            with self.subTest(quote=quote):
+                accepted, rejected = verify(hypothesis("Mediterranean coast", quote, "Israel", "location", intro),
+                                             "Israel\n" + intro + " " + quote,
+                                             "Where is Israel located?", "place", "conservative_relation")
+                self.assertFalse(accepted)
+                self.assertEqual(rejected[0]["reason"], "relationship_owner_conflict")
+
+    def test_conservative_preserves_known_polity_and_creator_dob_conflicts(self):
+        quote = "Andorra's ally, the Crown of Aragon, was founded in 1162."
+        accepted, rejected = verify(hypothesis("1162", quote, "Andorra", "established_date"),
+                                     "Andorra\n" + quote, "When was Andorra established?", "year", "conservative_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "relationship_owner_conflict")
+        quote = "Joshua Jacob Marston (born August 13, 1968) is an American film director."
+        accepted, rejected = verify(hypothesis("August 13, 1968", quote, "Joshua Jacob Marston", "birth_date"),
+                                     "Joshua Jacob Marston\n" + quote,
+                                     "When was The Black Marble director born?", "date", "conservative_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "linked_subject_relationship_not_supported")
+
+    def test_conservative_literal_fallback_is_not_claimed_as_mechanical_support(self):
+        quote = "Aurora occupies a valley in Arcadia."
+        accepted, rejected = verify(hypothesis("Arcadia", quote, "Aurora", "location"),
+                                     "Aurora\n" + quote, "Where is Aurora located?", "place", "conservative_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+        self.assertFalse(accepted[0]["relation_supported"])
+        self.assertFalse(accepted[0]["binding_support"]["mechanical_relation_checked"])
+        self.assertEqual(accepted[0]["binding_support"]["guard_disposition"], "literal_retained_unrecognized_construction")
+
+    def test_conservative_unknown_preserves_original_literal_request(self):
+        class Parent:
+            def _verify(self, question, answer_type, docs):
+                self.original_calls.append((question, answer_type, dict(docs)))
+                key = question + "::" + ",".join(map(str, docs))
+                self._verification_diagnostics[key] = {"attempts": 1, "outputs": [{"hypotheses": [item]}]}
+                return base.verify_hypotheses({"hypotheses": [item]}, docs) + (None,)
+
+        class Engine(binding.BindingImprovementMixin, Parent):
+            improvements = frozenset({"binding"})
+            cfg = SimpleNamespace(evidence_binding_validation="conservative_relation")
+
+            def __init__(self):
+                self._verification_diagnostics = {}
+                self.original_calls = []
+
+            def _infer_object(self, messages):
+                raise AssertionError("Unknown relation should use the original verifier")
+
+        quote = "Vixen is a comic book character created by Gerry Conway and Bob Oksner."
+        item = {"answer": "Vixen", "evidence": quote, "doc_id": "D0", "confidence": 1}
+        engine = Engine()
+        accepted, rejected, reason = engine._verify("What character was created by Gerry Conway and Bob Oksner?", "entity", {0: quote})
+        self.assertFalse(rejected)
+        self.assertIsNone(reason)
+        self.assertEqual(accepted[0]["answer"], "Vixen")
+        self.assertEqual(len(engine.original_calls), 1)
+        self.assertEqual(engine._verification_diagnostics["What character was created by Gerry Conway and Bob Oksner?::0"]["attempts"], 1)
+
+    def test_conservative_creator_and_direction_positive_conflicts_still_rejected(self):
+        quote = "Film Alpha was directed by Dana Jones. Film Beta was directed by Morgan Lee."
+        accepted, rejected = verify(hypothesis("Morgan Lee", quote, "Film Alpha", "director"),
+                                     "Film Alpha\n" + quote, "Who directed Film Alpha?", "person", "conservative_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "answer_attribute_belongs_to_other_entity")
+        quote = "France is north of Spain."
+        accepted, rejected = verify(hypothesis("Spain", quote, "France", "north_of"),
+                                     "France\n" + quote, "What is north of France?", "place", "conservative_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "relationship_direction_conflict")
+
+    def test_conservative_unknown_request_bytes_match_original_exp4(self):
+        quote = "Vixen is a comic book character created by Gerry Conway and Bob Oksner."
+        item = {"answer": "Vixen", "evidence": quote, "doc_id": "D0", "confidence": 1}
+
+        class Original(base.EvidenceRetrieval):
+            def __init__(self):
+                self.calls = []
+                self._verification_diagnostics = {}
+
+            def _infer_object(self, messages):
+                self.calls.append(json.loads(json.dumps(messages)))
+                return {"hypotheses": [item]}, None
+
+        class Conservative(binding.BindingImprovementMixin, Original):
+            improvements = frozenset({"binding"})
+            cfg = SimpleNamespace(evidence_binding_validation="conservative_relation")
+
+        question = "What character was created by Gerry Conway and Bob Oksner?"
+        original, conservative = Original(), Conservative()
+        old_result = original._verify(question, "entity", {0: quote})
+        new_result = conservative._verify(question, "entity", {0: quote})
+        self.assertEqual(old_result, new_result)
+        self.assertEqual(original.calls, conservative.calls)
+        self.assertEqual(len(conservative.calls), 1)
 
 
 if __name__ == "__main__":

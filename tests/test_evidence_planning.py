@@ -126,6 +126,141 @@ class PlanningImprovementTests(unittest.TestCase):
         self.assertEqual(len(rag.calls), 1)
 
 
+class CanonicalPlanValidationTests(unittest.TestCase):
+    def engine(self, responses, mode="canonical_refs"):
+        rag = FakeRAG(responses)
+        rag.pcrag_config.evidence_plan_validation = mode
+        return Engine(rag, {"planning"}), rag
+
+    def test_existing_refs_repair_missing_and_redundant_metadata_without_rewriting_questions(self):
+        payload = {"nodes": [
+            {"id": "s1", "question": "Which saint is a cathedral dedicated to?", "depends_on": []},
+            {"id": "s2", "question": "Which basilica is named after ${s1.answer}?", "depends_on": []},
+            {"id": "s3", "question": "Who governs the city containing ${s2.answer}?",
+             "depends_on": ["s1", "s2", "s2"]},
+        ]}
+        original = json.dumps(payload)
+        engine, rag = self.engine([payload])
+        nodes, reason = engine._plan("Which governor oversees that basilica's city?", 3)
+        self.assertIsNone(reason)
+        self.assertEqual([n["depends_on"] for n in nodes], [[], ["s1"], ["s2"]])
+        self.assertEqual([n["question"] for n in nodes], [n["question"] for n in payload["nodes"]])
+        self.assertEqual(json.dumps(payload), original)
+        self.assertEqual(len(rag.calls), 1)
+        changes = next(iter(engine._plan_diagnostics.values()))["canonicalization_changes"][0]["changes"]
+        self.assertEqual(changes[0]["added"], ["s1"])
+        self.assertEqual(changes[1]["removed"], ["s1"])
+
+    def test_actual_missing_placeholder_requires_llm_repair_instead_of_becoming_root(self):
+        bad = {"nodes": [
+            {"id": "s1", "question": "Which saint is Mantua Cathedral dedicated to?", "depends_on": []},
+            {"id": "s2", "question": "Which basilica is named after the saint Mantua Cathedral is dedicated to?",
+             "depends_on": ["s1"]},
+        ]}
+        corrected = {"nodes": [bad["nodes"][0], dict(bad["nodes"][1],
+                    question="Which basilica is named after ${s1.answer}?")]}
+        engine, rag = self.engine([bad, corrected])
+        nodes, reason = engine._plan("Which basilica shares the cathedral's saint?", 2)
+        self.assertIsNone(reason)
+        self.assertEqual(nodes[1]["depends_on"], ["s1"])
+        self.assertIn("${s1.answer}", nodes[1]["question"])
+        self.assertEqual(len(rag.calls), 2)
+        diagnostics = next(iter(engine._plan_diagnostics.values()))
+        self.assertEqual(diagnostics["validation_errors"], ["declared_dependency_without_placeholder"])
+
+    def test_birth_instead_of_requested_death_is_rejected_then_repaired_in_second_call(self):
+        bad = comparison_plan()
+        corrected = comparison_plan()
+        for node in corrected["nodes"]:
+            if node["depends_on"]:
+                node["question"] = node["question"].replace("When was", "When did").replace(" born?", " die?")
+        query = "Which film's director died earlier, Film A or Film B?"
+        engine, rag = self.engine([bad, corrected])
+        nodes, reason = engine._plan(query, 2)
+        self.assertIsNone(reason)
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(len(rag.calls), 2)
+        self.assertEqual(engine._plan_diagnostics[query]["validation_errors"],
+                         ["relation_attribute_mismatch_death_to_birth"])
+        self.assertIn("death, birth and tenure end are different facts", str(rag.calls[-1]))
+        self.assertTrue(all(" die?" in n["question"] for n in nodes if n["depends_on"]))
+
+    def test_two_attribute_failures_never_trigger_third_request(self):
+        engine, rag = self.engine([comparison_plan(), comparison_plan()])
+        nodes, reason = engine._plan("Which director died earlier?", 2)
+        self.assertEqual(nodes, [])
+        self.assertEqual(reason, "relation_attribute_mismatch_death_to_birth")
+        self.assertEqual(len(rag.calls), 2)
+
+    def test_unknown_self_and_cyclic_references_remain_invalid(self):
+        for ref, deps, reason in (("unknown", [], "unknown_or_self_dependency"),
+                                  ("s2", [], "unknown_or_self_dependency"),
+                                  ("s1", ["unknown"], "unknown_or_self_dependency")):
+            payload = {"nodes": [
+                {"id": "s1", "question": "Who wrote Work X?", "depends_on": []},
+                {"id": "s2", "question": "Where was ${" + ref + ".answer} born?", "depends_on": deps},
+            ]}
+            self.assertEqual(planning.canonicalize_plan_dependencies(payload)[2], reason)
+        payload = {"nodes": [
+            {"id": "s1", "question": "Who is ${s2.answer}?", "depends_on": []},
+            {"id": "s2", "question": "Who is ${s1.answer}?", "depends_on": []},
+        ]}
+        normalized, _, reason = planning.canonicalize_plan_dependencies(payload)
+        self.assertIsNone(reason)
+        self.assertEqual(planning.validate_retrieval_plan(normalized, 6, 4)[1], "cyclic_dependencies")
+
+    def test_fake_or_incomplete_placeholder_cannot_be_promoted_to_root(self):
+        for ref in ("${s1}", "${s1.value}", "${s1.answer", "{s1.answer}", "s1.answer", "${1.answer}"):
+            payload = {"nodes": [
+                {"id": "s1", "question": "Who wrote Work X?", "depends_on": []},
+                {"id": "s2", "question": f"Where was {ref} born?", "depends_on": []},
+            ]}
+            with self.subTest(ref=ref):
+                self.assertEqual(planning.canonicalize_plan_dependencies(payload)[2],
+                                 "invalid_dependency_placeholder")
+
+    def test_wrong_attribute_guard_allows_required_death_node_and_intermediate_birth(self):
+        nodes = [{"question": "Where was Person A born?"}, {"question": "When did Person A die?"}]
+        self.assertIsNone(planning.relation_faithfulness_error("When did Person A die?", nodes))
+        self.assertEqual(planning.relation_faithfulness_error("When was Person A born?", [nodes[1]]),
+                         "relation_attribute_mismatch_birth_to_death")
+
+    def test_requested_tenure_endpoint_cannot_be_replaced_by_birth_date(self):
+        query = "What date did the Governor of the city containing that basilica end?"
+        bad = [{"question": "Who governed that city?"}, {"question": "What date was the governor born?"}]
+        good = [{"question": "Who governed that city?"}, {"question": "What date did the governor's tenure end?"}]
+        self.assertEqual(planning.relation_faithfulness_error(query, bad),
+                         "relation_attribute_mismatch_end_to_birth")
+        self.assertIsNone(planning.relation_faithfulness_error(query, good))
+        self.assertIsNone(planning.relation_faithfulness_error("What date was a person in West End born?", bad))
+
+    def test_default_and_explicit_strict_keep_original_prompt_and_validation(self):
+        query = "Which film's director died earlier, Film A or Film B?"
+        default_rag = FakeRAG([comparison_plan()])
+        default = Engine(default_rag, {"planning"})
+        strict, strict_rag = self.engine([comparison_plan()], "strict")
+        self.assertEqual(default._plan(query, 2), strict._plan(query, 2))
+        self.assertEqual(default_rag.calls, strict_rag.calls)
+        self.assertEqual(default._plan_diagnostics, strict._plan_diagnostics)
+        self.assertNotIn("Relation faithfulness:", str(strict_rag.calls))
+        self.assertNotIn("canonicalization_changes", strict._plan_diagnostics[query])
+
+    def test_new_mode_preserves_capacity_and_depth_limits(self):
+        payload = {"nodes": []}
+        for index in range(5):
+            payload["nodes"].append({"id": f"s{index + 1}",
+                                     "question": f"Who is ${{s{index}.answer}}?" if index else "Who wrote Work X?",
+                                     "depends_on": []})
+        engine, rag = self.engine([payload, payload])
+        self.assertEqual(engine._plan("Follow an evidence chain", 3)[1], "dependency_depth_exceeded")
+        self.assertEqual(len(rag.calls), 2)
+        payload = {"nodes": [{"id": f"s{i}", "question": "Who wrote Work X?", "depends_on": []}
+                             for i in range(7)]}
+        engine, rag = self.engine([payload, payload])
+        self.assertEqual(engine._plan("Retrieve evidence", 2)[1], "invalid_node_count")
+        self.assertEqual(len(rag.calls), 2)
+
+
 class AdaptiveSearchTests(unittest.TestCase):
     def docs(self, engine):
         return engine._verification_documents(list(range(8)))

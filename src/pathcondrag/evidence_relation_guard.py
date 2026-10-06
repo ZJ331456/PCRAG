@@ -1,8 +1,9 @@
 """Conservative local ownership checks for optional strict answer bindings.
 
 These checks recognize a bounded set of English relation constructions.  They
-are not a general entailment model: an unknown or ambiguous construction leaves
-the answer unbound, while the caller retains its ordinary document candidates.
+are not a general entailment model. Strict mode leaves unknown constructions
+unbound; conservative mode preserves ordinary literal verification unless a
+recognized construction demonstrates an ownership conflict.
 No dataset identifiers, labels, or extra model requests are used.
 """
 from __future__ import annotations
@@ -15,6 +16,16 @@ from .evidence_retrieval import normalized_text
 
 def _clean(value: str) -> str:
     return value.strip().rstrip("?.! ")
+
+
+def clean_subject(value: str) -> str:
+    """Remove question category labels without changing titles like Book of Eli."""
+    value = _clean(value)
+    match = re.match(r"(?:(?:the|a|an)\s+)?(film|movie|book|novel|song|documentary)\s+(.+)$", value, re.I)
+    if (match and match.group(1).islower() and
+            not re.match(r"of\b", match.group(2), re.I)):
+        return _clean(match.group(2))
+    return value
 
 
 def relation_spec(question: str) -> dict:
@@ -47,7 +58,7 @@ def relation_spec(question: str) -> dict:
     for relation, pattern in patterns:
         match = re.search(pattern, q, re.I)
         if match:
-            spec = {"relation": relation, "subject": _clean(match.group(1))}
+            spec = {"relation": relation, "subject": clean_subject(match.group(1))}
             break
     direction = re.search(r"\b(north|south|east|west|northeast|northwest|southeast|southwest)\s+of\s+(.+)$", q, re.I)
     if direction:
@@ -60,7 +71,7 @@ def relation_spec(question: str) -> dict:
         if owner or reverse:
             role, work = ((owner.group(1), owner.group(2)) if owner else
                           (reverse.group(2), reverse.group(1)))
-            spec.update(subject=None, owner_work=_clean(work), owner_role=role.casefold())
+            spec.update(subject=None, owner_work=clean_subject(work), owner_role=role.casefold())
     # Award questions may specify their subject through descriptive qualifiers;
     # require the award's name in the same owning clause rather than treating a
     # bare year mentioned in a biography as proof.
@@ -125,7 +136,7 @@ def _owned_clause(entity: str, clause: str, document: str, surface: Callable,
             # The named owner must lead the clause, possibly after an article or
             # a short role label. A name elsewhere in the subject phrase merely
             # co-occurs and does not establish ownership of this predicate.
-            if prefix and not re.fullmatch(r"(?:(?:the|a|an)\s+)?(?:(?:film|movie|book|novel|person|actor|director|writer|composer|country|city|state)\s*)?", prefix, re.I):
+            if prefix and not re.fullmatch(r"(?:(?:the|a|an)(?:\s+|$))?(?:(?:film|movie|book|novel|person|actor|director|writer|composer|country|city|state)\s*)?", prefix, re.I):
                 return False
         return True
     return (_topic_matches(entity, document, same_entity) and
@@ -150,7 +161,85 @@ def _role_pair_supported(work: str, role: str, person: str, document: str,
             if (_owned_clause(person, before, document, surface, same_entity) and
                     surface(work, after, document)[0]):
                 return True
+        # Explicit attribution constructions used in leads and adaptation
+        # credits: "film by ... director X"; "novel Title by Author".
+        # Bare "song by X" does not prove that X composed the song.
+        if role in {"director", "author", "writer"}:
+            for marker in re.finditer(r"\bby\b", clause, re.I):
+                before, after = clause[:marker.start()], clause[marker.end():]
+                if not surface(work, before, document)[0] or not surface(person, after, document)[0]:
+                    continue
+                if role == "director" and re.search(r"\b(?:film|movie|documentary)\b", before, re.I) and re.search(r"\bdirector\b", after, re.I):
+                    return True
+                if role in {"author", "writer"} and (
+                        re.search(r"\b(?:book|novel|poem|story)\b|\bbased\s+on\b", before, re.I) or
+                        (_topic_matches(work, document, same_entity) and
+                         re.search(r"\b(?:book|novel|poem|story)\b", document[:500], re.I))):
+                    return True
     return False
+
+
+def rejection_disposition(reason: Optional[str]) -> str:
+    """Separate uncovered grammar from a rejection that can block a binding."""
+    if reason is None:
+        return "supported"
+    if reason in {"unrecognized_requested_relationship", "unresolved_relationship_subject",
+                  "comparison_requires_atomic_attribute_evidence",
+                  "requested_creator_not_supported_for_subject",
+                  "requested_location_not_supported_for_subject",
+                  "requested_establishment_not_supported_for_subject",
+                  "requested_direction_not_supported_for_subject",
+                  "requested_award_not_supported_for_subject"}:
+        return "unrecognized_construction"
+    return "conflict_or_invalid_source"
+
+
+def conservative_relation_reason(spec: dict, question: str, answer: str, answer_type: str,
+                                 entity: str, span: str, document: str,
+                                 surface: Callable, same_entity: Callable) -> Optional[str]:
+    """Preserve unknown grammar, but reject explicit wrong owners/relations."""
+    reason = strict_relation_reason(spec, question, answer, answer_type, entity, span,
+                                    document, surface, same_entity)
+    if rejection_disposition(reason) != "unrecognized_construction":
+        return reason
+    relation = spec["relation"]
+    for clause in _clauses(span):
+        if not _contains(answer, clause) and relation not in {"director", "author", "composer"}:
+            continue
+        if relation in {"location", "established_date"}:
+            marker = re.search((r"\b(?:is|was|are|were|lies|lie)\b" if relation == "location" else
+                                r"\b(?:established|founded|formed|created|built|opened|incorporated)\b"), clause, re.I)
+            if marker and (relation == "location" or _contains(answer, clause[marker.end():])):
+                head = clause[:marker.start()].strip()
+                literal = surface(entity, head, document)[0]
+                if literal:
+                    match = re.search(r"(?<!\w)" + re.escape(literal) + r"(?!\w)", head, re.I)
+                    if match and (re.match(r"['’]s\b", head[match.end():]) or
+                                  re.search(r"\b(?:of|by|for|in|on|from|with)\s*$", head[:match.start()], re.I)):
+                        return "relationship_owner_conflict"
+                elif not _owned_clause(entity, head, document, surface, same_entity):
+                    # A different explicit noun subject, unlike a fragment with
+                    # an unexpressed owner, contradicts the requested ownership.
+                    head = head.rsplit(",", 1)[-1].strip()
+                    if re.fullmatch(r"(?:The\s+)?[A-Z][\w'’.-]*(?:\s+[A-Z][\w'’.-]*){0,5}", head):
+                        return "relationship_owner_conflict"
+        if relation in {"director", "author", "composer"}:
+            marker = re.search({"director": r"directed\s+by", "author": r"(?:written|authored)\s+by",
+                                "composer": r"composed\s+by"}[relation], clause, re.I)
+            if marker and _owned_clause(entity, clause[:marker.start()], document, surface, same_entity):
+                tail = clause[marker.end():].strip()
+                if not surface(answer, tail, document)[0] and re.match(r"[A-Z][\w'’.-]*(?:\s+[A-Z][\w'’.-]*)+", tail):
+                    return "answer_attribute_belongs_to_other_entity"
+        if spec.get("direction"):
+            marker = re.search(r"\b(north|south|east|west|northeast|northwest|southeast|southwest)\s+of\b", clause, re.I)
+            if marker:
+                before, after = clause[:marker.start()], clause[marker.end():]
+                if surface(entity, before, document)[0] and _contains(answer, after):
+                    return "relationship_direction_conflict"
+                if (_contains(answer, before) and surface(entity, after, document)[0] and
+                        marker.group(1).casefold() != spec["direction"]):
+                    return "relationship_direction_conflict"
+    return reason
 
 
 def strict_relation_reason(spec: dict, question: str, answer: str, answer_type: str,

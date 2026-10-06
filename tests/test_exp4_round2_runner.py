@@ -35,6 +35,7 @@ class Round2RunnerTests(unittest.TestCase):
                     '--openie_max_workers': '8', '--max_new_tokens': '2048',
                     '--evidence_adaptive_mode': 'verify_only',
                     '--evidence_binding_validation': 'strict_relation', '--hop_source': 'benchmark',
+                    '--evidence_plan_validation': 'strict',
                     '--candidate_output_top_k': '200', '--result_top_k': '10'}
         for key, value in expected.items():
             self.assertEqual(command[command.index(key) + 1], value)
@@ -194,16 +195,108 @@ class Round2RunnerTests(unittest.TestCase):
                     patch.object(runner.previous, 'full') as full, \
                     patch.object(runner.previous, 'cleanup_trials') as cleanup:
                 self.assertEqual(runner.run(args), 0)
-            smoke.assert_called_once()
-            screen.assert_called_once()
-            confirm.assert_called_once()
+                original_summary = out / 'metadata/exp4_round2_selection/selection.json'
+                saved_original = original_summary.read_bytes()
+                args.run_tag = 'relation_plan_fix'
+                args.variants = ','.join(item.name for item in runner.FOLLOWUP_VARIANTS)
+                self.assertEqual(runner.run(args), 0)
+                self.assertEqual(original_summary.read_bytes(), saved_original)
+            self.assertEqual(smoke.call_count, 2)
+            self.assertEqual(screen.call_count, 2)
+            self.assertEqual(confirm.call_count, 2)
             full.assert_not_called()
             cleanup.assert_not_called()
             saved = runner.read_json(out / 'metadata/exp4_round2_selection/selection.json')
             self.assertEqual(saved['progress']['planned_groups'], 36)
             self.assertEqual(saved['progress']['maximum_possible_groups'], 48)
             self.assertFalse(saved['automatic_full_run_enabled'])
+            followup = runner.read_json(out / 'metadata/exp4_round2_selection_relation_plan_fix/selection.json')
+            self.assertEqual(followup['progress']['planned_groups'], 24)
+            self.assertEqual(followup['progress']['maximum_possible_groups'], 36)
+            self.assertEqual(followup['run_tag'], 'relation_plan_fix')
+            self.assertTrue((out / '_exp4_round2_trials_relation_plan_fix').is_dir())
             self.assertEqual((old / 'sentinel').read_text(), 'original round unchanged')
+
+    def test_tagged_namespace_and_filtered_profiles_do_not_reuse_original_output_paths(self):
+        metadata, temp = runner.namespace('relation_plan_fix')
+        self.assertEqual(metadata, 'exp4_round2_selection_relation_plan_fix')
+        self.assertEqual(temp, '_exp4_round2_trials_relation_plan_fix')
+        for tag in ('', '../other', 'a/b', 'a-b', 'x' * 81):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                runner.namespace(tag)
+        self.assertEqual(runner.selected_variants(SimpleNamespace()), runner.VARIANTS)
+        requested = ','.join(item.name for item in runner.FOLLOWUP_VARIANTS)
+        chosen = runner.selected_variants(SimpleNamespace(variants=requested))
+        self.assertEqual(chosen, runner.FOLLOWUP_VARIANTS)
+        self.assertEqual(len(chosen), 4)
+        self.assertFalse(any('closure' in item.flags for item in chosen))
+        for names in ('unknown', 'binding_conservative,binding_conservative', ''):
+            with self.assertRaises(ValueError):
+                runner.selected_variants(SimpleNamespace(variants=names))
+
+    def test_followup_command_and_smoke_forward_plan_and_relation_validation(self):
+        args = SimpleNamespace(python='python', llm_base_url='http://local/v1',
+                               variants=','.join(item.name for item in runner.FOLLOWUP_VARIANTS))
+        context = {'dataset': 'musique', 'manifest': {'data_path': '/data', 'corpus_path': '/corpus'}}
+        planned = runner.FOLLOWUP_VARIANTS[0]
+        command = runner.command(args, context, Path('/case'), [7, 9], planned)
+        self.assertEqual(command[command.index('--evidence_plan_validation') + 1], 'canonical_refs')
+        bound = runner.FOLLOWUP_VARIANTS[2]
+        command = runner.command(args, context, Path('/case'), [7, 9], bound)
+        self.assertEqual(command[command.index('--evidence_binding_validation') + 1], 'conservative_relation')
+        self.assertEqual(command[command.index('--evidence_adaptive_mode') + 1], 'verify_only')
+        smoke = runner.smoke_combination(args)
+        self.assertEqual(smoke.plan_validation, 'canonical_refs')
+        self.assertEqual(smoke.binding_validation, 'conservative_relation')
+        self.assertEqual(smoke.flags, runner.previous.FLAGS)
+
+    def test_tagged_exclusions_union_both_previous_rounds_and_preserve_their_files(self):
+        with tempfile.TemporaryDirectory() as name:
+            out = Path(name)
+            old = out / 'metadata/exp4_improvement_selection/selection.json'
+            old.parent.mkdir(parents=True)
+            old_data = {'screen': {'screen_indices': {d: list(range(48)) for d in runner.DATASETS},
+                                   'confirmation_indices': {d: list(range(48, 72)) for d in runner.DATASETS}}}
+            runner.write_json(old, old_data)
+            second = out / 'metadata/exp4_round2_selection/selection.json'
+            second.parent.mkdir(parents=True)
+            second_data = {'indices': {'screen': {d: list(range(72, 120)) for d in runner.DATASETS},
+                                      'confirmation': {d: list(range(120, 144)) for d in runner.DATASETS}}}
+            runner.write_json(second, second_data)
+            original_bytes = old.read_bytes(), second.read_bytes()
+            original = runner.prior_exclusions(out)
+            self.assertEqual(len(original['excluded_indices']['musique']), 72)
+            tagged = runner.prior_exclusions(out, 'relation_plan_fix')
+            self.assertEqual(len(tagged['sources']), 2)
+            for dataset in runner.DATASETS:
+                self.assertEqual(tagged['excluded_indices'][dataset], list(range(144)))
+            self.assertEqual((old.read_bytes(), second.read_bytes()), original_bytes)
+
+    def test_filtered_combination_uses_only_available_positive_profiles(self):
+        entries = {item.name: {'config': runner.asdict(item), 'weak_signal': False,
+                              'strong_target_met': False, 'score': 0.0} for item in runner.FOLLOWUP_VARIANTS}
+        self.assertEqual(runner.combined_candidate(entries), (None, []))
+        entries['planning_selection_refs'].update(weak_signal=True, score=1.0)
+        entries['binding_conservative_adaptive_verify'].update(weak_signal=True, score=2.0)
+        combo, basis = runner.combined_candidate(entries)
+        self.assertEqual(combo.flags, ('planning', 'selection', 'binding', 'adaptive'))
+        self.assertEqual(combo.plan_validation, 'canonical_refs')
+        self.assertEqual(combo.binding_validation, 'conservative_relation')
+        self.assertEqual(combo.adaptive_mode, 'verify_only')
+        self.assertEqual(set(basis), {'planning_selection_refs', 'binding_conservative_adaptive_verify'})
+
+    def test_tagged_protocol_contains_subset_namespace_and_canonical_fields(self):
+        args = SimpleNamespace(screen_seed=142, confirm_seed=242, gain_unit='absolute_pp', target_gain=4,
+                               max_regression=1, allowed_exceptions=2, reference='matched_exp4',
+                               previous_round_exclusions={}, run_tag='relation_plan_fix',
+                               variants=','.join(item.name for item in runner.FOLLOWUP_VARIANTS))
+        with patch.object(runner.previous, 'protocol_for', return_value={'algorithm_code_sha256': {}}):
+            protocol = runner.protocol_for(args, {})
+        self.assertEqual(protocol['run_tag'], 'relation_plan_fix')
+        self.assertEqual(len(protocol['variant_configs']), 4)
+        self.assertEqual(protocol['variant_configs'][0]['plan_validation'], 'canonical_refs')
+        self.assertEqual(protocol['smoke_combination']['binding_validation'], 'conservative_relation')
+        self.assertEqual(protocol, json.loads(json.dumps(protocol)))
 
 
 if __name__ == '__main__':

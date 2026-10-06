@@ -12,7 +12,10 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .evidence_retrieval import normalized_text, verify_hypotheses
-from .evidence_relation_guard import relation_name_matches, relation_spec, strict_relation_reason
+from .evidence_relation_guard import (
+    conservative_relation_reason, rejection_disposition, relation_name_matches,
+    relation_spec, strict_relation_reason,
+)
 
 
 def _contains(phrase: str, text: str) -> bool:
@@ -233,9 +236,11 @@ def verify_typed_hypotheses(payload: dict, documents: Dict[int, str], question: 
     if not isinstance(payload.get("hypotheses"), list):
         return [], [{"reason": "invalid_hypotheses_list"}]
     accepted, rejected, seen = [], [], set()
-    if validation not in {"legacy", "strict_relation"}:
+    if validation not in {"legacy", "strict_relation", "conservative_relation"}:
         raise ValueError(f"Unknown evidence binding validation: {validation}")
-    spec = relation_spec(question) if validation == "strict_relation" else None
+    spec = relation_spec(question) if validation != "legacy" else None
+    if validation == "conservative_relation" and spec["relation"] in {"other", "comparison"}:
+        return verify_hypotheses(payload, documents)
     relation = spec["relation"] if spec else requested_relation(question)
     requested_subject = None if spec else _question_subject(question, relation)
     for item in payload["hypotheses"]:
@@ -273,10 +278,17 @@ def verify_typed_hypotheses(payload: dict, documents: Dict[int, str], question: 
             reason = reason or "relationship_subject_mismatch"
         if not reason:
             if spec:
-                reason = strict_relation_reason(spec, question, answer, answer_type, entity, span,
-                                                document, supported_entity_surface, _same_entity)
+                guard = (conservative_relation_reason if validation == "conservative_relation"
+                         else strict_relation_reason)
+                reason = guard(spec, question, answer, answer_type, entity, span,
+                               document, supported_entity_surface, _same_entity)
         if not reason:
             reason = _attribute_reason(relation, answer, entity, span, support, document)
+        uncovered = (validation == "conservative_relation" and
+                     rejection_disposition(reason) == "unrecognized_construction")
+        retained_reason = reason if uncovered else None
+        if uncovered:
+            reason = None
         if reason:
             rejected.append({"answer": answer[:200], "doc_id": doc_id, "reason": reason})
             continue
@@ -286,13 +298,18 @@ def verify_typed_hypotheses(payload: dict, documents: Dict[int, str], question: 
         seen.add(identity)
         checked = dict(base[0], answer=answer, answer_entity=entity,
                        answer_relation=claimed_relation, subject_evidence=support,
-                       relation_supported=True,
+                       relation_supported=not uncovered,
                        binding_support={"answer_surface": alias_kind,
-                                        "validation": ("strict_relation" if spec else "source_grounded_typed"),
+                                        "validation": (validation if spec else "source_grounded_typed"),
                                         "requested_relation": relation})
         if spec:
-            checked["binding_support"]["mechanical_relation_checked"] = True
+            checked["binding_support"]["mechanical_relation_checked"] = not uncovered
             checked["binding_support"]["entailment_guaranteed"] = False
+        if validation == "conservative_relation":
+            checked["binding_support"]["guard_disposition"] = (
+                "literal_retained_unrecognized_construction" if uncovered else "mechanical_supported")
+            if retained_reason:
+                checked["binding_support"]["unrecognized_construction_reason"] = retained_reason
         accepted.append(checked)
     accepted.sort(key=lambda x: (-x["confidence"], x["doc_id"], normalized_text(x["answer"])))
     return accepted, rejected
@@ -303,11 +320,22 @@ class BindingImprovementMixin:
         if "binding" not in self.improvements:
             return super()._verify(question, answer_type, docs)
         validation = getattr(getattr(self, "cfg", None), "evidence_binding_validation", "legacy")
-        if validation not in {"legacy", "strict_relation"}:
+        if validation not in {"legacy", "strict_relation", "conservative_relation"}:
             raise ValueError(f"Unknown evidence binding validation: {validation}")
-        spec = relation_spec(question) if validation == "strict_relation" else None
+        spec = relation_spec(question) if validation != "legacy" else None
         relation = spec["relation"] if spec else requested_relation(question)
         key = question + "::" + ",".join(map(str, docs))
+        if validation == "conservative_relation" and (
+                relation in {"other", "comparison"} or
+                (spec.get("subject") and re.search(r"\b(?:who|whose|that|which)\b", spec["subject"], re.I))):
+            # Preserve the original request and its repair budget for relations
+            # the local grammar cannot judge. Do not issue a second verifier.
+            result = super()._verify(question, answer_type, docs)
+            diagnostic = self._verification_diagnostics.get(key)
+            if diagnostic is not None:
+                diagnostic["binding_mode"] = "conservative_relation_literal_fallback"
+                diagnostic["local_guard_reason"] = "unrecognized_construction"
+            return result
         if spec and relation in {"other", "comparison"}:
             unsupported = ("comparison_requires_atomic_attribute_evidence" if relation == "comparison"
                            else "unrecognized_requested_relationship")
@@ -348,8 +376,13 @@ class BindingImprovementMixin:
                 "hypotheses for unresolved comparison questions or an unrecognized requested "
                 "relation. Copy the clause that establishes subject, relation and answer together.")
             messages[1]["content"] += "\nLocal relation requirements: " + json.dumps(spec, ensure_ascii=False)
+            if validation == "conservative_relation":
+                messages[0]["content"] += (
+                    " Conservative relation validation retains literal source-supported proposals "
+                    "when local grammar cannot establish their relation, but never retains an "
+                    "explicitly contradictory subject, attribute owner, or direction.")
         diagnostics = {"attempts": 0, "outputs": [], "binding_mode": (
-            "strict_relation" if spec else "source_grounded_typed")}
+            validation if spec else "source_grounded_typed")}
         self._verification_diagnostics[key] = diagnostics
         all_rejected = []
         reason = None

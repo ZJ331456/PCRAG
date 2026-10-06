@@ -181,6 +181,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         evidence_improvements=getattr(args, "evidence_improvements", ""),
         evidence_plan_node_budget=int(getattr(args, "evidence_plan_node_budget", 6)),
         evidence_plan_depth_budget=int(getattr(args, "evidence_plan_depth_budget", 4)),
+        evidence_plan_validation=getattr(args, "evidence_plan_validation", "strict"),
         evidence_selection_top_k=int(getattr(args, "evidence_selection_top_k", 10)),
         evidence_adaptive_mode=getattr(args, "evidence_adaptive_mode", "both"),
         evidence_binding_validation=getattr(args, "evidence_binding_validation", "legacy"),
@@ -543,9 +544,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive; empty preserves original exp4.")
     parser.add_argument("--evidence_plan_node_budget", type=int, default=6)
     parser.add_argument("--evidence_plan_depth_budget", type=int, default=4)
+    parser.add_argument("--evidence_plan_validation", choices=["strict", "canonical_refs"], default="strict")
     parser.add_argument("--evidence_selection_top_k", type=int, default=10)
     parser.add_argument("--evidence_adaptive_mode", choices=["both", "verify_only", "beam_only"], default="both")
-    parser.add_argument("--evidence_binding_validation", choices=["legacy", "strict_relation"], default="legacy")
+    parser.add_argument("--evidence_binding_validation", choices=["legacy", "strict_relation", "conservative_relation"], default="legacy")
 
     parser.add_argument("--corpus_mode", choices=["full", "sample_only"], default="full")
     parser.add_argument("--max_corpus_docs", type=int, default=0)

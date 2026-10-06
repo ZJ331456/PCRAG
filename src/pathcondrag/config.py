@@ -28,6 +28,7 @@ class PCRAGConfig(BaseConfig):
     evidence_improvements: str = ""
     evidence_plan_node_budget: int = 6
     evidence_plan_depth_budget: int = 4
+    evidence_plan_validation: str = "strict"
     evidence_selection_top_k: int = 10
     # Split verification expansion from branch retention for controlled tests.
     evidence_adaptive_mode: str = "both"
@@ -167,10 +168,12 @@ class PCRAGConfig(BaseConfig):
             raise ValueError("evidence_selection_top_k must be 1 through 20")
         if self.evidence_adaptive_mode not in {"both", "verify_only", "beam_only"}:
             raise ValueError("Unknown evidence_adaptive_mode")
-        if self.evidence_binding_validation not in {"legacy", "strict_relation"}:
+        if self.evidence_plan_validation not in {"strict", "canonical_refs"}:
+            raise ValueError("Unknown evidence_plan_validation")
+        if self.evidence_binding_validation not in {"legacy", "strict_relation", "conservative_relation"}:
             raise ValueError("Unknown evidence_binding_validation")
-        if self.evidence_binding_validation == "strict_relation" and "binding" not in flags:
-            raise ValueError("Strict relation validation requires the binding improvement")
+        if self.evidence_binding_validation != "legacy" and "binding" not in flags:
+            raise ValueError("Relation validation requires the binding improvement")
         if self.evidence_ablation_mode not in {"normal", "budget_dag", "budget_qd", "budget_iterative", "fixed_pool", "validation", "selection"}:
             raise ValueError("Unknown evidence_ablation_mode")
         if self.evidence_binding_mode not in {"string", "literal", "relation"}:

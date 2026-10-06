@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import urllib.request
 
@@ -31,6 +32,7 @@ class Variant:
     flags: tuple[str, ...] = ()
     adaptive_mode: str = 'both'
     binding_validation: str = 'legacy'
+    plan_validation: str = 'strict'
 
 
 BASELINE = Variant('baseline')
@@ -45,21 +47,60 @@ VARIANTS = (
     Variant('binding_strict_adaptive_verify', ('binding', 'adaptive'), 'verify_only', 'strict_relation'),
     Variant('binding_strict_adaptive_both', ('binding', 'adaptive'), 'both', 'strict_relation'),
 )
+FOLLOWUP_VARIANTS = (
+    Variant('planning_selection_refs', ('planning', 'selection'), plan_validation='canonical_refs'),
+    Variant('binding_conservative', ('binding',), binding_validation='conservative_relation'),
+    Variant('binding_conservative_adaptive_verify', ('binding', 'adaptive'), 'verify_only', 'conservative_relation'),
+    Variant('binding_conservative_adaptive_both', ('binding', 'adaptive'), 'both', 'conservative_relation'),
+)
+
+
+def namespace(run_tag=None):
+    if run_tag is not None and not re.fullmatch(r'[A-Za-z0-9_]{1,80}', run_tag):
+        raise ValueError('Run tag must contain only letters, digits or underscores')
+    suffix = '_' + run_tag if run_tag else ''
+    return SUMMARY_NAME + suffix, TEMP_NAME + suffix
+
+
+def selected_variants(args):
+    requested = getattr(args, 'variants', None)
+    if requested is None:
+        return VARIANTS
+    names = [name.strip() for name in requested.split(',') if name.strip()]
+    known = {item.name: item for item in (*VARIANTS, *FOLLOWUP_VARIANTS)}
+    if not names or len(names) != len(set(names)) or any(name not in known for name in names):
+        raise ValueError('Variants must be unique known profile names')
+    return tuple(known[name] for name in names)
+
+
+def smoke_combination(args):
+    if any(item in FOLLOWUP_VARIANTS for item in selected_variants(args)):
+        return Variant('all_combination_conservative_refs', previous.FLAGS, 'both',
+                       'conservative_relation', 'canonical_refs')
+    return SMOKE_COMBINATION
 
 
 def signature(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def prior_exclusions(out):
+def prior_exclusions(out, run_tag=None):
     """Keep previously tuned round1 questions out of round2 development."""
     source = out / 'metadata/exp4_improvement_selection/selection.json'
     earlier = read_json(source)['screen']
     indices = {dataset: sorted(set(earlier['screen_indices'][dataset]) |
                                set(earlier['confirmation_indices'][dataset])) for dataset in DATASETS}
-    return {'source': str(source), 'source_sha256': previous.experiments.sha256(source),
+    sources = [{'source': str(source), 'source_sha256': previous.experiments.sha256(source)}]
+    if run_tag:
+        round2_source = out / 'metadata' / SUMMARY_NAME / 'selection.json'
+        prior = read_json(round2_source)
+        for dataset in DATASETS:
+            indices[dataset] = sorted(set(indices[dataset]) | set(prior['indices']['screen'][dataset]) |
+                                      set(prior['indices']['confirmation'][dataset]))
+        sources.append({'source': str(round2_source), 'source_sha256': previous.experiments.sha256(round2_source)})
+    return {'source': str(source), 'source_sha256': previous.experiments.sha256(source), 'sources': sources,
             'excluded_indices': indices,
-            'reason': 'Exclude all round1 screening and confirmation questions from round2 screening/confirmation.'}
+            'reason': 'Exclude all prior screening/confirmation questions; tagged followups also exclude original round2.'}
 
 
 def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolute_pp',
@@ -121,7 +162,8 @@ def assess(args, reports, baselines):
 def command(args, context, case, indices, variant):
     return previous.command(args, context, case, indices, frozenset(variant.flags)) + [
         '--evidence_adaptive_mode', variant.adaptive_mode,
-        '--evidence_binding_validation', variant.binding_validation]
+        '--evidence_binding_validation', variant.binding_validation,
+        '--evidence_plan_validation', variant.plan_validation]
 
 
 def verify_saved_case(context, case, manifest, variant):
@@ -197,7 +239,8 @@ def run_case(args, context, case, indices, variant, env, *, cleanup=True):
                                            frozenset(variant.flags), elapsed, start, end)
     runtime = result.get('runtime_config', {})
     for key, expected in [('evidence_adaptive_mode', variant.adaptive_mode),
-                          ('evidence_binding_validation', variant.binding_validation)]:
+                          ('evidence_binding_validation', variant.binding_validation),
+                          ('evidence_plan_validation', variant.plan_validation)]:
         if runtime.get(key) != expected:
             # Do not retain the old helper's marker after a round-specific
             # validation failure; the exported result remains for inspection.
@@ -217,14 +260,15 @@ def run_case(args, context, case, indices, variant, env, *, cleanup=True):
 def update_progress(summary, summary_file):
     plans = summary['group_plan']
     completed = sum(item.get('validated') is True for item in plans)
+    maximum = summary.get('maximum_possible_groups', 48)
     summary['progress'] = {'planned_groups': len(plans), 'completed_groups': completed,
                            'remaining_groups': len(plans) - completed,
-                           'maximum_possible_groups': 48,
+                           'maximum_possible_groups': maximum,
                            'optional_groups_note': 'Up to 3 evidence-based combination groups and '
                                                    'up to 9 confirmation groups are added after screening.'}
     write_json(summary_file, summary)
     print(f'[round2-progress] planned={len(plans)} completed={completed} '
-          f'remaining={len(plans)-completed} maximum=48', flush=True)
+          f'remaining={len(plans)-completed} maximum={maximum}', flush=True)
 
 
 def register_groups(summary, summary_file, phase, variants, count):
@@ -291,6 +335,7 @@ def evaluate_variant(args, contexts, temp, env, summary, summary_file, phase, in
 
 def smoke(args, contexts, temp, env, summary, summary_file):
     indices = summary['indices']['smoke']
+    combination = smoke_combination(args)
     if summary.get('smoke', {}).get('complete'):
         for dataset, context in contexts.items():
             manifest = previous.subset_manifest(context['manifest'], context['data'], context['hops'], indices[dataset])
@@ -300,13 +345,13 @@ def smoke(args, contexts, temp, env, summary, summary_file):
             if hashes != summary['smoke']['phase_start_cache_sha256'][dataset]:
                 raise ValueError(f'{dataset}: smoke starting cache changed')
             phase_context = dict(context, cache=cache, cache_hashes=hashes)
-            for variant in (Variant('baseline_replay'), SMOKE_COMBINATION):
+            for variant in (Variant('baseline_replay'), combination):
                 verify_saved_case(phase_context, temp / 'smoke' / dataset / variant.name, manifest, variant)
         print('[round2-smoke-resume] 9 completed groups revalidated; no smoke requests rerun.', flush=True)
         return
     phase_contexts, baselines = phase_baselines(args, contexts, temp, env, summary, summary_file, 'smoke', indices)
     replay = Variant('baseline_replay')
-    for variant in (replay, SMOKE_COMBINATION):
+    for variant in (replay, combination):
         for dataset, context in phase_contexts.items():
             case = temp / 'smoke' / dataset / variant.name
             run_case(args, context, case, indices[dataset], variant, env)
@@ -322,17 +367,20 @@ def smoke(args, contexts, temp, env, summary, summary_file):
 
 
 def variant_from_config(config):
-    return Variant(config['name'], tuple(config['flags']), config['adaptive_mode'], config['binding_validation'])
+    return Variant(config['name'], tuple(config['flags']), config['adaptive_mode'],
+                   config['binding_validation'], config.get('plan_validation', 'strict'))
 
 
 def combined_candidate(screened):
     """Combine only settings with measured positive standalone/group evidence."""
     evidence = []
-    for name in ('closure_fixed', 'planning_selection', 'binding_strict'):
-        if screened[name]['weak_signal']:
-            evidence.append(screened[name])
-    adaptive = [screened[name] for name in ('adaptive_verify', 'adaptive_beam', 'adaptive_both')
-                if screened[name]['weak_signal']]
+    for names in [('closure_fixed',), ('planning_selection', 'planning_selection_refs'),
+                  ('binding_strict', 'binding_conservative')]:
+        candidates = [screened[name] for name in names if name in screened and screened[name]['weak_signal']]
+        if candidates:
+            evidence.append(max(candidates, key=lambda item: (item['strong_target_met'], item['score'])))
+    adaptive = [item for name, item in screened.items() if name != 'combined_supported' and
+                'adaptive' in item['config']['flags'] and item['weak_signal']]
     if adaptive:
         evidence.append(max(adaptive, key=lambda item: (item['strong_target_met'], item['score'])))
     if len(evidence) < 2:
@@ -341,10 +389,20 @@ def combined_candidate(screened):
                   if any(flag in item['config']['flags'] for item in evidence))
     mode = next((item['config']['adaptive_mode'] for item in evidence
                  if 'adaptive' in item['config']['flags']), 'both')
+    binding = next((item['config']['binding_validation'] for item in evidence
+                    if 'adaptive' in item['config']['flags'] and 'binding' in item['config']['flags']), None)
+    if binding is None:
+        binding = next((item['config']['binding_validation'] for item in evidence
+                        if 'binding' in item['config']['flags']), 'legacy')
+    evidence = [item for item in evidence if 'binding' not in item['config']['flags'] or
+                item['config']['binding_validation'] == binding]
+    plan = 'canonical_refs' if any(item['config'].get('plan_validation') == 'canonical_refs'
+                                   for item in evidence) else 'strict'
     candidate = Variant('combined_supported', flags, mode,
-                        'strict_relation' if 'binding' in flags else 'legacy')
-    if any((candidate.flags, candidate.adaptive_mode, candidate.binding_validation) ==
-           (tuple(item['config']['flags']), item['config']['adaptive_mode'], item['config']['binding_validation'])
+                        binding, plan)
+    if any((candidate.flags, candidate.adaptive_mode, candidate.binding_validation, candidate.plan_validation) ==
+           (tuple(item['config']['flags']), item['config']['adaptive_mode'], item['config']['binding_validation'],
+            item['config'].get('plan_validation', 'strict'))
            for name, item in screened.items() if name != 'combined_supported'):
         return None, []
     return candidate, [item['config']['name'] for item in evidence]
@@ -353,7 +411,7 @@ def combined_candidate(screened):
 def screen(args, contexts, temp, env, summary, summary_file):
     indices = summary['indices']['screen']
     phase_contexts, baselines = phase_baselines(args, contexts, temp, env, summary, summary_file, 'screen', indices)
-    for variant in VARIANTS:
+    for variant in selected_variants(args):
         evaluate_variant(args, phase_contexts, temp, env, summary, summary_file, 'screen', indices, variant, baselines)
     combined, basis = combined_candidate(summary['screen']['variants'])
     summary['combination_basis'] = basis
@@ -375,7 +433,7 @@ def confirm(args, contexts, temp, env, summary, summary_file):
                     key=lambda item: (-int(item['strong_target_met']), -item['score'], item['config']['name']))
     chosen = ranked[:2] if positive else ranked[:1]
     variants = [variant_from_config(item['config']) for item in chosen]
-    plan = [asdict(variant) for variant in variants]
+    plan = json.loads(json.dumps([asdict(variant) for variant in variants]))
     if summary.get('confirmation_candidates') and summary['confirmation_candidates'] != plan:
         raise ValueError('Confirmation candidates changed during resume')
     summary['confirmation_candidates'] = plan
@@ -401,9 +459,11 @@ def protocol_for(args, contexts):
     protocol = previous.protocol_for(args, contexts)
     for relative in ('scripts/exp4_round2.py', 'scripts/utils/exp4_round2.py', 'scripts/run_exp4_round2.sh'):
         protocol['algorithm_code_sha256'][relative] = previous.experiments.sha256(ROOT / relative)
-    protocol.update(round=2, screen_seed=args.screen_seed, confirmation_seed=args.confirm_seed,
+    protocol.update(round=2, run_tag=getattr(args, 'run_tag', None),
+                    screen_seed=args.screen_seed, confirmation_seed=args.confirm_seed,
                     previous_round_exclusions=args.previous_round_exclusions,
-                    variant_configs=[asdict(variant) for variant in VARIANTS],
+                    variant_configs=[asdict(variant) for variant in selected_variants(args)],
+                    smoke_combination=asdict(smoke_combination(args)),
                     target={'gain_unit': args.gain_unit, 'gain': args.target_gain,
                             'max_regression_absolute_pp': args.max_regression,
                             'allowed_exceptions': args.allowed_exceptions, 'reference': args.reference,
@@ -429,11 +489,13 @@ def run(args):
     out = Path(args.out_root).resolve()
     if not out.is_relative_to(ROOT / 'outputs') or out == ROOT / 'outputs':
         raise ValueError('Output root must be a dedicated PathCondRAG outputs directory')
-    temp = out / TEMP_NAME
+    summary_name, temp_name = namespace(getattr(args, 'run_tag', None))
+    variants = selected_variants(args)
+    temp = out / temp_name
     if temp.is_symlink():
         raise ValueError('Refusing a symlinked round2 temporary directory')
     temp.mkdir(parents=True, exist_ok=True)
-    summary_file = out / 'metadata' / SUMMARY_NAME / 'selection.json'
+    summary_file = out / 'metadata' / summary_name / 'selection.json'
     summary_file.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(args.llm_base_url.rstrip('/') + '/models', timeout=10) as response:
         if response.status != 200:
@@ -442,7 +504,7 @@ def run(args):
         raise ValueError('vLLM request log does not exist')
     before_code = previous.code_hashes(Path(args.hippo_root))
     contexts = {dataset: previous.context_for(out, dataset, temp) for dataset in DATASETS}
-    args.previous_round_exclusions = prior_exclusions(out)
+    args.previous_round_exclusions = prior_exclusions(out, getattr(args, 'run_tag', None))
     protocol = protocol_for(args, contexts)
     if summary_file.is_file():
         summary = read_json(summary_file)
@@ -451,6 +513,8 @@ def run(args):
     else:
         indices = development_indices(args, contexts, args.previous_round_exclusions)
         summary = {'schema_version': 1, 'round': 2, 'protocol': protocol,
+                   'run_tag': getattr(args, 'run_tag', None),
+                   'maximum_possible_groups': 24 + 3 * len(variants),
                    'protocol_sha256': signature(protocol), 'indices': indices, 'group_plan': [],
                    'previous_round_exclusions': args.previous_round_exclusions,
                    'selection_status': 'pending_small_sample_evaluation',
@@ -462,8 +526,8 @@ def run(args):
                                    'warm-cache wall time is not a fair efficiency comparison.',
                    'index_cleanup_policy': 'Private indexes removed after validation/cache snapshots; '
                                            'exported results, traces, reports and signed cleanup proofs retained.'}
-        register_groups(summary, summary_file, 'smoke', [BASELINE, Variant('baseline_replay'), SMOKE_COMBINATION], 2)
-        register_groups(summary, summary_file, 'screen', [BASELINE, *VARIANTS], args.screen_size)
+        register_groups(summary, summary_file, 'smoke', [BASELINE, Variant('baseline_replay'), smoke_combination(args)], 2)
+        register_groups(summary, summary_file, 'screen', [BASELINE, *variants], args.screen_size)
     env = previous.environment(args)
     env['PYTHONHASHSEED'] = '42'
     if args.mode in ('smoke', 'all'):
@@ -486,6 +550,8 @@ def run(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=('smoke', 'screen', 'confirm', 'all'), default='all')
+    parser.add_argument('--run-tag', help='Independent output namespace using letters, digits or underscores')
+    parser.add_argument('--variants', help='Comma-separated subset of named screen profiles; default is the original eight')
     parser.add_argument('--screen-size', type=int, default=48)
     parser.add_argument('--confirm-size', type=int, default=24)
     parser.add_argument('--screen-seed', type=int, default=142)
@@ -502,6 +568,11 @@ def main(argv=None):
     parser.add_argument('--llm-base-url', default='http://127.0.0.1:8035/v1')
     parser.add_argument('--vllm-log', default=str(previous.DEFAULT_OUT / 'logs/vllm.log'))
     args = parser.parse_args(argv)
+    try:
+        namespace(args.run_tag)
+        selected_variants(args)
+    except ValueError as error:
+        parser.error(str(error))
     if (args.target_gain <= 0 or args.max_regression < 0 or not 0 <= args.allowed_exceptions <= 5 or
             args.screen_size < 2 or args.confirm_size < 1):
         parser.error('Invalid target, regression limit, exception count or sample size')

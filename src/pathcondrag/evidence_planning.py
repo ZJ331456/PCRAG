@@ -6,9 +6,92 @@ benchmark answers, support annotations, question types, or gold document counts.
 from __future__ import annotations
 
 import json
+import re
 from typing import Dict, List, Optional, Tuple
 
 from .evidence_retrieval import normalized_text, plan_layers, validate_plan
+
+
+_PLAN_REFERENCE = re.compile(r"\$\{([A-Za-z][\w-]*)\.answer\}")
+_ANSWER_REFERENCE_LIKE = re.compile(r"\b[A-Za-z][\w-]*\.answer\b")
+_DEATH_ATTRIBUTE = re.compile(r"\b(?:die|dies|died|death|dead|deceased|passed\s+away)\b", re.I)
+_BIRTH_ATTRIBUTE = re.compile(r"\b(?:born|birth|birthday|birthdate)\b", re.I)
+_END_ATTRIBUTE = re.compile(r"\b(?:end|ends|ended|ceased|terminated)\b", re.I)
+_TIME_QUESTION = re.compile(r"\b(?:when|what\s+(?:date|year|time)|which\s+(?:date|year|time))\b", re.I)
+
+
+def canonicalize_plan_dependencies(payload: dict) -> Tuple[dict, List[dict], Optional[str]]:
+    """Derive dependency metadata from existing literal references only.
+
+    The questions and node identifiers are never rewritten. Missing/redundant
+    metadata can be corrected when the question already names its dependencies.
+    A declared dependency without a placeholder has no such deterministic repair.
+    Full ordering, cycle, capacity and depth checks remain with the validator.
+    """
+    changes = []
+    if not isinstance(payload, dict) or not isinstance(payload.get("nodes"), list):
+        return payload, changes, "invalid_node_count"
+    nodes = payload["nodes"]
+    ids = set()
+    for item in nodes:
+        if not isinstance(item, dict):
+            return payload, changes, "invalid_node"
+        nid = str(item.get("id", "")).strip()
+        if not re.fullmatch(r"[A-Za-z][\w-]*", nid) or nid in ids:
+            return payload, changes, "invalid_or_duplicate_node_id"
+        ids.add(nid)
+    rewritten = []
+    for item in nodes:
+        question = str(item.get("question", "")).strip()
+        matches = list(_PLAN_REFERENCE.finditer(question))
+        # Reject malformed, incomplete or merely similar reference text. It
+        # must never become a root question by losing a syntactically bad ref.
+        if (any(start.start() not in {match.start() for match in matches}
+                for start in re.finditer(r"\$\{", question))
+                or any(not any(match.start() <= token.start() < token.end() <= match.end()
+                               for match in matches)
+                       for token in _ANSWER_REFERENCE_LIKE.finditer(question))):
+            return payload, changes, "invalid_dependency_placeholder"
+        refs = list(dict.fromkeys(match.group(1) for match in matches))
+        raw_deps = item.get("depends_on", [])
+        if not isinstance(raw_deps, list) or any(not isinstance(dep, str) for dep in raw_deps):
+            return payload, changes, "invalid_question_or_dependencies"
+        deps = [dep.strip() for dep in raw_deps]
+        if any(not re.fullmatch(r"[A-Za-z][\w-]*", dep) for dep in deps):
+            return payload, changes, "invalid_dependency_id"
+        nid = str(item["id"]).strip()
+        if any(dep not in ids or dep == nid for dep in refs + deps):
+            return payload, changes, "unknown_or_self_dependency"
+        if deps and not refs:
+            return payload, changes, "declared_dependency_without_placeholder"
+        if raw_deps != refs:
+            changes.append({"node_id": nid, "original_depends_on": list(raw_deps),
+                            "canonical_depends_on": refs,
+                            "added": [dep for dep in refs if dep not in deps],
+                            "removed": [dep for dep in dict.fromkeys(deps) if dep not in refs]})
+        rewritten.append(dict(item, depends_on=refs))
+    return dict(payload, nodes=rewritten), changes, None
+
+
+def relation_faithfulness_error(query: str, nodes: List[dict]) -> Optional[str]:
+    """Reject explicit birth/death/end attribute swaps without inferring answers.
+
+    This is a narrow lexical safeguard, not a claim of semantic entailment. An
+    intermediate birth node is allowed if a requested death node is also present.
+    """
+    questions = "\n".join(node["question"] for node in nodes)
+    requested_death = bool(_DEATH_ATTRIBUTE.search(query))
+    requested_birth = bool(_BIRTH_ATTRIBUTE.search(query))
+    planned_death = bool(_DEATH_ATTRIBUTE.search(questions))
+    planned_birth = bool(_BIRTH_ATTRIBUTE.search(questions))
+    if requested_death and planned_birth and not planned_death:
+        return "relation_attribute_mismatch_death_to_birth"
+    if requested_birth and planned_death and not planned_birth:
+        return "relation_attribute_mismatch_birth_to_death"
+    if (not requested_birth and _TIME_QUESTION.search(query) and _END_ATTRIBUTE.search(query)
+            and planned_birth and not _END_ATTRIBUTE.search(questions)):
+        return "relation_attribute_mismatch_end_to_birth"
+    return None
 
 
 def validate_retrieval_plan(payload: dict, node_budget: int,
@@ -38,6 +121,9 @@ class PlannerImprovementMixin:
         node_budget = max(1, int(getattr(self.cfg, "evidence_plan_node_budget", 6)))
         depth_budget = max(1, int(getattr(self.cfg, "evidence_plan_depth_budget", 4)))
         depth_hint = max(1, int(hops))
+        validation_mode = getattr(self.cfg, "evidence_plan_validation", "strict")
+        if validation_mode not in {"strict", "canonical_refs"}:
+            raise ValueError("Unknown evidence_plan_validation")
         messages = [
             {"role": "system", "content": (
                 "Plan evidence retrieval using ONLY the input question. Return ONLY JSON "
@@ -72,6 +158,20 @@ class PlannerImprovementMixin:
         diagnostics = {"attempts": 0, "outputs": [], "validation_errors": [],
                        "depth_hint": depth_hint, "node_budget": node_budget,
                        "depth_budget": depth_budget, "capacity_policy": "atomic_parallel"}
+        if validation_mode == "canonical_refs":
+            messages[0]["content"] += (
+                " Relation faithfulness: preserve the exact requested relation and attribute. "
+                "A death date/place is not a birth date/place; a tenure ending is not a "
+                "birth event. Examples illustrate structure, never override the question. "
+                "For 'which director of Film A and Film B died earlier?', use "
+                "s1='Who directed Film A?', s2='When did ${s1.answer} die?', "
+                "s3='Who directed Film B?', s4='When did ${s3.answer} die?'. "
+                "Use birth questions only when the input asks about birth. Every unknown "
+                "intermediate entity must appear as an existing node's literal "
+                "${ID.answer}; do not replace it with an unbound definite description."
+            )
+            diagnostics.update(validation_mode=validation_mode, canonicalization_changes=[],
+                               relation_faithfulness="explicit_birth_death_end_swap_check")
         self._plan_diagnostics[query] = diagnostics
         reason = None
         for attempt in range(2):
@@ -79,7 +179,15 @@ class PlannerImprovementMixin:
             diagnostics["attempts"] += 1
             diagnostics["outputs"].append(payload)
             if not reason:
-                nodes, reason = validate_retrieval_plan(payload, node_budget, depth_budget)
+                validated_payload = payload
+                if validation_mode == "canonical_refs":
+                    validated_payload, changes, reason = canonicalize_plan_dependencies(payload)
+                    diagnostics["canonicalization_changes"].append(
+                        {"attempt": attempt + 1, "changes": changes, "error": reason})
+                if not reason:
+                    nodes, reason = validate_retrieval_plan(validated_payload, node_budget, depth_budget)
+                if not reason and validation_mode == "canonical_refs":
+                    reason = relation_faithfulness_error(query, nodes)
                 if not reason:
                     diagnostics["actual_depth"] = len(plan_layers(nodes))
                     return nodes, None
@@ -95,6 +203,14 @@ class PlannerImprovementMixin:
                         "guess unknown intermediate entities. Return ONLY corrected JSON."
                     )},
                 ])
+                if validation_mode == "canonical_refs":
+                    messages[-1]["content"] += (
+                        " Keep the input question's requested relation and attribute exactly: "
+                        "death, birth and tenure end are different facts. If a node depends "
+                        "on an earlier answer, write its existing ${ID.answer} explicitly "
+                        "in that node's question. Do not remove a needed dependency or "
+                        "guess the intermediate entity to bypass validation."
+                    )
         return [], reason
 
 
