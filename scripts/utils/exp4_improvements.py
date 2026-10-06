@@ -525,11 +525,11 @@ def protocol_for(args, contexts):
             'screen_size': args.screen_size, 'confirm_size': args.confirm_size, 'seed': 42}
 
 
-def require_reviewed_protocol(summary, protocol):
-    """A user-reviewed full run may change this orchestration file, nothing else."""
+def require_screening_protocol(summary, protocol):
+    """Reuse screening measurements only when the orchestration file changed."""
     old = summary.get('protocol')
     if not isinstance(old, dict):
-        raise ValueError('A signed screening protocol is required for reviewed-full')
+        raise ValueError('A signed screening protocol is required')
     expected_hash = hashlib.sha256(json.dumps(old, sort_keys=True).encode()).hexdigest()
     if summary.get('protocol_sha256') != expected_hash:
         raise ValueError('Original screening protocol signature differs')
@@ -540,8 +540,13 @@ def require_reviewed_protocol(summary, protocol):
             raise ValueError('Screening protocol omits the orchestration code hash')
         item['algorithm_code_sha256'].pop(runner_path)
     if previous != current:
-        raise ValueError('Reviewed-full requires unchanged core algorithm, inputs, cache and runtime; '
+        raise ValueError('Resume requires unchanged core algorithm, inputs, cache and runtime; '
                          'only this orchestration file may change')
+
+
+def require_reviewed_protocol(summary, protocol):
+    """A user-reviewed full run may change this orchestration file, nothing else."""
+    require_screening_protocol(summary, protocol)
     if summary.get('reviewed_full_protocol') and summary['reviewed_full_protocol'] != protocol:
         raise ValueError('Existing reviewed-full protocol changed; refusing incompatible resume')
 
@@ -633,6 +638,124 @@ def prepare_reviewed_full(args, contexts, summary, summary_file, protocol):
           '48-question screening reused, no new smoke/screen/24-question confirmation will run.', flush=True)
 
 
+def prepare_confirmation(args, contexts, summary, summary_file, protocol):
+    """Verify archived screening records without rerunning deleted raw trials."""
+    require_smoke(summary)
+    require_screening_protocol(summary, protocol)
+    signed = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+    if summary.get('confirmation_protocol') and (
+            summary['confirmation_protocol'] != protocol or
+            summary.get('confirmation_protocol_sha256') != signed):
+        raise ValueError('Confirmation protocol changed; refusing incompatible resume')
+    decision = summary.get('reviewed_full_decision', {})
+    snapshot_file = summary_file.with_name('selection_before_reviewed_full.json')
+    if (Path(decision.get('original_selection_snapshot', '')).resolve() != snapshot_file.resolve() or
+            not snapshot_file.is_file() or
+            experiments.sha256(snapshot_file) != decision.get('original_selection_snapshot_sha256')):
+        raise ValueError('Original screening snapshot is missing or its signature changed')
+    original = read_json(snapshot_file)
+    if (original.get('protocol') != summary.get('protocol') or
+            original.get('protocol_sha256') != summary.get('protocol_sha256') or
+            original.get('smoke') != summary.get('smoke')):
+        raise ValueError('Original screening protocol or smoke measurements changed')
+    phase = summary.get('screen', {})
+    stable = lambda value: {key: item for key, item in value.items()
+                            if key not in ('confirmation', 'confirmation_baselines')}
+    if stable(phase) != stable(original.get('screen', {})):
+        raise ValueError('Saved screening measurements or confirmation indices changed')
+    archive = summary.get('reviewed_archived_trial_reports', {})
+    for dataset, context in contexts.items():
+        screened = phase['screen_indices'][dataset]
+        indices = phase['confirmation_indices'][dataset]
+        expected = stratified_indices(context['data'], context['hops'], dataset,
+                                      args.confirm_size, excluded=screened)
+        if (len(screened) != args.screen_size or len(set(screened)) != len(screened) or
+                len(indices) != args.confirm_size or indices != expected or
+                not set(screened).isdisjoint(indices)):
+            raise ValueError(f'{dataset}: confirmation indices differ from the fixed disjoint subset')
+        saved_reports = {'baseline': phase['baselines'][dataset], **{
+            name: variant['reports'][dataset] for name, variant in phase['variants'].items()}}
+        for name, report in saved_reports.items():
+            rows = report.get('per_question', [])
+            if (archive.get(f'screen/{dataset}/{name}') != report or
+                    report.get('validated') is not True or report.get('n_samples') != args.screen_size or
+                    [row['query_index'] for row in rows] != screened):
+                raise ValueError(f'{dataset}/{name}: archived screening report differs')
+    ranked = sorted((item for item in phase['variants'].items() if item[1]['eligible']),
+                    key=lambda item: (-item[1]['score'], len(item[1]['flags']), item[0]))[:2]
+    plan = [{'dataset': dataset, 'name': name}
+            for name in (['baseline'] + [name for name, _ in ranked]) for dataset in DATASETS]
+    if not ranked:
+        raise ValueError('No positive screening configuration needs confirmation')
+    if summary.get('confirmation_plan') and summary['confirmation_plan'] != plan:
+        raise ValueError('Confirmation candidates changed during resume')
+    summary['confirmation_plan'] = plan
+    summary['confirmation_protocol'] = protocol
+    summary['confirmation_protocol_sha256'] = signed
+    summary['chosen_flags'] = []
+    summary['chosen_name'] = 'pending_confirmation'
+    summary['selection_status'] = 'confirmation_pending'
+    write_json(summary_file, summary)
+    print('[confirm-preflight] archived screening reports and signed snapshot verified; '
+          'deleted raw screening results are not revalidated or rerun.', flush=True)
+    return ranked
+
+
+def confirm(args, contexts, temp, env, summary, summary_file, ranked):
+    """Finish independent small-sample confirmation; never launch full retrieval."""
+    phase = summary['screen']
+    baselines = phase.setdefault('confirmation_baselines', {})
+    judgments = phase.setdefault('confirmation', {})
+    completed = set()
+    total = len(summary['confirmation_plan'])
+
+    def progress():
+        summary['confirmation_progress'] = {
+            'planned_groups': total, 'completed_groups': len(completed),
+            'remaining_groups': total - len(completed), 'samples_per_group': args.confirm_size,
+            'completed_cases': sorted(completed)}
+        write_json(summary_file, summary)
+        print(f'[confirm-progress] planned={total} completed={len(completed)} '
+              f'remaining={total-len(completed)} samples_per_group={args.confirm_size}', flush=True)
+
+    # Hash-check completed report exports before including them in the initial
+    # progress count. run_case also rechecks frozen assets and starting cache.
+    for item in summary['confirmation_plan']:
+        case = temp / 'confirmation' / item['dataset'] / item['name']
+        if (case / 'validated.ok').is_file():
+            verify_trial_report(case)
+            completed.add(f"{item['dataset']}/{item['name']}")
+    progress()
+    phase_contexts = {}
+    for dataset, context in contexts.items():
+        indices = phase['confirmation_indices'][dataset]
+        phase_contexts[dataset], baselines[dataset], _ = fresh_phase_baseline(
+            args, context, temp, 'confirmation', indices, env)
+        completed.add(f'{dataset}/baseline')
+        progress()
+    chosen = frozenset()
+    for name, candidate in ranked:
+        flags = frozenset(candidate['flags'])
+        record = judgments.setdefault(name, {'flags': candidate['flags'], 'reports': {}})
+        for dataset, context in phase_contexts.items():
+            indices = phase['confirmation_indices'][dataset]
+            record['reports'][dataset], _ = run_case(args, context,
+                temp / 'confirmation' / dataset / name, indices, flags, env)
+            completed.add(f'{dataset}/{name}')
+            progress()
+        record.update(comparison_score(record['reports'], baselines))
+        write_json(summary_file, summary)
+        if record['eligible'] and not chosen:
+            chosen = flags
+    summary['chosen_flags'] = [flag for flag in FLAGS if flag in chosen]
+    summary['chosen_name'] = flags_name(chosen)
+    summary['selection_status'] = 'confirmed_exploratory' if chosen else 'no_confirmed_improvement'
+    summary['confirmation_complete'] = True
+    write_json(summary_file, summary)
+    print(f"[confirmed-small-only] {summary['chosen_name']} status={summary['selection_status']}; "
+          'full retrieval is not started; confirmation outputs retained.', flush=True)
+
+
 def run(args):
     out = Path(args.out_root).resolve()
     if not out.is_relative_to(ROOT / 'outputs') or out == ROOT / 'outputs':
@@ -683,13 +806,16 @@ def run(args):
                     'node_budget': 6, 'depth_budget': 4, 'selection_top_k': 10},
     }
     protocol = protocol_for(args, contexts)
-    if args.mode == 'reviewed-full':
+    confirmation_candidates = None
+    if args.mode == 'confirm':
+        confirmation_candidates = prepare_confirmation(args, contexts, summary, summary_file, protocol)
+    elif args.mode == 'reviewed-full':
         print('[reviewed-full-preflight] checking frozen indexes, existing reports and unchanged algorithm; '
               'this is CPU validation, not a new 48-question retrieval.', flush=True)
         prepare_reviewed_full(args, contexts, summary, summary_file, protocol)
     elif summary.get('protocol') and summary['protocol'] != protocol:
         raise ValueError('Algorithm source, input indexes, cache or runtime protocol changed; do not resume incompatible trials')
-    if args.mode != 'reviewed-full':
+    if args.mode not in ('reviewed-full', 'confirm'):
         summary['protocol'] = protocol
         summary['protocol_sha256'] = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
     write_json(summary_file, summary)
@@ -699,6 +825,8 @@ def run(args):
     if args.mode in ('screen', 'all'):
         require_smoke(summary)
         screen(args, contexts, temp, env, summary, summary_file)
+    if args.mode == 'confirm':
+        confirm(args, contexts, temp, env, summary, summary_file, confirmation_candidates)
     if args.mode in ('full', 'all', 'reviewed-full'):
         require_smoke(summary)
         cleanup_trial_results(out, summary, summary_file)
@@ -715,7 +843,7 @@ def run(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('smoke', 'screen', 'full', 'clean', 'all', 'reviewed-full'), default='all')
+    parser.add_argument('--mode', choices=('smoke', 'screen', 'confirm', 'full', 'clean', 'all', 'reviewed-full'), default='all')
     parser.add_argument('--flags', help='Explicit positive screened flags for reviewed-full only')
     parser.add_argument('--case-suffix', help='Letters/digits/underscores suffix for reviewed-full output cases')
     parser.add_argument('--screen-size', type=int, default=48)

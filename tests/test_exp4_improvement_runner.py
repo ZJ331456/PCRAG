@@ -8,7 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -240,6 +240,182 @@ class ImprovementRunnerTests(unittest.TestCase):
         summary['screen']['variants']['adaptive']['reports'] = {'hotpotqa': {'validated': True}}
         with self.assertRaisesRegex(ValueError, 'all three datasets'):
             runner.prepare_reviewed_full(args, {}, summary, Path('/unused/selection.json'), summary['protocol'])
+
+    def confirmation_fixture(self, out):
+        summary = self.signed_summary()
+        summary['protocol'].update(screen_size=2, confirm_size=1)
+        summary['protocol_sha256'] = hashlib.sha256(
+            json.dumps(summary['protocol'], sort_keys=True).encode()).hexdigest()
+        phase = {'screen_indices': {}, 'confirmation_indices': {}, 'baselines': {},
+                 'variants': {'adaptive': {'flags': ['adaptive'], 'eligible': True,
+                                          'score': .01, 'reports': {}}}, 'confirmation': {}}
+        contexts = {}
+        for dataset in runner.DATASETS:
+            contexts[dataset] = {'dataset': dataset, 'data': [0, 1, 2, 3], 'hops': [2] * 4,
+                                 'source': Path('/frozen'),
+                                 'manifest': {'model_dir': 'model', 'source_asset_sha256': {}}}
+            phase['screen_indices'][dataset] = [0, 1]
+            phase['confirmation_indices'][dataset] = [2]
+            for name in ('baseline', 'adaptive'):
+                report = reports(.70 if name == 'baseline' else .72)[dataset]
+                report.update(validated=True, n_samples=2, per_question=[
+                    {'query_index': index} for index in [0, 1]])
+                if name == 'baseline':
+                    phase['baselines'][dataset] = report
+                else:
+                    phase['variants']['adaptive']['reports'][dataset] = report
+        summary['screen'] = phase
+        snapshot = out / 'selection_before_reviewed_full.json'
+        runner.write_json(snapshot, summary)
+        summary['reviewed_full_decision'] = {
+            'original_selection_snapshot': str(snapshot),
+            'original_selection_snapshot_sha256': runner.experiments.sha256(snapshot)}
+        summary['reviewed_archived_trial_reports'] = {
+            f'screen/{dataset}/{name}': deepcopy(
+                phase['baselines'][dataset] if name == 'baseline' else
+                phase['variants'][name]['reports'][dataset])
+            for dataset in runner.DATASETS for name in ('baseline', 'adaptive')}
+        summary['chosen_flags'] = []
+        args = SimpleNamespace(out_root=str(out), screen_size=2, confirm_size=1,
+                               mode='confirm', llm_base_url='http://local/v1',
+                               hippo_root='/hippo', vllm_log=str(out / 'vllm.log'))
+        current = deepcopy(summary['protocol'])
+        current['algorithm_code_sha256']['scripts/utils/exp4_improvements.py'] = 'confirm-driver'
+        return args, contexts, summary, current
+
+    def test_confirmation_preflight_preserves_screening_and_freezes_its_own_protocol(self):
+        with tempfile.TemporaryDirectory() as name:
+            out = Path(name)
+            args, contexts, summary, current = self.confirmation_fixture(out)
+            screen_before, protocol_before = deepcopy(summary['screen']), deepcopy(summary['protocol'])
+            with patch.object(runner, 'stratified_indices', return_value=[2]):
+                ranked = runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', current)
+                self.assertEqual([name for name, _ in ranked], ['adaptive'])
+                self.assertEqual(len(summary['confirmation_plan']), 6)
+                self.assertEqual(summary['screen'], screen_before)
+                self.assertEqual(summary['protocol'], protocol_before)
+                runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', current)
+                changed = deepcopy(current)
+                changed['algorithm_code_sha256']['scripts/utils/exp4_improvements.py'] = 'changed-again'
+                with self.assertRaisesRegex(ValueError, 'Confirmation protocol changed'):
+                    runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', changed)
+
+    def test_confirmation_rejects_core_changes_and_incompatible_indices(self):
+        with tempfile.TemporaryDirectory() as name:
+            out = Path(name)
+            args, contexts, summary, current = self.confirmation_fixture(out)
+            changed = deepcopy(current)
+            changed['algorithm_code_sha256']['src/pathcondrag/evidence_retrieval.py'] = 'new-core'
+            with self.assertRaisesRegex(ValueError, 'unchanged core'):
+                runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', changed)
+            with patch.object(runner, 'stratified_indices', return_value=[3]):
+                with self.assertRaisesRegex(ValueError, 'fixed disjoint subset'):
+                    runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', current)
+            summary['screen']['confirmation_indices']['musique'] = [3]
+            with self.assertRaisesRegex(ValueError, 'confirmation indices changed'):
+                runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', current)
+
+    def test_confirmation_rejects_changed_archive_or_snapshot(self):
+        with tempfile.TemporaryDirectory() as name:
+            out = Path(name)
+            args, contexts, summary, current = self.confirmation_fixture(out)
+            summary['reviewed_archived_trial_reports']['screen/musique/adaptive']['n_samples'] = 0
+            with patch.object(runner, 'stratified_indices', return_value=[2]):
+                with self.assertRaisesRegex(ValueError, 'archived screening report differs'):
+                    runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', current)
+            (out / 'selection_before_reviewed_full.json').write_text('{}')
+            with self.assertRaisesRegex(ValueError, 'signature changed'):
+                runner.prepare_confirmation(args, contexts, summary, out / 'selection.json', current)
+
+    def test_confirmation_mode_runs_only_six_small_groups_and_keeps_previous_records(self):
+        # This drives run() with CPU doubles, checking the mode dispatch and
+        # persistent summary without sending any embedding or LLM requests.
+        with tempfile.TemporaryDirectory(dir=runner.ROOT / 'outputs') as name:
+            out = Path(name)
+            args, contexts, summary, current = self.confirmation_fixture(out)
+            summary_file = out / 'metadata/exp4_improvement_selection/selection.json'
+            summary_file.parent.mkdir(parents=True)
+            snapshot = summary_file.with_name('selection_before_reviewed_full.json')
+            (out / snapshot.name).rename(snapshot)
+            summary['reviewed_full_decision']['original_selection_snapshot'] = str(snapshot)
+            runner.write_json(summary_file, summary)
+            Path(args.vllm_log).write_text('')
+            before = deepcopy(summary)
+            baseline = reports()
+            candidate = reports(.72, .81, .42)
+            for mapping in (baseline, candidate):
+                for dataset, report in mapping.items():
+                    report.update(validated=True, n_samples=1)
+            response = MagicMock()
+            response.__enter__.return_value.status = 200
+
+            def fresh(args, context, temp, phase, indices, env):
+                self.assertEqual(phase, 'confirmation')
+                self.assertEqual(indices, [2])
+                return context, baseline[context['dataset']], None
+
+            def case(args, context, path, indices, flags, env):
+                self.assertEqual(indices, [2])
+                self.assertEqual(flags, frozenset(['adaptive']))
+                return candidate[context['dataset']], None
+
+            with patch.object(runner.urllib.request, 'urlopen', return_value=response), \
+                    patch.object(runner, 'code_hashes', return_value={}), \
+                    patch.object(runner, 'context_for', side_effect=lambda out, dataset, temp: contexts[dataset]), \
+                    patch.object(runner, 'environment', return_value={}), \
+                    patch.object(runner, 'protocol_for', return_value=current), \
+                    patch.object(runner, 'stratified_indices', return_value=[2]), \
+                    patch.object(runner, 'fresh_phase_baseline', side_effect=fresh) as fresh_mock, \
+                    patch.object(runner, 'run_case', side_effect=case) as case_mock, \
+                    patch.object(runner.experiments, 'asset_hashes', return_value={}), \
+                    patch.object(runner, 'smoke') as smoke_mock, \
+                    patch.object(runner, 'screen') as screen_mock, \
+                    patch.object(runner, 'full') as full_mock, \
+                    patch.object(runner, 'cleanup_trials') as clean_mock, \
+                    patch.object(runner, 'cleanup_trial_results') as preclean_mock:
+                self.assertEqual(runner.run(args), 0)
+            self.assertEqual(fresh_mock.call_count, 3)
+            self.assertEqual(case_mock.call_count, 3)
+            for operation in (smoke_mock, screen_mock, full_mock, clean_mock, preclean_mock):
+                operation.assert_not_called()
+            saved = runner.read_json(summary_file)
+            self.assertEqual(saved['smoke'], before['smoke'])
+            self.assertEqual(saved['screen']['variants'], before['screen']['variants'])
+            self.assertEqual(saved['screen']['screen_indices'], before['screen']['screen_indices'])
+            self.assertEqual(saved['protocol_sha256'], before['protocol_sha256'])
+            self.assertEqual(saved['chosen_flags'], ['adaptive'])
+            self.assertEqual(saved['confirmation_progress']['remaining_groups'], 0)
+            self.assertTrue(saved['confirmation_complete'])
+
+    def test_small_case_resumes_validated_exports_and_refuses_unvalidated_directory(self):
+        with tempfile.TemporaryDirectory() as name:
+            out = Path(name)
+            case = out / 'adaptive'
+            case.mkdir()
+            context = {'manifest': {'model_dir': 'model', 'source_asset_sha256': {'graph': 'same'}},
+                       'source': out / 'public', 'cache_hashes': {'cache': 'same'},
+                       'data': [], 'hops': []}
+            manifest = {'selected_indices': [2], 'model_dir': 'model'}
+            report = {'validated': True, 'improvements': ['adaptive']}
+            with patch.object(runner, 'subset_manifest', return_value=manifest), \
+                    patch.object(runner, 'execute') as execute_mock:
+                with self.assertRaisesRegex(ValueError, 'Unvalidated case already exists'):
+                    runner.run_case(SimpleNamespace(), context, case, [2], {'adaptive'}, {})
+                execute_mock.assert_not_called()
+                self.assertEqual(list(case.iterdir()), [])
+                runner.write_json(case / 'result.json', {'unchanged': True})
+                runner.write_json(case / 'report.json', report)
+                runner.write_json(case / 'manifest.json', manifest)
+                runner.write_json(case / 'before.json', {
+                    'asset_sha256': {'graph': 'same'}, 'initial_cache_sha256': {'cache': 'same'}})
+                runner.write_json(case / 'validated.ok', {
+                    f'{kind}_sha256': runner.experiments.sha256(case / f'{kind}.json')
+                    for kind in ('result', 'report', 'manifest')})
+                with patch.object(runner.experiments, 'asset_hashes', return_value={'graph': 'same'}):
+                    saved, result = runner.run_case(SimpleNamespace(), context, case, [2], {'adaptive'}, {})
+                self.assertEqual(saved, report)
+                self.assertIsNone(result)
+                execute_mock.assert_not_called()
 
 
 if __name__ == '__main__':
