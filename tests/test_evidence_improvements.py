@@ -167,6 +167,10 @@ class ImprovementIntegrationTests(unittest.TestCase):
                        dict(evidence_plan_node_budget=9), dict(evidence_plan_depth_budget=5),
                        dict(evidence_selection_top_k=21), dict(evidence_adaptive_mode="unlimited"),
                        dict(evidence_plan_validation="guess_refs"),
+                       dict(evidence_plan_routing="read_gold_type"),
+                       dict(evidence_plan_routing="question_structure"),
+                       dict(evidence_support_mode="unbounded"),
+                       dict(evidence_support_mode="bounded_swap"),
                        dict(evidence_binding_validation="unchecked"),
                        dict(evidence_binding_validation="strict_relation")]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

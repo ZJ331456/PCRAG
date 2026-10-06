@@ -4,12 +4,14 @@ from .evidence_binding import BindingImprovementMixin
 from .evidence_planning import AdaptiveSearchMixin, PlannerImprovementMixin
 from .evidence_retrieval import EvidenceRetrieval
 from .evidence_selection import SelectionImprovementMixin
+from .evidence_support import AncestorSupportMixin
 
 
 class ImprovedEvidenceRetrieval(
     PlannerImprovementMixin,
     AdaptiveSearchMixin,
     BindingImprovementMixin,
+    AncestorSupportMixin,
     SelectionImprovementMixin,
     EvidenceRetrieval,
 ):

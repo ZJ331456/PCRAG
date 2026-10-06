@@ -261,6 +261,59 @@ class CanonicalPlanValidationTests(unittest.TestCase):
         self.assertEqual(len(rag.calls), 2)
 
 
+class QuestionRoutingTests(unittest.TestCase):
+    def test_chain_routing_uses_exact_original_exp4_messages_and_node_budget(self):
+        query = "Who owns the record label of the Another Page performer?"
+        payload = {"nodes": [
+            {"id": "s1", "question": "Who performed Another Page?", "depends_on": [], "answer_type": "person"},
+            {"id": "s2", "question": "Which label is ${s1.answer} with?", "depends_on": ["s1"], "answer_type": "organization"},
+        ]}
+        original_rag, routed_rag = FakeRAG([payload]), FakeRAG([payload])
+        original = base.EvidenceRetrieval(original_rag)
+        routed_rag.pcrag_config.evidence_plan_routing = "question_structure"
+        routed_rag.pcrag_config.evidence_plan_validation = "canonical_refs"
+        routed = Engine(routed_rag, {"planning"})
+        self.assertEqual(original._plan(query, 2), routed._plan(query, 2))
+        self.assertEqual(original_rag.calls, routed_rag.calls)
+        diagnostics = routed._plan_diagnostics[query]
+        self.assertFalse(diagnostics["routing"]["expand"])
+        self.assertNotIn("node_budget", diagnostics)
+        self.assertEqual(len(routed_rag.calls), 1)
+
+    def test_ambiguous_conjunction_keeps_original_capacity(self):
+        rag = FakeRAG([comparison_plan(), comparison_plan()])
+        rag.pcrag_config.evidence_plan_routing = "question_structure"
+        engine = Engine(rag, {"planning"})
+        query = "When did the country where Britain and France fought become independent?"
+        self.assertEqual(engine._plan(query, 2), ([], "invalid_node_count"))
+        self.assertEqual(len(rag.calls), 2)
+        self.assertFalse(engine._plan_diagnostics[query]["routing"]["expand"])
+
+    def test_explicit_comparison_expands_with_planning_without_selection(self):
+        rag = FakeRAG([comparison_plan()])
+        rag.pcrag_config.evidence_plan_routing = "question_structure"
+        engine = Engine(rag, {"planning"})
+        query = "Which film has the director born earlier, Film A or Film B?"
+        nodes, reason = engine._plan(query, 2)
+        self.assertIsNone(reason)
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(len(rag.calls), 1)
+        diagnostics = engine._plan_diagnostics[query]
+        self.assertEqual(diagnostics["routing"]["kind"], "bridge_comparison")
+        self.assertEqual(diagnostics["validation_mode"], "canonical_refs")
+        self.assertEqual(diagnostics["node_budget"], 6)
+        self.assertNotIn("selection", engine.improvements)
+
+    def test_default_all_routing_preserves_existing_improved_planner(self):
+        query = "Compare the films"
+        default_rag, explicit_rag = FakeRAG([comparison_plan()]), FakeRAG([comparison_plan()])
+        explicit_rag.pcrag_config.evidence_plan_routing = "all"
+        default, explicit = Engine(default_rag, {"planning"}), Engine(explicit_rag, {"planning"})
+        self.assertEqual(default._plan(query, 2), explicit._plan(query, 2))
+        self.assertEqual(default_rag.calls, explicit_rag.calls)
+        self.assertEqual(default._plan_diagnostics, explicit._plan_diagnostics)
+
+
 class AdaptiveSearchTests(unittest.TestCase):
     def docs(self, engine):
         return engine._verification_documents(list(range(8)))

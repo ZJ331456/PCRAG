@@ -33,6 +33,8 @@ class Variant:
     adaptive_mode: str = 'both'
     binding_validation: str = 'legacy'
     plan_validation: str = 'strict'
+    plan_routing: str = 'all'
+    support_mode: str = 'tail_only'
 
 
 BASELINE = Variant('baseline')
@@ -53,6 +55,13 @@ FOLLOWUP_VARIANTS = (
     Variant('binding_conservative_adaptive_verify', ('binding', 'adaptive'), 'verify_only', 'conservative_relation'),
     Variant('binding_conservative_adaptive_both', ('binding', 'adaptive'), 'both', 'conservative_relation'),
 )
+REPRESENTATIVE_VARIANTS = (
+    Variant('structure_routed', ('planning',), plan_validation='canonical_refs', plan_routing='question_structure'),
+    Variant('support_tail', ('support',)),
+    Variant('support_swap', ('support',), support_mode='bounded_swap'),
+    Variant('structure_support', ('planning', 'support'), plan_validation='canonical_refs',
+            plan_routing='question_structure', support_mode='bounded_swap'),
+)
 
 
 def namespace(run_tag=None):
@@ -67,13 +76,17 @@ def selected_variants(args):
     if requested is None:
         return VARIANTS
     names = [name.strip() for name in requested.split(',') if name.strip()]
-    known = {item.name: item for item in (*VARIANTS, *FOLLOWUP_VARIANTS)}
+    known = {item.name: item for item in (*VARIANTS, *FOLLOWUP_VARIANTS, *REPRESENTATIVE_VARIANTS)}
     if not names or len(names) != len(set(names)) or any(name not in known for name in names):
         raise ValueError('Variants must be unique known profile names')
     return tuple(known[name] for name in names)
 
 
 def smoke_combination(args):
+    if any(item in REPRESENTATIVE_VARIANTS for item in selected_variants(args)):
+        return Variant('structure_support_smoke', ('planning', 'support'),
+                       plan_validation='canonical_refs', plan_routing='question_structure',
+                       support_mode='bounded_swap')
     if any(item in FOLLOWUP_VARIANTS for item in selected_variants(args)):
         return Variant('all_combination_conservative_refs', previous.FLAGS, 'both',
                        'conservative_relation', 'canonical_refs')
@@ -154,16 +167,27 @@ def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolut
 
 
 def assess(args, reports, baselines):
+    if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
+        reports = {dataset: dict(report, retrieval_metrics=report['representative_evaluation']['full_population']['metrics'])
+                   for dataset, report in reports.items()}
+        baselines = {dataset: dict(report, retrieval_metrics=report['representative_evaluation']['full_population']['metrics'])
+                     for dataset, report in baselines.items()}
     return target_assessment(reports, baselines, target_gain=args.target_gain,
                              gain_unit=args.gain_unit, max_regression=args.max_regression,
                              allowed_exceptions=args.allowed_exceptions)
 
 
 def command(args, context, case, indices, variant):
-    return previous.command(args, context, case, indices, frozenset(variant.flags)) + [
+    base = previous.command(args, context, case, indices, frozenset(variant.flags))
+    # The earlier driver knows only its original five flags. Preserve the
+    # explicit profile here so support cannot silently disappear.
+    base[base.index('--evidence_improvements') + 1] = ','.join(variant.flags)
+    return base + [
         '--evidence_adaptive_mode', variant.adaptive_mode,
         '--evidence_binding_validation', variant.binding_validation,
-        '--evidence_plan_validation', variant.plan_validation]
+        '--evidence_plan_validation', variant.plan_validation,
+        '--evidence_plan_routing', variant.plan_routing,
+        '--evidence_support_mode', variant.support_mode]
 
 
 def verify_saved_case(context, case, manifest, variant):
@@ -240,13 +264,34 @@ def run_case(args, context, case, indices, variant, env, *, cleanup=True):
     runtime = result.get('runtime_config', {})
     for key, expected in [('evidence_adaptive_mode', variant.adaptive_mode),
                           ('evidence_binding_validation', variant.binding_validation),
-                          ('evidence_plan_validation', variant.plan_validation)]:
+                          ('evidence_plan_validation', variant.plan_validation),
+                          ('evidence_plan_routing', variant.plan_routing),
+                          ('evidence_support_mode', variant.support_mode)]:
         if runtime.get(key) != expected:
             # Do not retain the old helper's marker after a round-specific
             # validation failure; the exported result remains for inspection.
             (case / 'validated.ok').unlink()
             raise ValueError(f'{case}: {key}={runtime.get(key)} != {expected}')
     report['round2_config'] = asdict(variant)
+    report['improvements'] = list(variant.flags)
+    if getattr(args, 'sampling_policy', 'hop_support') == 'representative' and len(indices) > 2:
+        from .representative_sampling import poststratified_metrics
+        sampling = context['representative_sampling']
+        available_key = ('confirmation_available_indices' if case.parent.parent.name == 'confirmation'
+                         else 'available_indices')
+        groups = {}
+        for row in report['per_question']:
+            primary = sampling['features'][row['query_index']]['primary']
+            groups.setdefault(primary, []).append(row)
+        report['representative_evaluation'] = {
+            'full_population': poststratified_metrics(sampling['features'], indices, report['per_question'],
+                metrics=tuple(report['retrieval_metrics'])),
+            'available_population': poststratified_metrics(
+                sampling['features'], indices, report['per_question'], target_indices=sampling[available_key],
+                metrics=tuple(report['retrieval_metrics'])),
+            'by_primary_stratum': {primary: previous.compact(previous.aggregate_measurements(rows))
+                                  for primary, rows in groups.items()},
+            'warning': 'Primary-stratum calibrated descriptive estimates; not an unbiased guarantee or untouched test.'}
     write_json(case / 'report.json', report)
     marker = read_json(case / 'validated.ok')
     marker.update(report_sha256=previous.experiments.sha256(case / 'report.json'),
@@ -264,8 +309,9 @@ def update_progress(summary, summary_file):
     summary['progress'] = {'planned_groups': len(plans), 'completed_groups': completed,
                            'remaining_groups': len(plans) - completed,
                            'maximum_possible_groups': maximum,
-                           'optional_groups_note': 'Up to 3 evidence-based combination groups and '
-                                                   'up to 9 confirmation groups are added after screening.'}
+                           'optional_groups_note': ('The combined profile is already screened; up to 9 confirmation groups.'
+                               if summary.get('sampling_policy') == 'representative' else
+                               'Up to 3 evidence-based combination groups and up to 9 confirmation groups are added after screening.')}
     write_json(summary_file, summary)
     print(f'[round2-progress] planned={len(plans)} completed={completed} '
           f'remaining={len(plans)-completed} maximum={maximum}', flush=True)
@@ -324,6 +370,12 @@ def evaluate_variant(args, contexts, temp, env, summary, summary_file, phase, in
                                              indices[dataset], variant, env)
         mark_complete(summary, summary_file, phase, dataset, variant)
     entry.update(assess(args, entry['reports'], baselines))
+    if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
+        entry['raw_sample_assessment'] = target_assessment(entry['reports'], baselines,
+            target_gain=args.target_gain, gain_unit=args.gain_unit, max_regression=args.max_regression,
+            allowed_exceptions=args.allowed_exceptions)
+    entry['assessment_estimator'] = ('primary_poststratified_full_population'
+        if getattr(args, 'sampling_policy', 'hop_support') == 'representative' else 'raw_sample_macro')
     entry['paired_comparison'] = previous.comparison_score(entry['reports'], baselines)
     write_json(summary_file, summary)
     print(f'[round2-{phase}] {variant.name} target={entry["strong_target_met"]} '
@@ -368,7 +420,8 @@ def smoke(args, contexts, temp, env, summary, summary_file):
 
 def variant_from_config(config):
     return Variant(config['name'], tuple(config['flags']), config['adaptive_mode'],
-                   config['binding_validation'], config.get('plan_validation', 'strict'))
+                   config['binding_validation'], config.get('plan_validation', 'strict'),
+                   config.get('plan_routing', 'all'), config.get('support_mode', 'tail_only'))
 
 
 def combined_candidate(screened):
@@ -413,7 +466,8 @@ def screen(args, contexts, temp, env, summary, summary_file):
     phase_contexts, baselines = phase_baselines(args, contexts, temp, env, summary, summary_file, 'screen', indices)
     for variant in selected_variants(args):
         evaluate_variant(args, phase_contexts, temp, env, summary, summary_file, 'screen', indices, variant, baselines)
-    combined, basis = combined_candidate(summary['screen']['variants'])
+    combined, basis = ((None, []) if getattr(args, 'sampling_policy', 'hop_support') == 'representative'
+                      else combined_candidate(summary['screen']['variants']))
     summary['combination_basis'] = basis
     if combined:
         register_groups(summary, summary_file, 'screen', [combined], args.screen_size)
@@ -459,7 +513,18 @@ def protocol_for(args, contexts):
     protocol = previous.protocol_for(args, contexts)
     for relative in ('scripts/exp4_round2.py', 'scripts/utils/exp4_round2.py', 'scripts/run_exp4_round2.sh'):
         protocol['algorithm_code_sha256'][relative] = previous.experiments.sha256(ROOT / relative)
+    if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
+        relative = 'scripts/utils/representative_sampling.py'
+        protocol['algorithm_code_sha256'][relative] = previous.experiments.sha256(ROOT / relative)
+        protocol['representative_sampling'] = {dataset: {
+            'feature_sha256': context['representative_sampling']['feature_sha256'],
+            'screen_indices': context['representative_sampling']['screen_indices'],
+            'confirmation_indices': context['representative_sampling']['confirmation_indices']}
+            for dataset, context in contexts.items()}
     protocol.update(round=2, run_tag=getattr(args, 'run_tag', None),
+                    sampling_policy=getattr(args, 'sampling_policy', 'hop_support'),
+                    target_metric_estimator=('primary_poststratified_full_population'
+                        if getattr(args, 'sampling_policy', 'hop_support') == 'representative' else 'raw_sample_macro'),
                     screen_seed=args.screen_seed, confirmation_seed=args.confirm_seed,
                     previous_round_exclusions=args.previous_round_exclusions,
                     variant_configs=[asdict(variant) for variant in selected_variants(args)],
@@ -473,6 +538,21 @@ def protocol_for(args, contexts):
 
 def development_indices(args, contexts, exclusions):
     indices = {'smoke': {}, 'screen': {}, 'confirmation': {}}
+    if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
+        for dataset, context in contexts.items():
+            sampling = context['representative_sampling']
+            indices['screen'][dataset] = sampling['screen_indices']
+            indices['confirmation'][dataset] = sampling['confirmation_indices']
+            features, pool = sampling['features'], sampling['screen_indices']
+            first = min(pool, key=lambda i: (features[i]['hops'], i))
+            # Two contrasting structures for integration, never chosen using
+            # retrieval accuracy. This smoke is not the representative set.
+            second = max((i for i in pool if i != first), key=lambda i: (
+                int(features[i]['primary'] != features[first]['primary']),
+                int('comparison' in features[i]['primary'] or 'join' in features[i]['primary']),
+                features[i]['hops'], -i))
+            indices['smoke'][dataset] = sorted([first, second])
+        return indices
     for dataset, context in contexts.items():
         excluded = exclusions['excluded_indices'][dataset]
         indices['smoke'][dataset] = previous.stratified_indices(context['data'], context['hops'], dataset, 2)
@@ -504,17 +584,36 @@ def run(args):
         raise ValueError('vLLM request log does not exist')
     before_code = previous.code_hashes(Path(args.hippo_root))
     contexts = {dataset: previous.context_for(out, dataset, temp) for dataset in DATASETS}
-    args.previous_round_exclusions = prior_exclusions(out, getattr(args, 'run_tag', None))
+    representative = getattr(args, 'sampling_policy', 'hop_support') == 'representative'
+    if representative:
+        from .representative_sampling import collect_prior_exclusions, make_representative_split
+        exclusions = collect_prior_exclusions(out)
+        args.previous_round_exclusions = dict(exclusions, excluded_indices=exclusions['indices'])
+        for dataset, context in contexts.items():
+            context['representative_sampling'] = make_representative_split(context['data'], dataset,
+                excluded_indices=exclusions['indices'][dataset], screen_size=args.screen_size,
+                confirmation_size=args.confirm_size, seed=args.screen_seed,
+                confirmation_seed=args.confirm_seed, hops=context['hops'])
+    else:
+        args.previous_round_exclusions = prior_exclusions(out, getattr(args, 'run_tag', None))
     protocol = protocol_for(args, contexts)
     if summary_file.is_file():
         summary = read_json(summary_file)
         if summary.get('protocol') != protocol or summary.get('protocol_sha256') != signature(protocol):
             raise ValueError('Round2 algorithm, runner, runtime, source indexes, cache or target protocol changed')
+        if representative:
+            for dataset, saved in summary['sampling_reports'].items():
+                if (previous.experiments.sha256(Path(saved['path'])) != saved['sha256'] or
+                        read_json(saved['path']) != contexts[dataset]['representative_sampling']):
+                    raise ValueError(f'{dataset}: representative sampling report changed')
+            if summary['indices'] != development_indices(args, contexts, args.previous_round_exclusions):
+                raise ValueError('Representative question indices changed')
     else:
         indices = development_indices(args, contexts, args.previous_round_exclusions)
         summary = {'schema_version': 1, 'round': 2, 'protocol': protocol,
                    'run_tag': getattr(args, 'run_tag', None),
-                   'maximum_possible_groups': 24 + 3 * len(variants),
+                   'sampling_policy': getattr(args, 'sampling_policy', 'hop_support'),
+                   'maximum_possible_groups': (21 if representative else 24) + 3 * len(variants),
                    'protocol_sha256': signature(protocol), 'indices': indices, 'group_plan': [],
                    'previous_round_exclusions': args.previous_round_exclusions,
                    'selection_status': 'pending_small_sample_evaluation',
@@ -526,6 +625,14 @@ def run(args):
                                    'warm-cache wall time is not a fair efficiency comparison.',
                    'index_cleanup_policy': 'Private indexes removed after validation/cache snapshots; '
                                            'exported results, traces, reports and signed cleanup proofs retained.'}
+        if representative:
+            summary['sampling_reports'] = {}
+            (summary_file.parent / 'sampling').mkdir(parents=True, exist_ok=True)
+            for dataset, context in contexts.items():
+                sampling_path = summary_file.parent / 'sampling' / (dataset + '.json')
+                write_json(sampling_path, context['representative_sampling'])
+                summary['sampling_reports'][dataset] = {
+                    'path': str(sampling_path), 'sha256': previous.experiments.sha256(sampling_path)}
         register_groups(summary, summary_file, 'smoke', [BASELINE, Variant('baseline_replay'), smoke_combination(args)], 2)
         register_groups(summary, summary_file, 'screen', [BASELINE, *variants], args.screen_size)
     env = previous.environment(args)
@@ -552,6 +659,7 @@ def main(argv=None):
     parser.add_argument('--mode', choices=('smoke', 'screen', 'confirm', 'all'), default='all')
     parser.add_argument('--run-tag', help='Independent output namespace using letters, digits or underscores')
     parser.add_argument('--variants', help='Comma-separated subset of named screen profiles; default is the original eight')
+    parser.add_argument('--sampling-policy', choices=('hop_support', 'representative'), default='hop_support')
     parser.add_argument('--screen-size', type=int, default=48)
     parser.add_argument('--confirm-size', type=int, default=24)
     parser.add_argument('--screen-seed', type=int, default=142)
@@ -573,6 +681,8 @@ def main(argv=None):
         selected_variants(args)
     except ValueError as error:
         parser.error(str(error))
+    if args.sampling_policy == 'representative' and not args.run_tag:
+        parser.error('Representative sampling needs an independent run tag')
     if (args.target_gain <= 0 or args.max_regression < 0 or not 0 <= args.allowed_exceptions <= 5 or
             args.screen_size < 2 or args.confirm_size < 1):
         parser.error('Invalid target, regression limit, exception count or sample size')

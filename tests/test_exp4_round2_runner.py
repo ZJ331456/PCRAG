@@ -298,6 +298,98 @@ class Round2RunnerTests(unittest.TestCase):
         self.assertEqual(protocol['smoke_combination']['binding_validation'], 'conservative_relation')
         self.assertEqual(protocol, json.loads(json.dumps(protocol)))
 
+    def test_representative_profiles_forward_support_without_global_selection(self):
+        args = SimpleNamespace(python='python', llm_base_url='http://local/v1',
+            variants=','.join(item.name for item in runner.REPRESENTATIVE_VARIANTS))
+        context = {'dataset': 'musique', 'manifest': {'data_path': '/data', 'corpus_path': '/corpus'}}
+        self.assertEqual(len(runner.selected_variants(args)), 4)
+        for variant in runner.selected_variants(args):
+            command = runner.command(args, context, Path('/case'), [1, 5], variant)
+            self.assertEqual(command[command.index('--evidence_improvements') + 1], ','.join(variant.flags))
+            self.assertEqual(command[command.index('--evidence_plan_routing') + 1], variant.plan_routing)
+            self.assertEqual(command[command.index('--evidence_support_mode') + 1], variant.support_mode)
+            self.assertNotIn('selection', variant.flags)
+            self.assertNotIn('binding', variant.flags)
+        self.assertEqual(runner.smoke_combination(args).flags, ('planning', 'support'))
+
+    def test_representative_assessment_uses_population_calibration(self):
+        args = SimpleNamespace(sampling_policy='representative', target_gain=4,
+            gain_unit='absolute_pp', max_regression=1, allowed_exceptions=2)
+        baseline, candidate = reports(), reports(.67, .77)
+        for dataset in runner.DATASETS:
+            baseline[dataset]['representative_evaluation'] = {'full_population': {'metrics': {
+                'Recall@5': .7, 'Recall@10': .8}}}
+            candidate[dataset]['representative_evaluation'] = {'full_population': {'metrics': {
+                'Recall@5': .75, 'Recall@10': .85}}}
+        self.assertTrue(runner.assess(args, candidate, baseline)['strong_target_met'])
+        self.assertFalse(runner.target_assessment(candidate, baseline)['regression_limit_met'])
+
+    def test_representative_indices_use_fixed_split_and_contrasting_smoke(self):
+        args = SimpleNamespace(sampling_policy='representative')
+        features = [{'hops': 2, 'primary': 'type=bridge'} for _ in range(200)]
+        features[20] = {'hops': 2, 'primary': 'type=comparison'}
+        contexts = {dataset: {'representative_sampling': {
+            'features': features, 'screen_indices': list(range(10, 70)),
+            'confirmation_indices': list(range(100, 130))}} for dataset in runner.DATASETS}
+        indices = runner.development_indices(args, contexts, {})
+        for dataset in runner.DATASETS:
+            self.assertEqual(indices['screen'][dataset], list(range(10, 70)))
+            self.assertEqual(indices['confirmation'][dataset], list(range(100, 130)))
+            self.assertEqual(indices['smoke'][dataset], [10, 20])
+
+    def test_representative_first_run_creates_sampling_reports_and_checks_resume(self):
+        with tempfile.TemporaryDirectory(dir=runner.ROOT / 'outputs') as name:
+            out = Path(name)
+            args = SimpleNamespace(out_root=str(out), mode='all', screen_size=60, confirm_size=30,
+                screen_seed=342, confirm_seed=442, llm_base_url='http://local/v1',
+                hippo_root='/hippo', vllm_log=str(out / 'vllm.log'),
+                sampling_policy='representative', run_tag='structure_representative',
+                variants=','.join(item.name for item in runner.REPRESENTATIVE_VARIANTS))
+            Path(args.vllm_log).write_text('')
+            contexts = {dataset: {'source': out / 'public', 'data': [{}] * 3, 'hops': [2] * 3,
+                'manifest': {'model_dir': 'model', 'source_asset_sha256': {}}}
+                for dataset in runner.DATASETS}
+            split = {'features': [{'primary': 'bridge', 'hops': 2}] * 3,
+                     'screen_indices': [0, 1], 'confirmation_indices': [2]}
+            exclusions = {'indices': {dataset: [] for dataset in runner.DATASETS}, 'sources': []}
+            response = MagicMock()
+            response.__enter__.return_value.status = 200
+
+            def phase_smoke(args, contexts, temp, env, summary, file):
+                summary['smoke'] = {'complete': True}
+
+            with patch.object(runner.urllib.request, 'urlopen', return_value=response), \
+                    patch.object(runner.previous, 'code_hashes', return_value={}), \
+                    patch.object(runner.previous, 'context_for', side_effect=lambda out, dataset, temp: contexts[dataset]), \
+                    patch.object(runner.previous, 'environment', return_value={}), \
+                    patch('utils.representative_sampling.collect_prior_exclusions', return_value=exclusions), \
+                    patch('utils.representative_sampling.make_representative_split', return_value=split), \
+                    patch.object(runner, 'protocol_for', return_value={'policy': 'representative'}), \
+                    patch.object(runner.previous.experiments, 'asset_hashes', return_value={}), \
+                    patch.object(runner, 'smoke', side_effect=phase_smoke), \
+                    patch.object(runner, 'screen'), patch.object(runner, 'confirm'), \
+                    patch.object(runner.previous, 'full') as full:
+                self.assertEqual(runner.run(args), 0)
+                summary_path = out / 'metadata/exp4_round2_selection_structure_representative/selection.json'
+                saved = runner.read_json(summary_path)
+                self.assertEqual(saved['maximum_possible_groups'], 33)
+                for dataset, entry in saved['sampling_reports'].items():
+                    path = Path(entry['path'])
+                    self.assertTrue(path.is_file())
+                    self.assertEqual(runner.read_json(path), split)
+                    self.assertEqual(runner.previous.experiments.sha256(path), entry['sha256'])
+                self.assertEqual(runner.run(args), 0)
+                changed = deepcopy(saved)
+                changed['indices']['screen']['musique'] = [1, 2]
+                runner.write_json(summary_path, changed)
+                with self.assertRaisesRegex(ValueError, 'question indices changed'):
+                    runner.run(args)
+                runner.write_json(summary_path, saved)
+                Path(saved['sampling_reports']['musique']['path']).write_text('{}')
+                with self.assertRaisesRegex(ValueError, 'sampling report changed'):
+                    runner.run(args)
+                full.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

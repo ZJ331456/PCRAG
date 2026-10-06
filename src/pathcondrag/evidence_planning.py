@@ -10,6 +10,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .evidence_retrieval import normalized_text, plan_layers, validate_plan
+from .question_structure import route_question_structure
 
 
 _PLAN_REFERENCE = re.compile(r"\$\{([A-Za-z][\w-]*)\.answer\}")
@@ -118,10 +119,19 @@ class PlannerImprovementMixin:
     def _plan(self, query: str, hops: int):
         if "planning" not in self.improvements:
             return super()._plan(query, hops)
+        routing_mode = getattr(self.cfg, "evidence_plan_routing", "all")
+        if routing_mode not in {"all", "question_structure"}:
+            raise ValueError("Unknown evidence_plan_routing")
+        routing = route_question_structure(query) if routing_mode == "question_structure" else None
+        if routing is not None and not routing["expand"]:
+            nodes, reason = super()._plan(query, hops)
+            self._plan_diagnostics.setdefault(query, {})["routing"] = routing
+            return nodes, reason
         node_budget = max(1, int(getattr(self.cfg, "evidence_plan_node_budget", 6)))
         depth_budget = max(1, int(getattr(self.cfg, "evidence_plan_depth_budget", 4)))
         depth_hint = max(1, int(hops))
-        validation_mode = getattr(self.cfg, "evidence_plan_validation", "strict")
+        validation_mode = ("canonical_refs" if routing is not None
+                           else getattr(self.cfg, "evidence_plan_validation", "strict"))
         if validation_mode not in {"strict", "canonical_refs"}:
             raise ValueError("Unknown evidence_plan_validation")
         messages = [
@@ -158,6 +168,8 @@ class PlannerImprovementMixin:
         diagnostics = {"attempts": 0, "outputs": [], "validation_errors": [],
                        "depth_hint": depth_hint, "node_budget": node_budget,
                        "depth_budget": depth_budget, "capacity_policy": "atomic_parallel"}
+        if routing is not None:
+            diagnostics["routing"] = routing
         if validation_mode == "canonical_refs":
             messages[0]["content"] += (
                 " Relation faithfulness: preserve the exact requested relation and attribute. "
