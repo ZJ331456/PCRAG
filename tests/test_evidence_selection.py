@@ -144,14 +144,84 @@ class EvidenceSelectionTests(unittest.TestCase):
         self.assertEqual(trace["improvement_closure"]["reliable_proofs"]["s1"]["check"], "conservative_literal")
         self.assertFalse(trace["improvement_selection"]["enabled"])
 
-    def test_missing_ancestor_uses_base_fallback_without_promoting_child(self):
+    def test_missing_ancestor_retains_ordinary_coverage_competition(self):
         rag = Rag(2)
         state = closure_state(rag, root=False)
         ids = np.array([2, 3, 4, 5, 0, 1])
         actual, _, trace = Improved(rag, ("selection", "closure")).finalize("q", ids, np.linspace(1., .1, 6), {}, state)
-        self.assertEqual(actual[:2].tolist(), [2, 3])
+        self.assertEqual(actual[:2].tolist(), [1, 2])
+        self.assertEqual(trace["selected_prefix"][0]["closure_status"], "ordinary_document")
+        self.assertEqual(trace["selected_prefix"][0]["selection_source"], "coverage")
+        self.assertEqual(trace["improvement_closure"]["selected_bundle_count"], 0)
         self.assertIn(1, trace["improvement_closure"]["soft_fallback_docs"])
         self.assertTrue(any(r["reason"] == "missing_reliable_ancestor" for r in trace["improvement_closure"]["rejected_proofs"]))
+
+    def test_rejected_literal_proofs_do_not_push_relevant_passages_behind_unrelated_candidates(self):
+        rag = Rag()
+        rag.documents[0] = "The work was written by Alpha in 1990."
+        rag.documents[1] = "He was born in Paris in 1960."
+        state = closure_state(rag, relation=False)
+        for nid, doc_id in (("s1", 0), ("s2", 1)):
+            state["_evidence_beams"][0]["proofs"][nid]["evidence"] = rag.documents[doc_id]
+        state["evidence_candidates"].update({d: candidate(d, "noise:" + str(d), .2)
+                                              for d in range(6, 11)})
+        ids, scores = np.arange(12), np.linspace(1., .1, 12)
+        expected, _, _ = base_module.EvidenceRetrieval(rag).finalize("q", ids, scores, {}, dict(state, evidence_trace={}))
+        actual, _, trace = Improved(rag, ("closure",)).finalize("q", ids, scores, {}, state)
+        # Literal subject/coreference checks reject these proofs. Their passages
+        # still compete using exactly the original exp4 retrieval objective.
+        self.assertEqual(actual.tolist(), expected.tolist())
+        self.assertEqual(set(actual[:2]), {0, 1})
+        self.assertEqual(trace["improvement_closure"]["soft_fallback_docs"], [0, 1])
+        self.assertEqual(trace["improvement_closure"]["ancestor_document_bundles"], {})
+        self.assertTrue(all(d["closure_status"] == "ordinary_document"
+                            for d in trace["selected_prefix"]))
+
+    def test_reliable_ancestor_chain_fits_budget_and_keeps_parent_order(self):
+        rag = Rag(2)
+        state = closure_state(rag)
+        ids = np.array([1, 0, 2, 3, 4, 5])
+        actual, _, trace = Improved(rag, ("selection", "closure")).finalize("q", ids, np.linspace(1., .1, 6), {}, state)
+        self.assertEqual(actual[:2].tolist(), [0, 1])
+        self.assertEqual(trace["improvement_closure"]["selected_bundle_count"], 1)
+        self.assertTrue(all(d["closure_status"] == "complete_bundle"
+                            for d in trace["selected_prefix"]))
+
+    def test_over_budget_bundle_keeps_ordinary_document_and_does_not_claim_closure(self):
+        rag = Rag(1)
+        state = closure_state(rag)
+        # Only the child is in the dense ranking. The ancestor remains available
+        # as a candidate, but both proof documents cannot fit the one-slot prefix.
+        ids = np.array([1, 2, 3, 4, 0])
+        actual, _, trace = Improved(rag, ("selection", "closure")).finalize("q", ids, np.linspace(1., .1, 5), {}, state)
+        self.assertEqual(actual[0], 1)
+        self.assertEqual(trace["selected_prefix"][0]["selection_source"], "base_fallback")
+        self.assertEqual(trace["selected_prefix"][0]["closure_status"], "ordinary_document")
+        self.assertEqual(trace["improvement_closure"]["selected_bundle_count"], 0)
+        self.assertEqual(trace["improvement_closure"]["deferred_bundle_documents"]["1"],
+                         "bundle_exceeds_remaining_prefix_budget")
+
+    def test_one_document_proving_two_nodes_keeps_both_nodes_ancestors(self):
+        rag = Rag(3)
+        rag.documents[2] = "Alpha was born in Paris. Alpha worked in London."
+        state = closure_state(rag)
+        state["_evidence_plan"].append({"id": "s3", "question": "Where did ${s1.answer} work?",
+                                          "depends_on": ["s1"], "answer_type": "place"})
+        state["_evidence_plan"].append({"id": "s4", "question": "Which city links ${s2.answer}?",
+                                          "depends_on": ["s2"], "answer_type": "place"})
+        p3 = proof(2, "London", "Alpha worked in London.", "s3")
+        p4 = proof(2, "Paris", "Alpha was born in Paris.", "s4")
+        state["_evidence_winning_bindings"].update(s3="London", s4="Paris")
+        state["_evidence_beams"][0]["proofs"].update(s3=p3, s4=p4)
+        state["evidence_candidates"][2] = candidate(2, "dag:s3", verified=[p3, p4])
+        bundles, _, diagnostics = Improved(rag, ("closure",))._reliable_proof_bundles(
+            state, state["evidence_candidates"], state["_evidence_winning_bindings"])
+        self.assertEqual(bundles[2], {0, 1, 2})
+        self.assertEqual(diagnostics["ancestor_document_bundles"]["2"], [0, 1, 2])
+        actual, _, trace = Improved(rag, ("selection", "closure")).finalize(
+            "q", np.array([2, 3, 4, 0, 1]), np.linspace(1., .1, 5), {}, state)
+        self.assertEqual(actual[:3].tolist(), [0, 1, 2])
+        self.assertTrue(trace["improvement_closure"]["reliable_proof_closed_at_5"])
 
     def test_wrong_literal_subject_does_not_force_ancestor_chain(self):
         rag = Rag(2)

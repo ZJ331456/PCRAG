@@ -107,15 +107,20 @@ class AdaptiveSearchMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if "adaptive" in self.improvements:
+        self.adaptive_mode = getattr(self.cfg, "evidence_adaptive_mode", "both")
+        if self.adaptive_mode not in {"both", "verify_only", "beam_only"}:
+            raise ValueError("Unknown evidence_adaptive_mode")
+        self.expand_verification = "adaptive" in self.improvements and self.adaptive_mode in {"both", "verify_only"}
+        self.retain_alternatives = "adaptive" in self.improvements and self.adaptive_mode in {"both", "beam_only"}
+        if self.retain_alternatives:
             self.beam_width = 2
 
     def _verification_documents(self, ids: List[int]) -> Dict[int, str]:
-        count = 6 if "adaptive" in self.improvements else 3
+        count = 6 if self.expand_verification else 3
         return {int(doc_id): self._document(int(doc_id))[:4000] for doc_id in ids[:count]}
 
     def _verify(self, question: str, answer_type: str, docs: Dict[int, str]):
-        if "adaptive" not in self.improvements or len(docs) <= 3:
+        if not self.expand_verification or len(docs) <= 3:
             return super()._verify(question, answer_type, docs)
         entries = list(docs.items())
         first, extra = dict(entries[:3]), dict(entries[3:6])
@@ -146,7 +151,7 @@ class AdaptiveSearchMixin:
 
     def _prune_beams(self, beams: List[dict], total: int) -> List[dict]:
         ordered = super()._prune_beams(beams, total)
-        if "adaptive" not in self.improvements or len(ordered) < 2:
+        if not self.retain_alternatives or len(ordered) < 2:
             return ordered
         margin = max(0.0, float(getattr(self.cfg, "evidence_ambiguity_margin", 0.06)))
         gap = self._beam_score(ordered[0], total) - self._beam_score(ordered[1], total)

@@ -165,7 +165,9 @@ class ImprovementIntegrationTests(unittest.TestCase):
                        dict(improvement_stage=0, evidence_improvements="binding"),
                        dict(improvement_stage=4, evidence_improvements="binding", evidence_ablation_mode="validation"),
                        dict(evidence_plan_node_budget=9), dict(evidence_plan_depth_budget=5),
-                       dict(evidence_selection_top_k=21)]:
+                       dict(evidence_selection_top_k=21), dict(evidence_adaptive_mode="unlimited"),
+                       dict(evidence_binding_validation="unchecked"),
+                       dict(evidence_binding_validation="strict_relation")]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 config.PCRAGConfig(**kwargs)
 

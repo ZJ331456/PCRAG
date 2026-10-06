@@ -12,6 +12,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .evidence_retrieval import normalized_text, verify_hypotheses
+from .evidence_relation_guard import relation_name_matches, relation_spec, strict_relation_reason
 
 
 def _contains(phrase: str, text: str) -> bool:
@@ -227,13 +228,16 @@ def _attribute_reason(relation: str, answer: str, entity: str, span: str,
 
 
 def verify_typed_hypotheses(payload: dict, documents: Dict[int, str], question: str,
-                            answer_type: str) -> Tuple[List[dict], List[dict]]:
+                            answer_type: str, validation: str = "legacy") -> Tuple[List[dict], List[dict]]:
     """Check quoted answers, same-document aliases, subject and attribute type."""
     if not isinstance(payload.get("hypotheses"), list):
         return [], [{"reason": "invalid_hypotheses_list"}]
     accepted, rejected, seen = [], [], set()
-    relation = requested_relation(question)
-    requested_subject = _question_subject(question, relation)
+    if validation not in {"legacy", "strict_relation"}:
+        raise ValueError(f"Unknown evidence binding validation: {validation}")
+    spec = relation_spec(question) if validation == "strict_relation" else None
+    relation = spec["relation"] if spec else requested_relation(question)
+    requested_subject = None if spec else _question_subject(question, relation)
     for item in payload["hypotheses"]:
         base, failures = verify_hypotheses({"hypotheses": [item]}, documents)
         if not isinstance(item, dict):
@@ -261,10 +265,16 @@ def verify_typed_hypotheses(payload: dict, documents: Dict[int, str], question: 
             reason = reason or "subject_evidence_not_exact_substring"
         elif not supported_entity_surface(entity, support, document)[0]:
             reason = reason or "relationship_subject_not_supported"
-        elif not _relation_matches(claimed_relation, relation):
+        elif not (relation_name_matches(claimed_relation, spec) if spec and relation not in {
+                "birth_date", "birth_place", "death_date", "nationality"} else
+                _relation_matches(claimed_relation, relation)):
             reason = reason or "requested_relationship_mismatch"
         elif requested_subject and not _same_entity(entity, requested_subject, document):
             reason = reason or "relationship_subject_mismatch"
+        if not reason:
+            if spec:
+                reason = strict_relation_reason(spec, question, answer, answer_type, entity, span,
+                                                document, supported_entity_surface, _same_entity)
         if not reason:
             reason = _attribute_reason(relation, answer, entity, span, support, document)
         if reason:
@@ -274,10 +284,16 @@ def verify_typed_hypotheses(payload: dict, documents: Dict[int, str], question: 
         if identity in seen:
             continue
         seen.add(identity)
-        accepted.append(dict(base[0], answer=answer, answer_entity=entity,
-                             answer_relation=claimed_relation, subject_evidence=support,
-                             relation_supported=True,
-                             binding_support={"answer_surface": alias_kind, "validation": "source_grounded_typed", "requested_relation": relation}))
+        checked = dict(base[0], answer=answer, answer_entity=entity,
+                       answer_relation=claimed_relation, subject_evidence=support,
+                       relation_supported=True,
+                       binding_support={"answer_surface": alias_kind,
+                                        "validation": ("strict_relation" if spec else "source_grounded_typed"),
+                                        "requested_relation": relation})
+        if spec:
+            checked["binding_support"]["mechanical_relation_checked"] = True
+            checked["binding_support"]["entailment_guaranteed"] = False
+        accepted.append(checked)
     accepted.sort(key=lambda x: (-x["confidence"], x["doc_id"], normalized_text(x["answer"])))
     return accepted, rejected
 
@@ -286,7 +302,19 @@ class BindingImprovementMixin:
     def _verify(self, question: str, answer_type: str, docs: Dict[int, str]):
         if "binding" not in self.improvements:
             return super()._verify(question, answer_type, docs)
-        relation = requested_relation(question)
+        validation = getattr(getattr(self, "cfg", None), "evidence_binding_validation", "legacy")
+        if validation not in {"legacy", "strict_relation"}:
+            raise ValueError(f"Unknown evidence binding validation: {validation}")
+        spec = relation_spec(question) if validation == "strict_relation" else None
+        relation = spec["relation"] if spec else requested_relation(question)
+        key = question + "::" + ",".join(map(str, docs))
+        if spec and relation in {"other", "comparison"}:
+            unsupported = ("comparison_requires_atomic_attribute_evidence" if relation == "comparison"
+                           else "unrecognized_requested_relationship")
+            self._verification_diagnostics[key] = {
+                "attempts": 0, "outputs": [], "binding_mode": "strict_relation",
+                "local_guard_reason": unsupported}
+            return [], [{"reason": unsupported}], None
         messages = [
             {"role": "system", "content": (
                 "Verify answers to a retrieval subquestion using ONLY the supplied passages. "
@@ -309,8 +337,19 @@ class BindingImprovementMixin:
                 f"Subquestion: {question}\nAnswer type: {answer_type}\nRequested relation: {relation}\n\n" +
                 "\n\n".join(f"[D{k}]\n{text}" for k, text in docs.items()))},
         ]
-        key = question + "::" + ",".join(map(str, docs))
-        diagnostics = {"attempts": 0, "outputs": [], "binding_mode": "source_grounded_typed"}
+        if spec:
+            messages[0]["content"] += (
+                " Strict relation mode: answer_entity must be the specific subject asked about, "
+                "not another entity sharing a passage. A country containing a port does not "
+                "inherit the port's location; a neighboring country in another country's sentence "
+                "does not establish the queried adjacency. A date for one polity must never be "
+                "bound to another polity. For the birth date or nationality of a work's creator, "
+                "this same passage must explicitly link that work to that creator. Return no "
+                "hypotheses for unresolved comparison questions or an unrecognized requested "
+                "relation. Copy the clause that establishes subject, relation and answer together.")
+            messages[1]["content"] += "\nLocal relation requirements: " + json.dumps(spec, ensure_ascii=False)
+        diagnostics = {"attempts": 0, "outputs": [], "binding_mode": (
+            "strict_relation" if spec else "source_grounded_typed")}
         self._verification_diagnostics[key] = diagnostics
         all_rejected = []
         reason = None
@@ -319,7 +358,7 @@ class BindingImprovementMixin:
             diagnostics["attempts"] += 1
             diagnostics["outputs"].append(payload)
             accepted, rejected = (([], [{"reason": reason}]) if reason else
-                                  verify_typed_hypotheses(payload, docs, question, answer_type))
+                                  verify_typed_hypotheses(payload, docs, question, answer_type, validation))
             all_rejected.extend(rejected)
             if accepted or (not rejected and not reason):
                 return accepted, all_rejected, reason

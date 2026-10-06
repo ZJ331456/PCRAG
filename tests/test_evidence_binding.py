@@ -35,8 +35,8 @@ def hypothesis(answer, evidence, entity, relation, subject=None, **extra):
     return {"hypotheses": [item]}
 
 
-def verify(payload, document, question, kind="person"):
-    return binding.verify_typed_hypotheses(payload, {0: document}, question, kind)
+def verify(payload, document, question, kind="person", validation="legacy"):
+    return binding.verify_typed_hypotheses(payload, {0: document}, question, kind, validation)
 
 
 class BindingTests(unittest.TestCase):
@@ -224,6 +224,178 @@ class BindingTests(unittest.TestCase):
         engine = Engine([(None, "invalid_json_object"), ({"hypotheses": []}, None)])
         self.assertFalse(engine._verify("What nationality was Sergio Nasca?", "nationality", docs)[0])
         self.assertEqual(len(engine.calls), 2)
+
+    def test_strict_country_location_rejects_port_location(self):
+        intro = "Israel is a country in the Middle East."
+        quote = "On the Mediterranean coast, Haifa Port is the country's oldest and largest port."
+        payload = hypothesis("Mediterranean coast", quote, "Israel", "location", intro)
+        accepted, rejected = verify(payload, "Israel\n" + intro + " " + quote,
+                                     "Where is Israel located?", "place", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "requested_location_not_supported_for_subject")
+        accepted, rejected = verify(hypothesis("Middle East", intro, "Israel", "location"),
+                                     "Israel\n" + intro, "Where is Israel located?", "place", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertEqual(accepted[0]["binding_support"]["validation"], "strict_relation")
+        self.assertTrue(accepted[0]["binding_support"]["mechanical_relation_checked"])
+        self.assertFalse(accepted[0]["binding_support"]["entailment_guaranteed"])
+
+    def test_strict_country_mention_cannot_own_its_port_location(self):
+        intro = "Israel is a country."
+        for quote in ("Israel's Haifa Port is located on the Mediterranean coast.",
+                      "The port in Israel is located on the Mediterranean coast."):
+            with self.subTest(quote=quote):
+                accepted, rejected = verify(hypothesis("Mediterranean coast", quote, "Israel", "location", intro),
+                                             "Israel\n" + intro + " " + quote,
+                                             "Where is Israel located?", "place", "strict_relation")
+                self.assertFalse(accepted)
+                self.assertEqual(rejected[0]["reason"], "requested_location_not_supported_for_subject")
+
+    def test_strict_location_uses_document_anchored_pronoun(self):
+        intro = "Israel is a country."
+        quote = "It is located in Western Asia."
+        accepted, rejected = verify(hypothesis("Western Asia", quote, "Israel", "location", intro),
+                                     "Israel\n" + intro + " " + quote,
+                                     "Where is Israel located?", "place", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_strict_neighbor_cannot_change_requested_subject(self):
+        quote = "Spain is bordered to the north and northeast by France, Andorra, and the Bay of Biscay."
+        accepted, rejected = verify(hypothesis("Andorra", quote, "Spain", "north_of"),
+                                     "Spain\n" + quote,
+                                     "What is the region immediately north of Mediterranean coast?", "place", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "relationship_subject_mismatch")
+        accepted, rejected = verify(hypothesis("Andorra", quote, "Spain", "north_of"),
+                                     "Spain\n" + quote, "What is north of Spain?", "place", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_strict_neighbor_checks_direction_orientation(self):
+        quote = "France is north of Spain."
+        accepted, rejected = verify(hypothesis("Spain", quote, "France", "north_of"),
+                                     "France\n" + quote, "What is north of France?", "place", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "requested_direction_not_supported_for_subject")
+        accepted, rejected = verify(hypothesis("France", quote, "Spain", "north_of"),
+                                     "France\n" + quote, "What is north of Spain?", "place", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_strict_establishment_cannot_transfer_polity_date(self):
+        quote = "The Crown of Aragon was established in 1162. Andorra is a neighboring country."
+        for subject in ("Crown of Aragon", "Andorra"):
+            accepted, rejected = verify(hypothesis("1162", quote, subject, "established_date"),
+                                         "Crown of Aragon\n" + quote,
+                                         "When was Andorra established?", "year", "strict_relation")
+            self.assertFalse(accepted)
+            self.assertIn(rejected[0]["reason"], {"relationship_subject_mismatch", "requested_establishment_not_supported_for_subject"})
+        quote = "Andorra was established in 1278."
+        accepted, rejected = verify(hypothesis("1278", quote, "Andorra", "established_date"),
+                                     "Andorra\n" + quote, "When was Andorra established?", "year", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_strict_establishment_mentions_are_not_the_owning_subject(self):
+        for quote in ("Andorra's ally, the Crown of Aragon, was founded in 1162.",
+                      "The Crown of Aragon, an ally of Andorra, was founded in 1162."):
+            with self.subTest(quote=quote):
+                accepted, rejected = verify(hypothesis("1162", quote, "Andorra", "established_date"),
+                                             "Andorra\n" + quote, "When was Andorra established?", "year", "strict_relation")
+                self.assertFalse(accepted)
+                self.assertEqual(rejected[0]["reason"], "requested_establishment_not_supported_for_subject")
+
+    def test_strict_creator_birth_date_requires_the_work_creator_link(self):
+        quote = "Joshua Jacob Marston (born August 13, 1968) is an American screenwriter and film director."
+        accepted, rejected = verify(hypothesis("August 13, 1968", quote, "Joshua Jacob Marston", "birth_date"),
+                                     "Joshua Jacob Marston\n" + quote,
+                                     "When was The Black Marble director born?", "date", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "linked_subject_relationship_not_supported")
+        identity = "The Black Marble is a film directed by Harold Becker."
+        quote = "Harold Becker was born on September 25, 1928."
+        accepted, rejected = verify(hypothesis("September 25, 1928", quote, "Harold Becker", "birth_date"),
+                                     "The Black Marble\n" + identity + " " + quote,
+                                     "When was the director of The Black Marble born?", "date", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_strict_creators_cannot_swap_names_in_same_document(self):
+        quote = "Film Alpha was directed by Dana Jones. Film Beta was directed by Morgan Lee."
+        accepted, rejected = verify(hypothesis("Morgan Lee", quote, "Film Alpha", "director"),
+                                     "Film Alpha\n" + quote, "Who directed Film Alpha?", "person", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "requested_creator_not_supported_for_subject")
+        accepted, rejected = verify(hypothesis("Dana Jones", quote, "Film Alpha", "director"),
+                                     "Film Alpha\n" + quote, "Who directed Film Alpha?", "person", "strict_relation")
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+
+    def test_strict_comparison_does_not_accept_death_as_birth_order(self):
+        quote = "Dave Brockie died on March 23, 2014."
+        accepted, rejected = verify(hypothesis("Dave Brockie", quote, "Dave Brockie", "comparison"),
+                                     "Dave Brockie\n" + quote,
+                                     "Who was born first, Ronnie Radke or Dave Brockie?", "order", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "comparison_requires_atomic_attribute_evidence")
+
+    def test_strict_unknown_relation_rejects_binding_but_keeps_input_documents(self):
+        quote = "Aster is an example."
+        docs = {0: "Aster\n" + quote}
+        before = dict(docs)
+        accepted, rejected = binding.verify_typed_hypotheses(
+            hypothesis("Aster", quote, "Aster", "other"), docs, "Which example is best?", "unknown", "strict_relation")
+        self.assertFalse(accepted)
+        self.assertEqual(rejected[0]["reason"], "unrecognized_requested_relationship")
+        self.assertEqual(docs, before)
+
+    def test_strict_unknown_relation_needs_no_llm_request(self):
+        class Engine(binding.BindingImprovementMixin):
+            improvements = frozenset({"binding"})
+            cfg = SimpleNamespace(evidence_binding_validation="strict_relation")
+
+            def __init__(self):
+                self._verification_diagnostics = {}
+
+            def _infer_object(self, messages):
+                self.fail("An unrecognized relation must be handled locally")
+
+        engine = Engine()
+        accepted, rejected, reason = engine._verify("Which example is best?", "unknown", {0: "Aster is an example."})
+        self.assertFalse(accepted)
+        self.assertIsNone(reason)
+        self.assertEqual(rejected[0]["reason"], "unrecognized_requested_relationship")
+        self.assertEqual(engine._verification_diagnostics["Which example is best?::0"]["attempts"], 0)
+
+    def test_strict_binding_has_the_same_two_call_budget_and_legacy_prompt_unchanged(self):
+        class Engine(binding.BindingImprovementMixin):
+            improvements = frozenset({"binding"})
+
+            def __init__(self, validation=None):
+                self._verification_diagnostics = {}
+                self.calls = []
+                if validation:
+                    self.cfg = SimpleNamespace(evidence_binding_validation=validation)
+
+            def _infer_object(self, messages):
+                self.calls.append(json.loads(json.dumps(messages)))
+                if len(self.calls) == 1:
+                    return hypothesis("Mediterranean coast", quote, "Israel", "location", intro), None
+                return {"hypotheses": []}, None
+
+        intro = "Israel is a country in the Middle East."
+        quote = "On the Mediterranean coast, Haifa Port is the country's oldest and largest port."
+        docs = {0: "Israel\n" + intro + " " + quote}
+        implicit, explicit, strict = Engine(), Engine("legacy"), Engine("strict_relation")
+        implicit._verify("Where is Israel located?", "place", docs)
+        explicit._verify("Where is Israel located?", "place", docs)
+        accepted, _, _ = strict._verify("Where is Israel located?", "place", docs)
+        self.assertEqual(implicit.calls, explicit.calls)
+        self.assertFalse(accepted)
+        self.assertEqual(len(strict.calls), 2)
+        self.assertIn("Strict relation mode", strict.calls[0][0]["content"])
+        self.assertEqual(strict._verification_diagnostics["Where is Israel located?::0"]["attempts"], 2)
 
 
 if __name__ == "__main__":

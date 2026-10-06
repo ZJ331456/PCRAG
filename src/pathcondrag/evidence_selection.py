@@ -192,6 +192,7 @@ class SelectionImprovementMixin:
             bundles, fallback, closure_diagnostics = self._reliable_proof_bundles(state, candidates, bindings)
         covered, selected, details = {}, [], []
         promoted, baseline_fills, bundle_count = 0, 0, 0
+        deferred_bundles = {}
         jaccard_cache = {}
 
         def marginal(doc_id, prefix):
@@ -221,11 +222,13 @@ class SelectionImprovementMixin:
         def extension(doc_id):
             required = bundles.get(doc_id, {doc_id}) - set(selected)
             if len(selected) + len(required) > budget:
+                deferred_bundles[doc_id] = "bundle_exceeds_remaining_prefix_budget"
                 return None
             result = list(selected)
             while required:
                 eligible = [d for d in required if not (bundles.get(d, {d}) - set(result) - {d})]
                 if not eligible:
+                    deferred_bundles[doc_id] = "document_dependency_order_unavailable"
                     return None
                 chosen = max(eligible, key=lambda d: (marginal(d, result)[0], -base_rank.get(d, len(base_order)), -d))
                 result.append(chosen)
@@ -251,19 +254,25 @@ class SelectionImprovementMixin:
             # and meaningful-gain gating belong only to the selection flag.
             best = base_option if selection else (float("-inf"), 0, 0, 0, None, False)
             for doc_id in candidates:
-                if doc_id in chosen_set or doc_id in fallback:
+                if doc_id in chosen_set:
                     continue
                 value, gain, redundancy, meaningful = marginal(doc_id, selected)
                 if selection and not meaningful:
                     continue
                 proposed = extension(doc_id)
                 if proposed is None:
-                    continue
+                    # Closure constrains a proof promotion, not whether its
+                    # passage may compete under the existing retrieval score.
+                    # An over-budget bundle therefore loses forced closure but
+                    # retains the same ordinary candidate option as an invalid
+                    # or missing-ancestor proof.
+                    proposed = selected + [doc_id]
                 delta = sum(marginal(d, proposed[:index])[0]
                             for index, d in enumerate(proposed) if index >= len(selected))
                 score = delta / max(1, len(proposed) - len(selected))
                 if selection:
-                    contender = (score, 1 if doc_id in bundles else 0,
+                    complete_bundle = doc_id in bundles and bundles[doc_id] <= set(proposed)
+                    contender = (score, 1 if complete_bundle else 0,
                                  -base_rank.get(doc_id, len(base_order)), -doc_id, proposed, True)
                 else:
                     contender = (score, merged[doc_id], -doc_id, 0, proposed, True)
@@ -281,6 +290,9 @@ class SelectionImprovementMixin:
                 details.append({"doc_id": doc_id, "utility": float(value), "coverage_gain": float(gain),
                                 "redundancy": float(redundancy), "goals": goals.get(doc_id, {}),
                                 "verified": candidates.get(doc_id, {}).get("verified", []), "selection_source": mode})
+                if closure:
+                    complete = doc_id in bundles and bundles[doc_id] <= set(chosen_extension)
+                    details[-1]["closure_status"] = "complete_bundle" if complete else "ordinary_document"
                 selected.append(doc_id)
                 for goal, value in goals.get(doc_id, {}).items():
                     covered[goal] = max(covered.get(goal, 0.), value)
@@ -305,6 +317,8 @@ class SelectionImprovementMixin:
             closure_diagnostics.update(enabled=True, selected_bundle_count=bundle_count,
                                        strong_scope="promoted_reliable_proof_documents",
                                        fallback_policy="preserve_base_passage_without_forced_proof",
+                                       soft_fallback_candidates_retained=True,
+                                       deferred_bundle_documents={str(d): reason for d, reason in sorted(deferred_bundles.items())},
                                        reliable_proof_closed_at_5=proof_closed_at(5),
                                        reliable_proof_closed_at_10=proof_closed_at(10))
             trace["improvement_closure"] = closure_diagnostics

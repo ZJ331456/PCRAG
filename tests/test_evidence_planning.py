@@ -190,6 +190,42 @@ class AdaptiveSearchTests(unittest.TestCase):
         self.assertEqual(list(self.docs(engine)), [0, 1, 2])
         self.assertEqual(engine.beam_width, 1)
 
+    def test_verify_only_expands_missing_evidence_without_retaining_second_beam(self):
+        rag = FakeRAG([{"hypotheses": []}, answer("Beta", 4, "Beta directed Film B in 1991.")])
+        rag.pcrag_config.evidence_adaptive_mode = "verify_only"
+        engine = Engine(rag, {"adaptive"})
+        accepted, _, reason = engine._verify("Who directed Film B?", "person", self.docs(engine))
+        self.assertIsNone(reason)
+        self.assertEqual(accepted[0]["doc_id"], 4)
+        self.assertEqual(len(rag.calls), 2)
+        self.assertEqual(engine.beam_width, 1)
+        beams = [{"bindings": {"s1": "Alpha"}, "proofs": {}, "qualities": [.9]},
+                 {"bindings": {"s1": "Beta"}, "proofs": {}, "qualities": [.88]}]
+        self.assertEqual(len(engine._prune_beams(beams, 2)), 1)
+
+    def test_beam_only_retains_close_alternative_without_expanding_verification(self):
+        rag = FakeRAG([{"hypotheses": []}])
+        rag.pcrag_config.evidence_adaptive_mode = "beam_only"
+        engine = Engine(rag, {"adaptive"})
+        self.assertEqual(list(self.docs(engine)), [0, 1, 2])
+        accepted, _, reason = engine._verify("Who directed Film B?", "person", self.docs(engine))
+        self.assertIsNone(reason)
+        self.assertFalse(accepted)
+        self.assertEqual(len(rag.calls), 1)
+        beams = [{"bindings": {"s1": "Alpha"}, "proofs": {}, "qualities": [.9]},
+                 {"bindings": {"s1": "Beta"}, "proofs": {}, "qualities": [.88]}]
+        self.assertEqual(len(engine._prune_beams(beams, 2)), 2)
+
+    def test_explicit_both_replays_the_default_adaptive_requests(self):
+        responses = [{"hypotheses": []}, answer("Beta", 4, "Beta directed Film B in 1991.")]
+        default_rag, explicit_rag = FakeRAG(responses), FakeRAG(responses)
+        explicit_rag.pcrag_config.evidence_adaptive_mode = "both"
+        left, right = Engine(default_rag, {"adaptive"}), Engine(explicit_rag, {"adaptive"})
+        self.assertEqual(left._verify("Who directed Film B?", "person", self.docs(left)),
+                         right._verify("Who directed Film B?", "person", self.docs(right)))
+        self.assertEqual(default_rag.calls, explicit_rag.calls)
+        self.assertEqual(left._verification_diagnostics, right._verification_diagnostics)
+
 
 if __name__ == "__main__":
     unittest.main()
