@@ -512,5 +512,222 @@ class Round2RunnerTests(unittest.TestCase):
                 full.assert_not_called()
 
 
+class BridgeRunnerTests(unittest.TestCase):
+    def args(self, **updates):
+        values = dict(baseline_profile='plan_prune', selection_policy='hotpot_bridge',
+            sampling_policy='representative', require_raw_guard=True,
+            protected_metrics=','.join(runner.EXPORTED_RECALLS), target_gain=4,
+            gain_unit='absolute_pp', max_regression=1, allowed_exceptions=2,
+            variants=','.join(item.name for item in runner.BRIDGE_VARIANTS))
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    def measurements(self):
+        baseline = reports()
+        for report in baseline.values():
+            report['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5,
+                                                'Recall@20': .9, 'Recall@200': .98})
+            report['representative_evaluation'] = {'full_population': {
+                'metrics': dict(report['retrieval_metrics'])}}
+        return baseline
+
+    def assess_bridge(self, candidate, baseline):
+        args = self.args()
+        judged = runner.assess(args, candidate, baseline)
+        return dict(judged, **runner.hotpot_bridge_assessment(args, candidate, baseline, judged))
+
+    def test_new_profiles_and_replay_keep_plan_prune_as_the_paired_control(self):
+        args = self.args(python='python', llm_base_url='http://local/v1')
+        baseline = runner.baseline_variant(args)
+        self.assertEqual(baseline.flags, ('planning', 'plan_prune'))
+        self.assertEqual(baseline.plan_validation, 'canonical_refs')
+        self.assertEqual(baseline.plan_routing, 'question_structure')
+        replay = runner.baseline_variant(args, 'baseline_replay')
+        self.assertEqual(runner.replace(replay, name='baseline'), baseline)
+        self.assertEqual(runner.baseline_variant(SimpleNamespace()), runner.BASELINE)
+        self.assertEqual(runner.selected_variants(args), runner.BRIDGE_VARIANTS)
+        self.assertEqual(runner.smoke_combination(args).flags,
+                         ('planning', 'plan_prune', 'bridge_recovery', 'package'))
+        context = {'dataset': 'hotpotqa', 'manifest': {'data_path': '/data', 'corpus_path': '/corpus'}}
+        for variant in (*runner.BRIDGE_VARIANTS, baseline, replay):
+            command = runner.command(args, context, Path('/case'), [572, 723], variant)
+            self.assertEqual(command[command.index('--evidence_improvements') + 1], ','.join(variant.flags))
+            self.assertEqual(command[command.index('--max_new_tokens') + 1], '2048')
+            self.assertEqual(command[command.index('--embedding_batch_size') + 1], '4')
+            self.assertEqual(command[command.index('--llm_prefetch_workers') + 1], '8')
+
+    def test_hotpot_policy_requires_full_raw_and_calibrated_six_recall_guards(self):
+        self.assertEqual(runner.selection_policy(self.args()), 'hotpot_bridge')
+        for changes in ({'baseline_profile': 'original_exp4'}, {'require_raw_guard': False},
+                        {'sampling_policy': 'hop_support'}, {'protected_metrics': 'Recall@5,Recall@10'}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'six-Recall guards'):
+                runner.selection_policy(self.args(**changes))
+
+    def test_hotpot_r10_only_gain_is_a_component_signal_without_changing_global_target(self):
+        baseline = self.measurements()
+        candidate = deepcopy(baseline)
+        candidate['hotpotqa']['retrieval_metrics']['Recall@10'] += .02
+        candidate['hotpotqa']['representative_evaluation']['full_population']['metrics']['Recall@10'] += .02
+        judged = self.assess_bridge(candidate, baseline)
+        self.assertFalse(judged['weak_signal'])
+        self.assertFalse(judged['strong_target_met'])
+        self.assertTrue(judged['hotpot_bridge_signal'])
+        self.assertEqual(judged['hotpot_improved_metrics'], ['Recall@10'])
+        self.assertEqual(judged['component_reference'], 'fresh_paired_plan_prune')
+
+    def test_existing_or_new_2wiki_gain_is_not_new_hotpot_contribution(self):
+        baseline = self.measurements()
+        candidate = deepcopy(baseline)
+        for metrics in (candidate['2wikimultihopqa']['retrieval_metrics'],
+                        candidate['2wikimultihopqa']['representative_evaluation']['full_population']['metrics']):
+            metrics['Recall@5'] += .05
+            metrics['Recall@10'] += .05
+        judged = self.assess_bridge(candidate, baseline)
+        self.assertTrue(judged['weak_signal'])
+        self.assertFalse(judged['hotpot_bridge_signal'])
+
+    def test_component_signal_needs_raw_and_calibrated_improvement_on_same_metric(self):
+        baseline = self.measurements()
+        candidate = deepcopy(baseline)
+        candidate['hotpotqa']['retrieval_metrics']['Recall@5'] += .02
+        candidate['hotpotqa']['representative_evaluation']['full_population']['metrics']['Recall@10'] += .02
+        self.assertFalse(self.assess_bridge(candidate, baseline)['hotpot_bridge_signal'])
+        candidate['hotpotqa']['retrieval_metrics']['Recall@10'] += .02
+        self.assertTrue(self.assess_bridge(candidate, baseline)['hotpot_bridge_signal'])
+
+    def test_any_dataset_r2_regression_rejects_local_hotpot_gain(self):
+        baseline = self.measurements()
+        candidate = deepcopy(baseline)
+        for metrics in (candidate['hotpotqa']['retrieval_metrics'],
+                        candidate['hotpotqa']['representative_evaluation']['full_population']['metrics']):
+            metrics['Recall@5'] += .02
+        candidate['musique']['retrieval_metrics']['Recall@2'] -= .011
+        judged = self.assess_bridge(candidate, baseline)
+        self.assertTrue(judged['weighted_regression_limit_met'])
+        self.assertFalse(judged['raw_regression_limit_met'])
+        self.assertFalse(judged['hotpot_bridge_signal'])
+
+    def test_no_hotpot_gain_skips_confirmation_even_with_a_positive_2wiki_average(self):
+        args = self.args()
+        summary = {'screen': {'complete': True, 'variants': {
+            'package': {'regression_limit_met': True, 'weak_signal': True, 'hotpot_bridge_signal': False}}}}
+        with tempfile.TemporaryDirectory() as name, patch.object(runner, 'phase_baselines') as baselines:
+            runner.confirm(args, {}, Path(name), {}, summary, Path(name) / 'selection.json')
+        baselines.assert_not_called()
+        self.assertEqual(summary['selection_status'], 'small_sample_no_guarded_hotpot_gain')
+        self.assertEqual(summary['selected_new_module_profiles'], [])
+        self.assertFalse(summary['automatic_full_run_enabled'])
+
+    def test_combined_confirmation_runs_b_before_ab_and_does_not_select_parent_only_control(self):
+        args = self.args(confirm_size=30)
+        variants = {variant.name: dict(config=runner.asdict(variant), regression_limit_met=True,
+            weak_signal=False, strong_target_met=False, score=1,
+            hotpot_bridge_signal=variant.name != 'bridge_recovery', component_selection_score=1)
+            for variant in runner.BRIDGE_VARIANTS}
+        summary = {'screen': {'complete': True, 'variants': variants}, 'group_plan': [],
+                   'maximum_possible_groups': 30}
+        seen = []
+
+        def evaluate(args, contexts, temp, env, summary, file, phase, indices, variant, baselines):
+            seen.append(variant.name)
+            return dict(config=runner.asdict(variant), strong_target_met=False, weak_signal=False,
+                        hotpot_bridge_signal=True)
+
+        summary['indices'] = {'confirmation': {dataset: [7] for dataset in runner.DATASETS}}
+        with tempfile.TemporaryDirectory() as name, \
+                patch.object(runner, 'unique_confirmation_candidates', return_value=(
+                    [variants['bridge_package'], variants['package']], {})), \
+                patch.object(runner, 'phase_baselines', return_value=({}, {})), \
+                patch.object(runner, 'evaluate_variant', side_effect=evaluate):
+            runner.confirm(args, {}, Path(name), {}, summary, Path(name) / 'selection.json')
+        self.assertEqual(seen, ['bridge_recovery', 'bridge_package'])
+        self.assertEqual(summary['confirmation_parent_controls'], ['bridge_recovery'])
+        self.assertEqual(summary['confirmed_hotpot_bridge_variants'], ['bridge_package'])
+        self.assertEqual(summary['selected_new_module_profiles'], [{'profile': 'bridge_package',
+            'new_modules': ['bridge_recovery', 'package']}])
+        self.assertEqual(len(summary['group_plan']), 9)
+        self.assertEqual(summary['global_target_status'], 'paired_four_point_target_not_met')
+
+    def test_historical_original_control_is_question_matched_and_labeled_diagnostic(self):
+        rows = {index: {'query_index': index, 'metrics': {'Recall@5': score, 'Recall@10': 1.0},
+                        'all_gold_top5': score == 1, 'all_gold_top10': True}
+                for index, score in [(1, .5), (7, 1.0)]}
+        context = {'baseline_measurements': rows, 'representative_sampling': {
+            'features': [{'primary': 'type=bridge'} for _ in range(10)]}}
+        report = runner.historical_reference_report(context, [7, 1])
+        self.assertEqual([row['query_index'] for row in report['per_question']], [7, 1])
+        self.assertAlmostEqual(report['retrieval_metrics']['Recall@5'], .75)
+        self.assertIn('not a fresh paired causal control', report['warning'])
+
+    def test_combined_package_requires_equal_parent_plans_and_no_fresh_llm_outputs(self):
+        parent = {'results': [{'query_index': 7, 'retrieval_trace': {'evidence': {
+            'plan': [{'id': 'r1'}], 'bindings': {'r1': 'Person A'}, 'routes': [{'doc_id': 2}]}}}],
+            'llm_request_stats': {'http_attempts': 0}}
+        combined = deepcopy(parent)
+        combined['results'][0]['docs'] = ['Changed order is allowed']
+        self.assertTrue(runner.validate_package_parent_outputs(parent, combined)['validated'])
+        combined['results'][0]['retrieval_trace']['evidence']['bindings'] = {'r1': 'Person B'}
+        with self.assertRaisesRegex(ValueError, 'LLM outputs differ'):
+            runner.validate_package_parent_outputs(parent, combined)
+        combined = deepcopy(parent)
+        combined['llm_request_stats']['http_attempts'] = 1
+        with self.assertRaisesRegex(ValueError, 'fresh LLM outputs'):
+            runner.validate_package_parent_outputs(parent, combined)
+
+    def test_bridge_smoke_fixtures_are_separate_from_unbiased_development_selection(self):
+        args = self.args()
+        contexts = {dataset: {'representative_sampling': {
+            'features': [{'hops': 2, 'primary': 'type=bridge'} for _ in range(1000)],
+            'screen_indices': list(range(200, 260)), 'confirmation_indices': list(range(800, 830))}}
+            for dataset in runner.DATASETS}
+        indices = runner.development_indices(args, contexts, {})
+        self.assertEqual(indices['smoke'], runner.BRIDGE_SMOKE_FIXTURES)
+        contexts['hotpotqa']['representative_sampling']['screen_indices'].append(572)
+        with self.assertRaisesRegex(ValueError, 'excluded from development'):
+            runner.development_indices(args, contexts, {})
+
+    def test_bridge_protocol_freezes_control_profiles_source_and_parent_cache_policy(self):
+        args = self.args(screen_seed=742, confirm_seed=842, reference='matched_exp4',
+            previous_round_exclusions={}, run_tag='bridge_support',
+            exclude_run_tags='structure_representative,failure_focused')
+        with patch.object(runner.previous, 'protocol_for', return_value={'algorithm_code_sha256': {}}):
+            protocol = runner.protocol_for(args, {})
+        self.assertEqual(protocol['baseline_profile'], 'plan_prune')
+        self.assertEqual(protocol['baseline_config']['flags'], ['planning', 'plan_prune'])
+        self.assertEqual(protocol['selection_policy'], 'hotpot_bridge')
+        self.assertEqual(protocol['target']['gain'], 4)
+        self.assertEqual(protocol['smoke_fixture_policy']['indices'], runner.BRIDGE_SMOKE_FIXTURES)
+        self.assertIn('scripts/run_exp4_bridge_trials.sh', protocol['algorithm_code_sha256'])
+        self.assertIn('not a fresh causal control', protocol['historical_original_exp4_scope'])
+        self.assertIn('Immutable same-phase', protocol['combination_isolation']['combined_package_parent'])
+
+    def test_bridge_parent_snapshot_survives_cleanup_and_rejects_modified_cache_or_result(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            case, cache = root / 'bridge_recovery', root / 'parent_cache'
+            (case / 'index/llm_cache').mkdir(parents=True)
+            (case / 'index/llm_cache/prompt-result.json').write_text('{"plan":"fixed repaired plan"}')
+            runner.write_json(case / 'validated.ok', {'cleaned_private_index': False})
+            runner.write_json(case / 'result.json', {'results': ['frozen parent']})
+            saved = runner.freeze_bridge_parent_cache(case, cache)
+            shutil = runner.shutil
+            shutil.rmtree(case / 'index')
+            runner.write_json(case / 'validated.ok', {'cleaned_private_index': True})
+            self.assertEqual(runner.freeze_bridge_parent_cache(case, cache, saved), saved)
+            context = {'source': 'original public index', 'cache': root / 'baseline_cache'}
+            child = runner.package_parent_context(context, saved, 'hotpotqa', 'screen')
+            self.assertEqual(child['source'], context['source'])
+            self.assertEqual(child['cache'], cache)
+            self.assertEqual(child['cache_hashes'], saved['sha256'])
+            (cache / 'prompt-result.json').write_text('changed')
+            with self.assertRaisesRegex(ValueError, 'immutable'):
+                runner.package_parent_context(context, saved, 'hotpotqa', 'screen')
+            with self.assertRaisesRegex(ValueError, 'cache or source result changed'):
+                runner.freeze_bridge_parent_cache(case, cache, saved)
+            shutil.rmtree(cache)
+            with self.assertRaisesRegex(ValueError, 'missing after private index cleanup'):
+                runner.freeze_bridge_parent_cache(case, cache, saved)
+
+
 if __name__ == '__main__':
     unittest.main()

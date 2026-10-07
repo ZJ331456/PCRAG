@@ -224,6 +224,37 @@ class ImprovementIntegrationTests(unittest.TestCase):
         self.assertEqual(len(rag.calls), 3)
         self.assertEqual(len(rag.searches), 2)
 
+    def test_bridge_package_composition_preserves_complete_plan_without_annotations(self):
+        forbidden = {"gold_docs", "gold_answers", "answer", "supporting_facts",
+                     "question_decomposition", "type", "dataset"}
+
+        class GuardedState(dict):
+            def get(self, key, default=None):
+                if key in forbidden:
+                    raise AssertionError("Algorithm read a benchmark annotation")
+                return super().get(key, default)
+
+            def __getitem__(self, key):
+                if key in forbidden:
+                    raise AssertionError("Algorithm read a benchmark annotation")
+                return super().__getitem__(key)
+
+        rag = FakeRAG("planning,plan_prune,package,bridge_recovery", [PLAN, ALPHA, ROME])
+        rag.pcrag_config.evidence_plan_routing = "question_structure"
+        rag.pcrag_config.evidence_plan_validation = "canonical_refs"
+        engine = improved.ImprovedEvidenceRetrieval(rag)
+        sample = GuardedState(state())
+        for key in forbidden:
+            sample[key] = "forbidden_annotation"
+        engine.process_window([sample])
+        ids, scores, trace = engine.finalize(sample["query"], *sample["base"], sample)
+        self.assertEqual(trace["bindings"], {"s1": "Alpha", "s2": "Rome"})
+        self.assertEqual(len(rag.calls), 3)
+        self.assertEqual(len(rag.searches), 2)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(np.all(np.diff(scores) <= 0))
+        self.assertNotIn("forbidden_annotation", str(rag.calls))
+
 
 if __name__ == "__main__":
     unittest.main()

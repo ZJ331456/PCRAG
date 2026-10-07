@@ -544,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence_selection_mode", choices=["coverage", "ancestor", "joint"], default="coverage")
     parser.add_argument("--evidence_ablation_inputs_file", default="")
     parser.add_argument("--evidence_improvements", default="",
-                        help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive,support,terminal,plan_prune; empty preserves original exp4.")
+                        help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive,support,terminal,plan_prune,package,bridge_recovery; empty preserves original exp4.")
     parser.add_argument("--evidence_plan_node_budget", type=int, default=6)
     parser.add_argument("--evidence_plan_depth_budget", type=int, default=4)
     parser.add_argument("--evidence_plan_validation", choices=["strict", "canonical_refs"], default="strict")

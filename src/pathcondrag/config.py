@@ -158,7 +158,8 @@ class PCRAGConfig(BaseConfig):
         if self.improvement_stage not in range(6):
             raise ValueError("improvement_stage must be 0 through 5")
         flags = {f.strip() for f in self.evidence_improvements.split(",") if f.strip()}
-        if flags - {"planning", "selection", "binding", "closure", "adaptive", "support", "terminal", "plan_prune"}:
+        if flags - {"planning", "selection", "binding", "closure", "adaptive", "support", "terminal", "plan_prune",
+                    "package", "bridge_recovery"}:
             raise ValueError("Unknown evidence_improvements flag")
         if flags and (self.improvement_stage != 4 or self.evidence_ablation_mode != "normal"):
             raise ValueError("Evidence improvements require normal stage-4 retrieval")
