@@ -81,8 +81,17 @@ BRIDGE_VARIANTS = (
     Variant('bridge_package', ('planning', 'plan_prune', 'bridge_recovery', 'package'),
             plan_validation='canonical_refs', plan_routing='question_structure'),
 )
+STRUCTURAL_VARIANTS = (
+    Variant('dag_package', ('planning', 'plan_prune', 'dag_package'),
+            plan_validation='canonical_refs', plan_routing='question_structure'),
+    Variant('structural_recovery', ('planning', 'plan_prune', 'structural_recovery'),
+            plan_validation='canonical_refs', plan_routing='question_structure'),
+    Variant('structural_package', ('planning', 'plan_prune', 'structural_recovery', 'dag_package'),
+            plan_validation='canonical_refs', plan_routing='question_structure'),
+)
 EXPORTED_RECALLS = ('Recall@1', 'Recall@2', 'Recall@5', 'Recall@10', 'Recall@20', 'Recall@200')
 BRIDGE_SMOKE_FIXTURES = {'hotpotqa': [572, 723], '2wikimultihopqa': [262, 584], 'musique': [93, 567]}
+STRUCTURAL_SMOKE_FIXTURES = {'hotpotqa': [197, 572], '2wikimultihopqa': [75, 584], 'musique': [93, 567]}
 
 
 def baseline_variant(args, name='baseline'):
@@ -96,15 +105,30 @@ def baseline_variant(args, name='baseline'):
 
 def selection_policy(args):
     policy = getattr(args, 'selection_policy', 'original')
-    if policy not in ('original', 'hotpot_bridge'):
+    if policy not in ('original', 'hotpot_bridge', 'hotpot_structural'):
         raise ValueError('Unknown selection policy')
-    if policy == 'hotpot_bridge' and (
+    if policy in ('hotpot_bridge', 'hotpot_structural') and (
             getattr(args, 'baseline_profile', 'original_exp4') != 'plan_prune' or
             getattr(args, 'sampling_policy', 'hop_support') != 'representative' or
             not getattr(args, 'require_raw_guard', False) or
             set(protected_metrics(args)) != set(EXPORTED_RECALLS)):
         raise ValueError('Hotpot bridge selection needs plan_prune, representative sampling and both six-Recall guards')
     return policy
+
+
+def component_profiles(args):
+    """A, B and AB profiles for opt-in paired component studies."""
+    policy = selection_policy(args)
+    if policy == 'hotpot_bridge':
+        return BRIDGE_VARIANTS
+    if policy == 'hotpot_structural':
+        return STRUCTURAL_VARIANTS
+    return ()
+
+
+def smoke_fixtures(args):
+    return (STRUCTURAL_SMOKE_FIXTURES if selection_policy(args) == 'hotpot_structural'
+            else BRIDGE_SMOKE_FIXTURES)
 
 
 def namespace(run_tag=None):
@@ -120,13 +144,15 @@ def selected_variants(args):
         return VARIANTS
     names = [name.strip() for name in requested.split(',') if name.strip()]
     known = {item.name: item for item in (*VARIANTS, *FOLLOWUP_VARIANTS, *REPRESENTATIVE_VARIANTS,
-                                         *FAILURE_VARIANTS, *BRIDGE_VARIANTS)}
+                                         *FAILURE_VARIANTS, *BRIDGE_VARIANTS, *STRUCTURAL_VARIANTS)}
     if not names or len(names) != len(set(names)) or any(name not in known for name in names):
         raise ValueError('Variants must be unique known profile names')
     return tuple(known[name] for name in names)
 
 
 def smoke_combination(args):
+    if any(item in STRUCTURAL_VARIANTS for item in selected_variants(args)):
+        return replace(STRUCTURAL_VARIANTS[-1], name='structural_package_smoke')
     if any(item in BRIDGE_VARIANTS for item in selected_variants(args)):
         return replace(BRIDGE_VARIANTS[-1], name='bridge_package_smoke')
     if any(item in FAILURE_VARIANTS for item in selected_variants(args)):
@@ -301,6 +327,55 @@ def hotpot_bridge_assessment(args, reports, baselines, assessment):
             'gain_not_a_four_percentage_point_target_claim': True}
 
 
+def component_comparison(args, candidate, reference):
+    """Descriptive paired deltas; do not substitute historical exp4 gains."""
+    details, raw_guard, calibrated_guard = {}, True, True
+    for dataset in DATASETS:
+        details[dataset] = {}
+        for metric in EXPORTED_RECALLS:
+            raw = (candidate[dataset]['retrieval_metrics'][metric] -
+                   reference[dataset]['retrieval_metrics'][metric]) * 100
+            calibrated = (candidate[dataset]['representative_evaluation']['full_population']['metrics'][metric] -
+                          reference[dataset]['representative_evaluation']['full_population']['metrics'][metric]) * 100
+            details[dataset][metric] = {'raw_delta_pp': raw, 'calibrated_delta_pp': calibrated}
+            raw_guard = raw_guard and raw >= -args.max_regression - 1e-8
+            calibrated_guard = calibrated_guard and calibrated >= -args.max_regression - 1e-8
+    return {'available': True, 'component_reference': 'fresh_same_phase_paired_profiles',
+            'metric_details': details, 'raw_regression_limit_met': raw_guard,
+            'calibrated_regression_limit_met': calibrated_guard,
+            'regression_limit_met': raw_guard and calibrated_guard,
+            'mean_deltas_pp': {metric: {
+                estimator: sum(details[dataset][metric][estimator] for dataset in DATASETS) / len(DATASETS)
+                for estimator in ('raw_delta_pp', 'calibrated_delta_pp')} for metric in EXPORTED_RECALLS}}
+
+
+def update_component_comparisons(args, summary, phase):
+    """Record four contributions even when confirmation omits one control."""
+    a, b, ab = component_profiles(args)
+    records = summary[phase]
+    by_name = {'baseline': records['baselines']}
+    by_name.update({name: entry['reports'] for name, entry in records.get('variants', {}).items()
+                    if set(entry.get('reports', {})) == set(DATASETS)})
+    comparisons = {}
+    for label, candidate, reference in (
+            ('A_minus_baseline', a.name, 'baseline'), ('B_minus_baseline', b.name, 'baseline'),
+            ('AB_minus_B', ab.name, b.name), ('AB_minus_A', ab.name, a.name)):
+        comparison = (component_comparison(args, by_name[candidate], by_name[reference])
+                      if candidate in by_name and reference in by_name else
+                      {'available': False, 'reason': 'Both profiles are not evaluated in this phase.'})
+        comparisons[label] = dict(comparison, candidate_profile=candidate, reference_profile=reference)
+    records['incremental_component_comparisons'] = comparisons
+
+
+def confirmation_ranking_key(args, entry):
+    key = (-int(entry['strong_target_met']), -entry.get('component_selection_score', entry['score']))
+    if selection_policy(args) == 'hotpot_structural':
+        # An equal measured benefit does not justify another module.
+        base_flags = set(baseline_variant(args).flags)
+        key += (len(set(entry['config']['flags']) - base_flags),)
+    return (*key, entry['config']['name'])
+
+
 def historical_reference_report(context, indices):
     """Matched questions from the old original-exp4 export, for context only."""
     report = previous.baseline_subset(context, indices)
@@ -418,6 +493,13 @@ def run_case(args, context, case, indices, variant, env, *, cleanup=True):
     manifest = previous.subset_manifest(context['manifest'], context['data'], context['hops'], indices)
     if (case / 'validated.ok').is_file():
         report = verify_saved_case(context, case, manifest, variant)
+        if context.get('parent_profile_cache'):
+            parent = context['parent_profile_cache']
+            source = Path(parent['source_result_path'])
+            if (report.get('parent_profile_cache') != parent or
+                    previous.experiments.sha256(source) != parent['source_result_sha256']):
+                raise ValueError('Saved package parent result or cache proof changed')
+            validate_package_parent_outputs(read_json(source), read_json(case / 'result.json'))
         if cleanup and not read_json(case / 'validated.ok').get('cleaned_private_index'):
             cleanup_private_index(context, case)
         return report
@@ -448,8 +530,9 @@ def run_case(args, context, case, indices, variant, env, *, cleanup=True):
     report['improvements'] = list(variant.flags)
     if context.get('parent_profile_cache'):
         report['parent_profile_cache'] = context['parent_profile_cache']
-        report['cache_policy'] = 'Reuse validated same-phase bridge_recovery outputs for package isolation; warm-cache timing.'
         parent = context['parent_profile_cache']
+        report['cache_policy'] = ('Reuse validated same-phase ' + parent['parent_profile'] +
+                                  ' outputs for package isolation; warm-cache timing.')
         source = Path(parent['source_result_path'])
         if previous.experiments.sha256(source) != parent['source_result_sha256']:
             (case / 'validated.ok').unlink()
@@ -557,11 +640,11 @@ def phase_baselines(args, contexts, temp, env, summary, summary_file, phase, ind
 
 def package_parent_context(context, parent, dataset, phase):
     if not parent or previous.experiments.cache_hashes(Path(parent['path'])) != parent['sha256']:
-        raise ValueError(f'{dataset}/{phase}: validated bridge_recovery parent cache is required and immutable')
+        raise ValueError(f'{dataset}/{phase}: validated package parent cache is required and immutable')
     return dict(context, cache=Path(parent['path']), cache_hashes=parent['sha256'], parent_profile_cache=parent)
 
 
-def freeze_bridge_parent_cache(case, cache, saved=None):
+def freeze_bridge_parent_cache(case, cache, saved=None, *, parent_profile='bridge_recovery'):
     if not cache.is_dir():
         if read_json(case / 'validated.ok').get('cleaned_private_index'):
             raise ValueError(f'{case}: bridge parent cache missing after private index cleanup')
@@ -570,7 +653,7 @@ def freeze_bridge_parent_cache(case, cache, saved=None):
     result_hash = previous.experiments.sha256(case / 'result.json')
     if saved is not None and (hashes != saved['sha256'] or result_hash != saved['source_result_sha256']):
         raise ValueError(f'{case}: bridge parent cache or source result changed')
-    return {'path': str(cache), 'sha256': hashes, 'parent_profile': 'bridge_recovery',
+    return {'path': str(cache), 'sha256': hashes, 'parent_profile': parent_profile,
             'source_result_path': str(case / 'result.json'),
             'source_result_sha256': result_hash,
             'policy': 'Same phase and question subset; AB reuses B plans, repair and verification outputs.'}
@@ -579,24 +662,35 @@ def freeze_bridge_parent_cache(case, cache, saved=None):
 def evaluate_variant(args, contexts, temp, env, summary, summary_file, phase, indices, variant, baselines):
     records = summary.setdefault(phase, {}).setdefault('variants', {})
     entry = records.setdefault(variant.name, {'config': asdict(variant), 'reports': {}})
+    profiles = component_profiles(args)
+    paired_components = bool(profiles)
+    structural = selection_policy(args) == 'hotpot_structural'
+    parent_key = 'structural_parent_caches' if structural else 'bridge_parent_caches'
     for dataset, context in contexts.items():
-        paired_bridge = selection_policy(args) == 'hotpot_bridge'
-        if paired_bridge and variant.name == 'bridge_package':
-            parent = summary[phase].get('bridge_parent_caches', {}).get(dataset)
+        if paired_components and variant.name == profiles[2].name:
+            parent = summary[phase].get(parent_key, {}).get(dataset)
+            context = package_parent_context(context, parent, dataset, phase)
+        elif structural and variant.name == profiles[0].name:
+            baseline_result = temp / phase / dataset / 'baseline/result.json'
+            parent = {'path': str(context['cache']), 'sha256': context['cache_hashes'],
+                      'parent_profile': 'plan_prune', 'source_result_path': str(baseline_result),
+                      'source_result_sha256': previous.experiments.sha256(baseline_result),
+                      'policy': 'A reuses fresh same-phase baseline plans and verification outputs.'}
             context = package_parent_context(context, parent, dataset, phase)
         case = temp / phase / dataset / variant.name
-        freeze_parent = paired_bridge and variant.name == 'bridge_recovery'
+        freeze_parent = paired_components and variant.name == profiles[1].name
         entry['reports'][dataset] = run_case(args, context, case,
                                              indices[dataset], variant, env, cleanup=not freeze_parent)
         if freeze_parent:
-            cache = temp / 'bridge_parent_cache' / phase / dataset
-            parent_records = summary[phase].setdefault('bridge_parent_caches', {})
-            parent_records[dataset] = freeze_bridge_parent_cache(case, cache, parent_records.get(dataset))
+            cache = temp / ('structural_parent_cache' if structural else 'bridge_parent_cache') / phase / dataset
+            parent_records = summary[phase].setdefault(parent_key, {})
+            parent_records[dataset] = freeze_bridge_parent_cache(case, cache, parent_records.get(dataset),
+                                                                 parent_profile=profiles[1].name)
             write_json(summary_file, summary)
             cleanup_private_index(context, case)
         mark_complete(summary, summary_file, phase, dataset, variant)
     entry.update(assess(args, entry['reports'], baselines))
-    if selection_policy(args) == 'hotpot_bridge':
+    if paired_components:
         entry.update(hotpot_bridge_assessment(args, entry['reports'], baselines, entry))
         historical = summary[phase]['historical_original_exp4_diagnostic']
         entry['historical_original_exp4_target_diagnostic'] = assess(args, entry['reports'], historical)
@@ -614,6 +708,8 @@ def evaluate_variant(args, contexts, temp, env, summary, summary_file, phase, in
         for metric in ('all_gold_top5', 'all_gold_top10')
         if metric in entry['reports'][dataset] and metric in baselines[dataset]}
         for dataset in DATASETS}
+    if structural:
+        update_component_comparisons(args, summary, phase)
     write_json(summary_file, summary)
     print(f'[round2-{phase}] {variant.name} target={entry["strong_target_met"]} '
           f'strict6={entry["strict_target_met"]} weak_signal={entry["weak_signal"]} '
@@ -773,7 +869,8 @@ def confirm(args, contexts, temp, env, summary, summary_file):
             print('[round2-finished-small-only] No candidate passed both regression guards; '
                   'confirmation and full retrieval are not started.', flush=True)
             return
-    bridge_policy = selection_policy(args) == 'hotpot_bridge'
+    bridge_policy = bool(component_profiles(args))
+    structural = selection_policy(args) == 'hotpot_structural'
     positive = [item for item in entries if item.get('hotpot_bridge_signal', False)] if bridge_policy else [
         item for item in entries if item['weak_signal']]
     if bridge_policy and not positive:
@@ -784,27 +881,28 @@ def confirm(args, contexts, temp, env, summary, summary_file):
         summary['confirmation'] = {'complete': True, 'skipped': True,
             'reason': 'No profile improved a Hotpot R@5/R@10 metric in both raw and calibrated '
                       'means while retaining all six paired Recall guards on every dataset.'}
+        if structural:
+            summary['preferred_new_module_profile'] = None
         write_json(summary_file, summary)
         print('[round2-finished-small-only] No guarded new Hotpot gain over plan_prune; '
               'confirmation and full retrieval are not started.', flush=True)
         return
     # Confirm at least the best exploratory candidate, even if the requested
     # large gain is absent. This does not label it effective or meet the target.
-    ranked = sorted(positive or list(entries),
-                    key=lambda item: (-int(item['strong_target_met']),
-                        -item.get('component_selection_score', item['score']), item['config']['name']))
+    ranked = sorted(positive or list(entries), key=lambda item: confirmation_ranking_key(args, item))
     chosen, equivalents = unique_confirmation_candidates(ranked, temp, 2 if positive else 1)
     parent_controls = []
-    if bridge_policy and any(item['config']['name'] == 'bridge_package' for item in chosen):
-        combined = next(item for item in chosen if item['config']['name'] == 'bridge_package')
-        parent = summary['screen']['variants'].get('bridge_recovery')
+    profiles = component_profiles(args)
+    if bridge_policy and any(item['config']['name'] == profiles[2].name for item in chosen):
+        combined = next(item for item in chosen if item['config']['name'] == profiles[2].name)
+        parent = summary['screen']['variants'].get(profiles[1].name)
         if parent is None:
-            raise ValueError('Combined package confirmation requires a screened bridge_recovery parent')
+            raise ValueError(f'Combined package confirmation requires a screened {profiles[1].name} parent')
         # At most two profiles remain. The B control is mandatory to isolate
         # package from newly generated repair output on confirmation questions.
         chosen = [parent, combined]
         if not parent.get('hotpot_bridge_signal', False):
-            parent_controls = ['bridge_recovery']
+            parent_controls = [profiles[1].name]
     if bridge_policy:
         summary['confirmation_parent_controls'] = parent_controls
     summary['confirmation_equivalent_profiles'] = equivalents
@@ -835,6 +933,14 @@ def confirm(args, contexts, temp, env, summary, summary_file):
             if summary['confirmed_hotpot_bridge_variants'] else 'small_sample_no_hotpot_component_confirmed')
         summary['global_target_status'] = ('paired_four_point_target_confirmed'
             if summary['confirmed_target_variants'] else 'paired_four_point_target_not_met')
+        if structural:
+            valid = [entry for entry in entries if entry['hotpot_bridge_signal'] and
+                     entry['config']['name'] not in parent_controls]
+            valid.sort(key=lambda item: confirmation_ranking_key(args, item))
+            summary['preferred_new_module_profile'] = valid[0]['config']['name'] if valid else None
+            summary['preferred_profile_policy'] = ('Rank measured gain first; equal gains prefer fewer added '
+                                                   'modules. Confirmation alone is not a final full-data claim.')
+            update_component_comparisons(args, summary, 'confirmation')
     summary.setdefault('confirmation', {})['complete'] = True
     summary['automatic_full_run_enabled'] = False
     write_json(summary_file, summary)
@@ -846,8 +952,9 @@ def protocol_for(args, contexts):
     protocol = previous.protocol_for(args, contexts)
     for relative in ('scripts/exp4_round2.py', 'scripts/utils/exp4_round2.py', 'scripts/run_exp4_round2.sh'):
         protocol['algorithm_code_sha256'][relative] = previous.experiments.sha256(ROOT / relative)
-    if selection_policy(args) == 'hotpot_bridge':
-        relative = 'scripts/run_exp4_bridge_trials.sh'
+    if component_profiles(args):
+        relative = ('scripts/run_exp4_structural_trials.sh' if selection_policy(args) == 'hotpot_structural'
+                    else 'scripts/run_exp4_bridge_trials.sh')
         protocol['algorithm_code_sha256'][relative] = previous.experiments.sha256(ROOT / relative)
     if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
         relative = 'scripts/utils/representative_sampling.py'
@@ -877,23 +984,31 @@ def protocol_for(args, contexts):
             baseline_config=asdict(baseline_variant(args)), selection_policy=selection_policy(args),
             component_gain_reference='fresh_paired_plan_prune',
             historical_original_exp4_scope='matched questions; diagnostic only; not a fresh causal control')
-        if selection_policy(args) == 'hotpot_bridge':
+        if component_profiles(args):
+            a, b, ab = component_profiles(args)
             protocol['smoke_fixture_policy'] = {
-                'indices': BRIDGE_SMOKE_FIXTURES,
+                'indices': smoke_fixtures(args),
                 'scope': 'Previously inspected integration fixtures; excluded from screening/confirmation.',
                 'retriever_inputs': 'question, benchmark hop value and corpus index; no fixture/gold labels'}
             protocol['combination_isolation'] = {
                 'standalone_package_parent': 'Fresh plan_prune phase-baseline cache',
-                'combined_package_parent': 'Immutable same-phase completed bridge_recovery cache',
+                'combined_package_parent': 'Immutable same-phase completed ' + b.name + ' cache',
                 'confirmation_rule': 'If AB is chosen, run B then AB; B may be a noncandidate parent control.',
                 'time_comparison': 'Different warm-cache histories; not a wall-time efficiency comparison.'}
+            if selection_policy(args) == 'hotpot_structural':
+                protocol['incremental_component_comparisons'] = {
+                    'A': a.name, 'B': b.name, 'AB': ab.name,
+                    'comparisons': ['A_minus_baseline', 'B_minus_baseline', 'AB_minus_B', 'AB_minus_A'],
+                    'equal_gain_preference': 'Fewer added modules before profile-name ordering.',
+                    'standalone_package_output_gate': 'Parent plans, routes, bindings and LLM outputs '
+                                                      'match fresh baseline; zero fresh HTTP.'}
         if contexts:
             protocol['historical_original_exp4_export_sha256'] = {
                 dataset: {filename: previous.experiments.sha256(
                     Path(args.out_root) / 'cases' / dataset / 'exp4_dependency_binding' / filename)
                     for filename in ('result.json', 'report.json')}
                 for dataset in contexts}
-            if selection_policy(args) == 'hotpot_bridge':
+            if component_profiles(args):
                 protocol['historical_full_plan_prune_export_sha256'] = {
                     dataset: {filename: previous.experiments.sha256(
                         Path(args.out_root) / 'cases' / dataset / 'exp4_dependency_binding_plan_prune' / filename)
@@ -909,11 +1024,11 @@ def development_indices(args, contexts, exclusions):
             sampling = context['representative_sampling']
             indices['screen'][dataset] = sampling['screen_indices']
             indices['confirmation'][dataset] = sampling['confirmation_indices']
-            if selection_policy(args) == 'hotpot_bridge':
-                fixtures = BRIDGE_SMOKE_FIXTURES[dataset]
+            if component_profiles(args):
+                fixtures = smoke_fixtures(args)[dataset]
                 if (any(index < 0 or index >= len(sampling['features']) for index in fixtures) or
                         set(fixtures) & (set(indices['screen'][dataset]) | set(indices['confirmation'][dataset]))):
-                    raise ValueError(f'{dataset}: bridge smoke fixtures must exist and be excluded from development')
+                    raise ValueError(f'{dataset}: known smoke fixtures must exist and be excluded from development')
                 indices['smoke'][dataset] = list(fixtures)
                 continue
             features, pool = sampling['features'], sampling['screen_indices']
@@ -959,7 +1074,7 @@ def run(args):
         raise ValueError('vLLM request log does not exist')
     before_code = previous.code_hashes(Path(args.hippo_root))
     contexts = {dataset: previous.context_for(out, dataset, temp) for dataset in DATASETS}
-    if selection_policy(args) == 'hotpot_bridge':
+    if component_profiles(args):
         for dataset, context in contexts.items():
             reference = out / 'cases' / dataset / 'exp4_dependency_binding_plan_prune'
             previous.verify_trial_report(reference)
@@ -971,10 +1086,10 @@ def run(args):
     if representative:
         from .representative_sampling import collect_prior_exclusions, make_representative_split
         exclusions = collect_prior_exclusions(out, additional_run_tags=exclusion_tags(args))
-        if selection_policy(args) == 'hotpot_bridge':
+        if component_profiles(args):
             exclusions = deepcopy(exclusions)
-            exclusions['integration_fixture_exclusions'] = deepcopy(BRIDGE_SMOKE_FIXTURES)
-            for dataset, fixtures in BRIDGE_SMOKE_FIXTURES.items():
+            exclusions['integration_fixture_exclusions'] = deepcopy(smoke_fixtures(args))
+            for dataset, fixtures in smoke_fixtures(args).items():
                 exclusions['indices'][dataset] = sorted(set(exclusions['indices'][dataset]) | set(fixtures))
         args.previous_round_exclusions = dict(exclusions, excluded_indices=exclusions['indices'])
         for dataset, context in contexts.items():
@@ -1021,8 +1136,8 @@ def run(args):
                 write_json(sampling_path, context['representative_sampling'])
                 summary['sampling_reports'][dataset] = {
                     'path': str(sampling_path), 'sha256': previous.experiments.sha256(sampling_path)}
-        if selection_policy(args) == 'hotpot_bridge':
-            summary.update(baseline_profile='plan_prune', selection_policy='hotpot_bridge',
+        if component_profiles(args):
+            summary.update(baseline_profile='plan_prune', selection_policy=selection_policy(args),
                 component_selection_reference='fresh_paired_plan_prune',
                 historical_original_exp4_is_diagnostic_only=True,
                 llm_attribution_warning='Package reuses same-phase parent cached plan/repair/verify outputs; '
@@ -1059,7 +1174,7 @@ def main(argv=None):
     parser.add_argument('--variants', help='Comma-separated subset of named screen profiles; default is the original eight')
     parser.add_argument('--baseline-profile', choices=('original_exp4', 'plan_prune'), default='original_exp4',
                         help='Fresh paired control; plan_prune retains previously observed 2Wiki planning benefits')
-    parser.add_argument('--selection-policy', choices=('original', 'hotpot_bridge'), default='original',
+    parser.add_argument('--selection-policy', choices=('original', 'hotpot_bridge', 'hotpot_structural'), default='original',
                         help='Hotpot policy requires new raw/calibrated Hotpot gain plus all six regression guards')
     parser.add_argument('--sampling-policy', choices=('hop_support', 'representative'), default='hop_support')
     parser.add_argument('--exclude-run-tags', default='',

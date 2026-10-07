@@ -729,5 +729,221 @@ class BridgeRunnerTests(unittest.TestCase):
                 runner.freeze_bridge_parent_cache(case, cache, saved)
 
 
+class StructuralRunnerTests(unittest.TestCase):
+    def args(self, **updates):
+        values = dict(baseline_profile='plan_prune', selection_policy='hotpot_structural',
+            sampling_policy='representative', require_raw_guard=True,
+            protected_metrics=','.join(runner.EXPORTED_RECALLS), target_gain=4,
+            gain_unit='absolute_pp', max_regression=1, allowed_exceptions=2,
+            variants=','.join(item.name for item in runner.STRUCTURAL_VARIANTS))
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    def measurements(self):
+        baseline = reports()
+        for report in baseline.values():
+            report['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5,
+                                                'Recall@20': .9, 'Recall@200': .98})
+            report['representative_evaluation'] = {'full_population': {
+                'metrics': dict(report['retrieval_metrics'])}}
+        return baseline
+
+    def test_structural_profiles_preserve_control_runtime_and_forward_all_flags(self):
+        args = self.args(python='python', llm_base_url='http://local/v1')
+        self.assertEqual(runner.selected_variants(args), runner.STRUCTURAL_VARIANTS)
+        self.assertEqual(runner.component_profiles(args), runner.STRUCTURAL_VARIANTS)
+        self.assertEqual(runner.baseline_variant(args).flags, ('planning', 'plan_prune'))
+        self.assertEqual(runner.smoke_combination(args).name, 'structural_package_smoke')
+        context = {'dataset': 'musique', 'manifest': {'data_path': '/data', 'corpus_path': '/corpus'}}
+        for variant in runner.STRUCTURAL_VARIANTS:
+            command = runner.command(args, context, Path('/case'), [93, 567], variant)
+            for key, expected in {'--evidence_improvements': ','.join(variant.flags),
+                                  '--evidence_plan_validation': 'canonical_refs',
+                                  '--evidence_plan_routing': 'question_structure',
+                                  '--embedding_batch_size': '4', '--llm_prefetch_workers': '8',
+                                  '--openie_max_workers': '8', '--max_new_tokens': '2048',
+                                  '--candidate_output_top_k': '200', '--result_top_k': '10'}.items():
+                self.assertEqual(command[command.index(key) + 1], expected)
+            self.assertIn('--reuse_index', command)
+            self.assertNotIn('--force_index_from_scratch', command)
+
+    def test_structural_policy_rejects_incomplete_six_metric_or_raw_guards(self):
+        self.assertEqual(runner.selection_policy(self.args()), 'hotpot_structural')
+        for change in ({'baseline_profile': 'original_exp4'}, {'require_raw_guard': False},
+                       {'protected_metrics': 'Recall@5,Recall@10'}, {'sampling_policy': 'hop_support'}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'six-Recall guards'):
+                runner.selection_policy(self.args(**change))
+
+    def test_known_mechanism_fixtures_cannot_enter_fresh_screen_or_confirmation(self):
+        args = self.args()
+        contexts = {dataset: {'representative_sampling': {
+            'features': [{'hops': 2, 'primary': 'type=bridge'} for _ in range(1000)],
+            'screen_indices': list(range(300, 360)), 'confirmation_indices': list(range(850, 880))}}
+            for dataset in runner.DATASETS}
+        indices = runner.development_indices(args, contexts, {})
+        self.assertEqual(indices['smoke'], runner.STRUCTURAL_SMOKE_FIXTURES)
+        contexts['2wikimultihopqa']['representative_sampling']['confirmation_indices'].append(75)
+        with self.assertRaisesRegex(ValueError, 'excluded from development'):
+            runner.development_indices(args, contexts, {})
+
+    def test_structural_protocol_freezes_new_script_prior_bridge_exclusion_and_parent_gate(self):
+        args = self.args(screen_seed=942, confirm_seed=1042, reference='matched_exp4',
+            previous_round_exclusions={}, run_tag='structural_support',
+            exclude_run_tags='structure_representative,failure_focused,bridge_support')
+        with patch.object(runner.previous, 'protocol_for', return_value={'algorithm_code_sha256': {}}):
+            protocol = runner.protocol_for(args, {})
+        self.assertEqual(protocol['selection_policy'], 'hotpot_structural')
+        self.assertEqual(protocol['smoke_fixture_policy']['indices'], runner.STRUCTURAL_SMOKE_FIXTURES)
+        self.assertIn('bridge_support', protocol['exclude_run_tags'])
+        self.assertIn('scripts/run_exp4_structural_trials.sh', protocol['algorithm_code_sha256'])
+        self.assertNotIn('scripts/run_exp4_bridge_trials.sh', protocol['algorithm_code_sha256'])
+        self.assertIn('structural_recovery', protocol['combination_isolation']['combined_package_parent'])
+        self.assertIn('zero fresh HTTP', protocol['incremental_component_comparisons']['standalone_package_output_gate'])
+        self.assertEqual(protocol['target']['gain'], 4)
+
+    def test_incremental_contributions_distinguish_ab_gain_from_b_and_old_control(self):
+        args = self.args()
+        baseline = self.measurements()
+        a, b, ab = [deepcopy(baseline) for _ in range(3)]
+        for candidate, gain in ((a, .01), (b, .02), (ab, .03)):
+            candidate['hotpotqa']['retrieval_metrics']['Recall@5'] += gain
+            candidate['hotpotqa']['representative_evaluation']['full_population']['metrics']['Recall@5'] += gain / 2
+        summary = {'screen': {'baselines': baseline, 'variants': {
+            name: {'reports': result} for name, result in zip(
+                ('dag_package', 'structural_recovery', 'structural_package'), (a, b, ab))}}}
+        runner.update_component_comparisons(args, summary, 'screen')
+        comparisons = summary['screen']['incremental_component_comparisons']
+        for label, raw, calibrated in [('A_minus_baseline', 1, .5), ('B_minus_baseline', 2, 1),
+                                      ('AB_minus_B', 1, .5), ('AB_minus_A', 2, 1)]:
+            row = comparisons[label]['metric_details']['hotpotqa']['Recall@5']
+            self.assertAlmostEqual(row['raw_delta_pp'], raw)
+            self.assertAlmostEqual(row['calibrated_delta_pp'], calibrated)
+        ab['musique']['retrieval_metrics']['Recall@200'] -= .011
+        runner.update_component_comparisons(args, summary, 'screen')
+        self.assertFalse(summary['screen']['incremental_component_comparisons']['AB_minus_B']['raw_regression_limit_met'])
+        del summary['screen']['variants']['dag_package']
+        runner.update_component_comparisons(args, summary, 'screen')
+        self.assertFalse(summary['screen']['incremental_component_comparisons']['AB_minus_A']['available'])
+
+    def test_equal_component_gain_prefers_fewer_modules_before_alphabetical_ab_name(self):
+        args = self.args()
+        entries = [dict(config=runner.asdict(variant), strong_target_met=False, score=1,
+                        component_selection_score=1) for variant in reversed(runner.STRUCTURAL_VARIANTS)]
+        ranked = sorted(entries, key=lambda entry: runner.confirmation_ranking_key(args, entry))
+        self.assertEqual([entry['config']['name'] for entry in ranked],
+                         ['dag_package', 'structural_recovery', 'structural_package'])
+        # Legacy bridge tie policy stays compatible with existing runs.
+        legacy = self.args(selection_policy='hotpot_bridge')
+        legacy_entries = [dict(config=runner.asdict(variant), strong_target_met=False, score=1,
+                               component_selection_score=1) for variant in runner.BRIDGE_VARIANTS]
+        self.assertEqual(sorted(legacy_entries, key=lambda entry: runner.confirmation_ranking_key(legacy, entry))[0]
+                         ['config']['name'], 'bridge_package')
+
+    def test_ab_confirmation_keeps_b_parent_first_and_at_most_nine_groups(self):
+        args = self.args(confirm_size=30)
+        variants = {variant.name: dict(config=runner.asdict(variant), regression_limit_met=True,
+            weak_signal=False, strong_target_met=False, score=1,
+            hotpot_bridge_signal=variant.name != 'structural_recovery', component_selection_score=1)
+            for variant in runner.STRUCTURAL_VARIANTS}
+        summary = {'screen': {'complete': True, 'variants': variants}, 'group_plan': [],
+                   'maximum_possible_groups': 30,
+                   'indices': {'confirmation': {dataset: [7] for dataset in runner.DATASETS}}}
+        seen = []
+
+        def evaluate(args, contexts, temp, env, summary, file, phase, indices, variant, baselines):
+            seen.append(variant.name)
+            return dict(config=runner.asdict(variant), strong_target_met=False, weak_signal=False,
+                        hotpot_bridge_signal=True, score=1, component_selection_score=1)
+
+        with tempfile.TemporaryDirectory() as name, \
+                patch.object(runner, 'unique_confirmation_candidates', return_value=(
+                    [variants['structural_package'], variants['dag_package']], {})), \
+                patch.object(runner, 'phase_baselines', return_value=({}, {})), \
+                patch.object(runner, 'update_component_comparisons') as comparisons, \
+                patch.object(runner, 'evaluate_variant', side_effect=evaluate):
+            runner.confirm(args, {}, Path(name), {}, summary, Path(name) / 'selection.json')
+        self.assertEqual(seen, ['structural_recovery', 'structural_package'])
+        self.assertEqual(summary['confirmation_parent_controls'], ['structural_recovery'])
+        self.assertEqual(summary['preferred_new_module_profile'], 'structural_package')
+        self.assertEqual(summary['selected_new_module_profiles'], [{'profile': 'structural_package',
+            'new_modules': ['structural_recovery', 'dag_package']}])
+        self.assertEqual(len(summary['group_plan']), 9)
+        comparisons.assert_called_once_with(args, summary, 'confirmation')
+        self.assertFalse(summary['automatic_full_run_enabled'])
+
+    def test_structural_parent_snapshot_retains_parent_name_and_rejects_modified_cache(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            case, cache = root / 'structural_recovery', root / 'parent_cache'
+            (case / 'index/llm_cache').mkdir(parents=True)
+            (case / 'index/llm_cache/fixed.json').write_text('{"repair":"same"}')
+            runner.write_json(case / 'validated.ok', {'cleaned_private_index': False})
+            runner.write_json(case / 'result.json', {'results': []})
+            saved = runner.freeze_bridge_parent_cache(case, cache, parent_profile='structural_recovery')
+            self.assertEqual(saved['parent_profile'], 'structural_recovery')
+            runner.shutil.rmtree(case / 'index')
+            runner.write_json(case / 'validated.ok', {'cleaned_private_index': True})
+            self.assertEqual(runner.freeze_bridge_parent_cache(case, cache, saved,
+                                                               parent_profile='structural_recovery'), saved)
+            (cache / 'fixed.json').write_text('{"repair":"changed"}')
+            with self.assertRaisesRegex(ValueError, 'immutable'):
+                runner.package_parent_context({}, saved, 'hotpotqa', 'screen')
+
+    def test_standalone_a_reuses_baseline_b_freezes_private_outputs_and_ab_reuses_b(self):
+        args = self.args()
+        baseline = self.measurements()
+        contexts = {dataset: {'cache': Path('/phase-cache') / dataset, 'cache_hashes': {},
+                             'source': Path('/frozen-public') / dataset} for dataset in runner.DATASETS}
+        original_contexts = deepcopy(contexts)
+        historical = deepcopy(baseline)
+        for report in historical.values():
+            report['warning'] = 'Historical diagnostic only.'
+        summary = {'screen': {'baselines': baseline,
+                              'historical_original_exp4_diagnostic': historical}}
+        indices = {dataset: [7, 9, 11] for dataset in runner.DATASETS}
+        seen = []
+
+        def run_case(args, context, case, indices, variant, env, *, cleanup):
+            seen.append((variant.name, context, cleanup))
+            return deepcopy(baseline[case.parent.name])
+
+        def freeze(case, cache, saved=None, *, parent_profile):
+            return {'path': str(cache), 'sha256': {}, 'parent_profile': parent_profile,
+                    'source_result_path': str(case / 'result.json'), 'source_result_sha256': 'fixed'}
+
+        with tempfile.TemporaryDirectory() as name, \
+                patch.object(runner.previous.experiments, 'sha256', return_value='fixed'), \
+                patch.object(runner.previous.experiments, 'cache_hashes', return_value={}), \
+                patch.object(runner.previous, 'comparison_score', return_value={}), \
+                patch.object(runner, 'freeze_bridge_parent_cache', side_effect=freeze) as snapshots, \
+                patch.object(runner, 'run_case', side_effect=run_case), \
+                patch.object(runner, 'cleanup_private_index') as cleanup, \
+                patch.object(runner, 'mark_complete'):
+            temp = Path(name)
+            for variant in runner.STRUCTURAL_VARIANTS:
+                runner.evaluate_variant(args, contexts, temp, {}, summary, temp / 'selection.json',
+                                        'screen', indices, variant, baseline)
+        self.assertEqual(contexts, original_contexts)
+        self.assertEqual(snapshots.call_count, 3)
+        self.assertEqual(cleanup.call_count, 3)
+        for profile, context, cleanup_flag in seen:
+            parent = context.get('parent_profile_cache')
+            if profile == 'dag_package':
+                self.assertEqual(parent['parent_profile'], 'plan_prune')
+                self.assertIn('/baseline/result.json', parent['source_result_path'])
+                self.assertTrue(cleanup_flag)
+            elif profile == 'structural_recovery':
+                self.assertIsNone(parent)
+                self.assertFalse(cleanup_flag)
+            else:
+                self.assertEqual(parent['parent_profile'], 'structural_recovery')
+                self.assertIn('/structural_parent_cache/screen/', parent['path'])
+                self.assertTrue(cleanup_flag)
+        comparisons = summary['screen']['incremental_component_comparisons']
+        self.assertTrue(all(row['available'] for row in comparisons.values()))
+        self.assertTrue(all(row['mean_deltas_pp']['Recall@5']['raw_delta_pp'] == 0
+                            for row in comparisons.values()))
+
+
 if __name__ == '__main__':
     unittest.main()

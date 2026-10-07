@@ -2,19 +2,23 @@
 
 from .evidence_binding import BindingImprovementMixin
 from .evidence_bridge import BridgeRecoveryMixin
+from .evidence_dag_package import DAGPackageMixin
 from .evidence_package import EvidencePackageMixin
 from .evidence_planning import AdaptiveSearchMixin, PlannerImprovementMixin
 from .evidence_retrieval import EvidenceRetrieval
 from .evidence_selection import SelectionImprovementMixin
 from .evidence_support import AncestorSupportMixin
 from .evidence_terminal import TerminalEvidenceMixin
+from .evidence_structural_recovery import StructuralRecoveryMixin
 
 
 class ImprovedEvidenceRetrieval(
+    StructuralRecoveryMixin,
     BridgeRecoveryMixin,
     PlannerImprovementMixin,
     AdaptiveSearchMixin,
     BindingImprovementMixin,
+    DAGPackageMixin,
     EvidencePackageMixin,
     TerminalEvidenceMixin,
     AncestorSupportMixin,
