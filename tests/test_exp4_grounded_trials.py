@@ -1,4 +1,6 @@
 from copy import deepcopy
+from contextlib import ExitStack
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -43,6 +45,38 @@ def parent_and_repaired():
 
 
 class GroundedTrialsTests(unittest.TestCase):
+    def test_first_formal_smoke_initializes_new_metadata_and_sampling_namespace(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            out = root / 'outputs' / 'trial'
+            out.mkdir(parents=True)
+            log = out / 'vllm.log'
+            log.touch()
+            contexts = {dataset: {'difficulty_sampling': {'screen_indices': [1, 2], 'confirmation_indices': [3]},
+                'difficulty_sampling_sha256': 'sampling', 'historical_plan_prune_sha256': 'historical',
+                'source': out / dataset, 'manifest': {'model_dir': 'model', 'source_asset_sha256': {}}}
+                for dataset in runner.DATASETS}
+            response = stack.enter_context(patch.object(runner.urllib.request, 'urlopen')).return_value
+            response.__enter__.return_value.status = 200
+            stack.enter_context(patch.object(runner, 'ROOT', root))
+            stack.enter_context(patch.object(runner, 'build_contexts', return_value=(contexts, {})))
+            stack.enter_context(patch.object(runner.previous, 'code_hashes', return_value={}))
+            stack.enter_context(patch.object(runner.previous, 'protocol_for', return_value={'algorithm_code_sha256': {}}))
+            stack.enter_context(patch.object(runner.previous, 'environment', return_value={}))
+            stack.enter_context(patch.object(runner.previous.experiments, 'sha256', return_value='code'))
+            stack.enter_context(patch.object(runner.previous.experiments, 'asset_hashes', return_value={}))
+            phase = stack.enter_context(patch.object(runner, 'phase_run'))
+            args = SimpleNamespace(out_root=str(out), mode='smoke', llm_base_url='http://localhost/v1',
+                vllm_log=str(log), hippo_root=str(root / 'hippo'), screen_seed=1142, confirm_seed=1242,
+                max_regression=1., target_gain=4., screen_size=90)
+            self.assertEqual(runner.run(args), 0)
+            phase.assert_called_once()
+            metadata = out / 'metadata' / runner.SUMMARY_NAME
+            self.assertTrue((metadata / 'selection.json').is_file())
+            for dataset in runner.DATASETS:
+                saved = json.loads((metadata / 'sampling' / f'{dataset}.json').read_text())
+                self.assertEqual(saved, contexts[dataset]['difficulty_sampling'])
+
     def args(self):
         return SimpleNamespace(target_gain=4, max_regression=1)
 

@@ -300,6 +300,7 @@ def run(args):
     if temp.is_symlink():
         raise ValueError('Refusing a symlinked trial directory')
     temp.mkdir(parents=True, exist_ok=True)
+    (path.parent / 'sampling').mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(args.llm_base_url.rstrip('/') + '/models', timeout=10) as response:
         if response.status != 200:
             raise ValueError('Existing vLLM is unavailable')
