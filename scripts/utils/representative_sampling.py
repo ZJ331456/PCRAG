@@ -21,12 +21,24 @@ SECONDARY = ('hops', 'gold_count', 'terminal_attribute', 'hop_gold',
              'hop_gold_terminal_attribute', 'topology', 'dag_shape')
 
 
-def collect_prior_exclusions(output_root):
-    """Exclude all planned screening/confirmation questions from three rounds."""
+def collect_prior_exclusions(output_root, additional_run_tags=()):
+    """Exclude explicitly named past development runs, with source hashes.
+
+    Fixed historical sources preserve the preceding round's sampling policy.
+    Additional namespaces must be named by the caller: a directory scan would
+    accidentally exclude this run's own questions when resuming it.
+    """
     root = Path(output_root)
     sources, excluded = [], {dataset: set() for dataset in DATASETS}
-    for directory in ('exp4_improvement_selection', 'exp4_round2_selection',
-                      'exp4_round2_selection_relation_plan_fix'):
+    tags = tuple(additional_run_tags)
+    if len(tags) != len(set(tags)) or any(not re.fullmatch(r'[A-Za-z0-9_]{1,80}', tag) for tag in tags):
+        raise ValueError('Excluded run tags must be unique namespace names')
+    directories = ('exp4_improvement_selection', 'exp4_round2_selection',
+                   'exp4_round2_selection_relation_plan_fix') + tuple(
+                       'exp4_round2_selection_' + tag for tag in tags)
+    if len(directories) != len(set(directories)):
+        raise ValueError('An excluded run is already a fixed historical source')
+    for directory in directories:
         path = root / 'metadata' / directory / 'selection.json'
         record = json.loads(path.read_text())
         phases = record['screen'] if directory == 'exp4_improvement_selection' else record['indices']

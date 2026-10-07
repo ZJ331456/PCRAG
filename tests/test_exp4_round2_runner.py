@@ -312,6 +312,127 @@ class Round2RunnerTests(unittest.TestCase):
             self.assertNotIn('binding', variant.flags)
         self.assertEqual(runner.smoke_combination(args).flags, ('planning', 'support'))
 
+    def test_failure_profiles_forward_atomic_routing_terminal_modes_and_original_baseline(self):
+        args = SimpleNamespace(python='python', llm_base_url='http://local/v1',
+            variants=','.join(item.name for item in runner.FAILURE_VARIANTS))
+        context = {'dataset': 'musique', 'manifest': {'data_path': '/data', 'corpus_path': '/corpus'}}
+        self.assertEqual(len(runner.selected_variants(args)), 5)
+        for variant in runner.selected_variants(args):
+            command = runner.command(args, context, Path('/case'), [7, 9], variant)
+            self.assertEqual(command[command.index('--evidence_improvements') + 1], ','.join(variant.flags))
+            self.assertEqual(command[command.index('--evidence_terminal_mode') + 1], variant.terminal_mode)
+        self.assertEqual(runner.FAILURE_VARIANTS[0].plan_routing, 'all')
+        self.assertEqual(runner.FAILURE_VARIANTS[-1].plan_routing, 'dependency_depth')
+        self.assertEqual(runner.smoke_combination(args).terminal_mode, 'prefix')
+        self.assertEqual(runner.smoke_combination(args).flags, ('planning', 'plan_prune', 'terminal'))
+        self.assertEqual(runner.variant_from_config(runner.asdict(runner.FAILURE_VARIANTS[-1])),
+                         runner.FAILURE_VARIANTS[-1])
+
+    def test_all_prefix_metrics_are_guarded_even_when_r5_and_r10_improve(self):
+        baseline, candidate = reports(), reports(.75, .85)
+        for dataset in runner.DATASETS:
+            baseline[dataset]['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5})
+            candidate[dataset]['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5})
+        candidate['hotpotqa']['retrieval_metrics']['Recall@2'] = .489
+        metrics = ('Recall@1', 'Recall@2', 'Recall@5', 'Recall@10')
+        judged = runner.target_assessment(candidate, baseline, protected_metrics=metrics)
+        self.assertEqual(judged['qualified_metrics'], 6)
+        self.assertFalse(judged['strong_target_met'])
+        self.assertFalse(judged['weak_signal'])
+        self.assertFalse(judged['protection_metric_details']['hotpotqa']['Recall@2']['regression_limit_met'])
+        candidate['hotpotqa']['retrieval_metrics']['Recall@2'] = .49
+        self.assertTrue(runner.target_assessment(candidate, baseline, protected_metrics=metrics)['strict_target_met'])
+
+    def test_raw_guard_cannot_be_hidden_by_population_calibration(self):
+        args = SimpleNamespace(sampling_policy='representative', target_gain=4,
+            gain_unit='absolute_pp', max_regression=1, allowed_exceptions=2, require_raw_guard=True,
+            protected_metrics='Recall@1,Recall@2,Recall@5,Recall@10')
+        baseline, candidate = reports(), reports(.75, .85)
+        for dataset in runner.DATASETS:
+            baseline[dataset]['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5})
+            candidate[dataset]['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5})
+            baseline[dataset]['representative_evaluation'] = {'full_population': {
+                'metrics': dict(baseline[dataset]['retrieval_metrics'])}}
+            candidate[dataset]['representative_evaluation'] = {'full_population': {
+                'metrics': dict(candidate[dataset]['retrieval_metrics'])}}
+        candidate['musique']['retrieval_metrics']['Recall@1'] = .28
+        judged = runner.assess(args, candidate, baseline)
+        self.assertTrue(judged['weighted_regression_limit_met'])
+        self.assertFalse(judged['raw_regression_limit_met'])
+        self.assertFalse(judged['regression_limit_met'])
+        self.assertFalse(judged['strong_target_met'])
+
+    def test_six_metric_guard_rejects_r200_drop_without_discarding_measured_r5_gain(self):
+        baseline, candidate = reports(), reports(.75, .85)
+        metrics = ('Recall@1', 'Recall@2', 'Recall@5', 'Recall@10', 'Recall@20', 'Recall@200')
+        for dataset in runner.DATASETS:
+            baseline[dataset]['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5,
+                                                          'Recall@20': .9, 'Recall@200': .98})
+            candidate[dataset]['retrieval_metrics'].update({'Recall@1': .3, 'Recall@2': .5,
+                                                          'Recall@20': .9, 'Recall@200': .98})
+        candidate['musique']['retrieval_metrics']['Recall@200'] = .969
+        judged = runner.target_assessment(candidate, baseline, protected_metrics=metrics)
+        self.assertEqual(judged['qualified_metrics'], 6)
+        self.assertAlmostEqual(judged['metric_details']['musique']['Recall@5']['delta_pp'], 5.0)
+        self.assertAlmostEqual(judged['protection_metric_details']['musique']['Recall@200']['delta_pp'], -1.1)
+        self.assertFalse(judged['regression_limit_met'])
+        self.assertFalse(judged['strong_target_met'])
+        args = SimpleNamespace(require_raw_guard=True)
+        with tempfile.TemporaryDirectory() as name, patch.object(runner, 'phase_baselines') as run:
+            summary = {'screen': {'complete': True, 'variants': {'bad': judged}}}
+            runner.confirm(args, {}, Path(name), {}, summary, Path(name) / 'selection.json')
+            run.assert_not_called()
+            self.assertEqual(summary['selection_status'], 'small_sample_no_guarded_candidate')
+
+    def test_explicit_prior_tags_are_validated_and_saved_in_protocol(self):
+        args = SimpleNamespace(screen_seed=542, confirm_seed=642, gain_unit='absolute_pp', target_gain=4,
+            max_regression=1, allowed_exceptions=2, reference='matched_exp4', previous_round_exclusions={},
+            run_tag='failure_focused', variants=','.join(item.name for item in runner.FAILURE_VARIANTS),
+            exclude_run_tags='structure_representative', protected_metrics='Recall@1,Recall@2,Recall@5,Recall@10',
+            require_raw_guard=True)
+        with patch.object(runner.previous, 'protocol_for', return_value={'algorithm_code_sha256': {}}):
+            protocol = runner.protocol_for(args, {})
+        self.assertEqual(protocol['exclude_run_tags'], ['structure_representative'])
+        self.assertEqual(protocol['target']['protected_metrics'], ['Recall@1', 'Recall@2', 'Recall@5', 'Recall@10'])
+        self.assertTrue(protocol['target']['require_raw_guard'])
+        args.exclude_run_tags = 'failure_focused'
+        with self.assertRaisesRegex(ValueError, 'own namespace'):
+            runner.exclusion_tags(args)
+        for value in ('Recall@3', 'Recall@5,Recall@5', ''):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                runner.protected_metrics(SimpleNamespace(protected_metrics=value))
+
+    def test_confirmation_deduplicates_rankings_not_equal_aggregate_scores(self):
+        with tempfile.TemporaryDirectory() as name:
+            temp = Path(name)
+            entries = []
+            for variant, docs in [('first', ['A', 'B']), ('same', ['A', 'B']), ('different', ['B', 'A'])]:
+                row = {'query_index': 7, 'metrics': {'Recall@1': .5, 'Recall@2': 1.0,
+                       'Recall@5': 1.0, 'Recall@10': 1.0}, 'all_gold_top5': True, 'all_gold_top10': True}
+                entry = {'config': {'name': variant}, 'reports': {dataset: {'per_question': [row]}
+                                                                 for dataset in runner.DATASETS}}
+                entries.append(entry)
+                for dataset in runner.DATASETS:
+                    path = temp / 'screen' / dataset / variant / 'result.json'
+                    path.parent.mkdir(parents=True)
+                    runner.write_json(path, {'results': [{'query_index': 7, 'docs': docs}]})
+            chosen, equivalents = runner.unique_confirmation_candidates(entries, temp, 2)
+            self.assertEqual([entry['config']['name'] for entry in chosen], ['first', 'different'])
+            self.assertEqual(equivalents, {'first': ['same']})
+
+    def test_confirmation_skips_every_candidate_that_breaches_raw_or_weighted_guard(self):
+        with tempfile.TemporaryDirectory() as name:
+            temp = Path(name)
+            summary = {'screen': {'complete': True, 'variants': {
+                'bad': {'regression_limit_met': False, 'weak_signal': False}}}}
+            args = SimpleNamespace(require_raw_guard=True)
+            with patch.object(runner, 'phase_baselines') as baselines:
+                runner.confirm(args, {}, temp, {}, summary, temp / 'selection.json')
+                baselines.assert_not_called()
+            self.assertEqual(summary['selection_status'], 'small_sample_no_guarded_candidate')
+            self.assertTrue(summary['confirmation']['skipped'])
+            self.assertFalse(summary['automatic_full_run_enabled'])
+
     def test_representative_assessment_uses_population_calibration(self):
         args = SimpleNamespace(sampling_policy='representative', target_gain=4,
             gain_unit='absolute_pp', max_regression=1, allowed_exceptions=2)

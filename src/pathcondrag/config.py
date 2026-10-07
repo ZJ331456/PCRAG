@@ -31,6 +31,7 @@ class PCRAGConfig(BaseConfig):
     evidence_plan_validation: str = "strict"
     evidence_plan_routing: str = "all"
     evidence_support_mode: str = "tail_only"
+    evidence_terminal_mode: str = "tail_only"
     evidence_selection_top_k: int = 10
     # Split verification expansion from branch retention for controlled tests.
     evidence_adaptive_mode: str = "both"
@@ -157,7 +158,7 @@ class PCRAGConfig(BaseConfig):
         if self.improvement_stage not in range(6):
             raise ValueError("improvement_stage must be 0 through 5")
         flags = {f.strip() for f in self.evidence_improvements.split(",") if f.strip()}
-        if flags - {"planning", "selection", "binding", "closure", "adaptive", "support"}:
+        if flags - {"planning", "selection", "binding", "closure", "adaptive", "support", "terminal", "plan_prune"}:
             raise ValueError("Unknown evidence_improvements flag")
         if flags and (self.improvement_stage != 4 or self.evidence_ablation_mode != "normal"):
             raise ValueError("Evidence improvements require normal stage-4 retrieval")
@@ -172,7 +173,7 @@ class PCRAGConfig(BaseConfig):
             raise ValueError("Unknown evidence_adaptive_mode")
         if self.evidence_plan_validation not in {"strict", "canonical_refs"}:
             raise ValueError("Unknown evidence_plan_validation")
-        if self.evidence_plan_routing not in {"all", "question_structure"}:
+        if self.evidence_plan_routing not in {"all", "question_structure", "dependency_depth"}:
             raise ValueError("Unknown evidence_plan_routing")
         if self.evidence_plan_routing != "all" and "planning" not in flags:
             raise ValueError("Question structure routing requires the planning improvement")
@@ -180,6 +181,10 @@ class PCRAGConfig(BaseConfig):
             raise ValueError("Unknown evidence_support_mode")
         if self.evidence_support_mode == "bounded_swap" and "support" not in flags:
             raise ValueError("Bounded support swaps require the support improvement")
+        if self.evidence_terminal_mode not in {"tail_only", "prefix"}:
+            raise ValueError("Unknown evidence_terminal_mode")
+        if self.evidence_terminal_mode != "tail_only" and "terminal" not in flags:
+            raise ValueError("Terminal prefix selection requires the terminal improvement")
         if self.evidence_binding_validation not in {"legacy", "strict_relation", "conservative_relation"}:
             raise ValueError("Unknown evidence_binding_validation")
         if self.evidence_binding_validation != "legacy" and "binding" not in flags:

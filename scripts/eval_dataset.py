@@ -184,6 +184,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         evidence_plan_validation=getattr(args, "evidence_plan_validation", "strict"),
         evidence_plan_routing=getattr(args, "evidence_plan_routing", "all"),
         evidence_support_mode=getattr(args, "evidence_support_mode", "tail_only"),
+        evidence_terminal_mode=getattr(args, "evidence_terminal_mode", "tail_only"),
         evidence_selection_top_k=int(getattr(args, "evidence_selection_top_k", 10)),
         evidence_adaptive_mode=getattr(args, "evidence_adaptive_mode", "both"),
         evidence_binding_validation=getattr(args, "evidence_binding_validation", "legacy"),
@@ -543,12 +544,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence_selection_mode", choices=["coverage", "ancestor", "joint"], default="coverage")
     parser.add_argument("--evidence_ablation_inputs_file", default="")
     parser.add_argument("--evidence_improvements", default="",
-                        help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive,support; empty preserves original exp4.")
+                        help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive,support,terminal,plan_prune; empty preserves original exp4.")
     parser.add_argument("--evidence_plan_node_budget", type=int, default=6)
     parser.add_argument("--evidence_plan_depth_budget", type=int, default=4)
     parser.add_argument("--evidence_plan_validation", choices=["strict", "canonical_refs"], default="strict")
-    parser.add_argument("--evidence_plan_routing", choices=["all", "question_structure"], default="all")
+    parser.add_argument("--evidence_plan_routing", choices=["all", "question_structure", "dependency_depth"], default="all")
     parser.add_argument("--evidence_support_mode", choices=["tail_only", "bounded_swap"], default="tail_only")
+    parser.add_argument("--evidence_terminal_mode", choices=["tail_only", "prefix"], default="tail_only")
     parser.add_argument("--evidence_selection_top_k", type=int, default=10)
     parser.add_argument("--evidence_adaptive_mode", choices=["both", "verify_only", "beam_only"], default="both")
     parser.add_argument("--evidence_binding_validation", choices=["legacy", "strict_relation", "conservative_relation"], default="legacy")

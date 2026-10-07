@@ -171,6 +171,9 @@ class ImprovementIntegrationTests(unittest.TestCase):
                        dict(evidence_plan_routing="question_structure"),
                        dict(evidence_support_mode="unbounded"),
                        dict(evidence_support_mode="bounded_swap"),
+                       dict(evidence_terminal_mode="unbounded"),
+                       dict(evidence_terminal_mode="prefix"),
+                       dict(evidence_plan_routing="dependency_depth"),
                        dict(evidence_binding_validation="unchecked"),
                        dict(evidence_binding_validation="strict_relation")]:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
@@ -206,6 +209,20 @@ class ImprovementIntegrationTests(unittest.TestCase):
         self.assertEqual(trace["bindings"], {"s1": "Alpha", "s2": "Rome"})
         self.assertEqual(len(ids), len(set(ids)))
         self.assertNotIn("forbidden_annotation", str(rag.calls))
+
+    def test_terminal_pruned_chain_composition_preserves_existing_supported_prefix(self):
+        rag = FakeRAG("planning,plan_prune,terminal", [PLAN, ALPHA, ROME])
+        rag.pcrag_config.evidence_plan_routing = "dependency_depth"
+        rag.pcrag_config.evidence_terminal_mode = "prefix"
+        engine = improved.ImprovedEvidenceRetrieval(rag)
+        sample = state()
+        engine.process_window([sample])
+        ids, scores, trace = engine.finalize(sample["query"], *sample["base"], sample)
+        self.assertEqual(trace["bindings"], {"s1": "Alpha", "s2": "Rome"})
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(np.all(np.diff(scores) <= 0))
+        self.assertEqual(len(rag.calls), 3)
+        self.assertEqual(len(rag.searches), 2)
 
 
 if __name__ == "__main__":

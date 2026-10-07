@@ -314,6 +314,237 @@ class QuestionRoutingTests(unittest.TestCase):
         self.assertEqual(default._plan_diagnostics, explicit._plan_diagnostics)
 
 
+class DependencyDepthPlanningTests(unittest.TestCase):
+    @staticmethod
+    def chain(final_question="When did ${s3.answer} close?", final_type="year"):
+        return {"nodes": [
+            {"id": "s1", "question": "Who wrote Work X?", "depends_on": [], "answer_type": "person"},
+            {"id": "s2", "question": "Which university did ${s1.answer} attend?",
+             "depends_on": ["s1"], "answer_type": "organization"},
+            {"id": "s3", "question": "Which campus belongs to ${s2.answer}?",
+             "depends_on": ["s2"], "answer_type": "place"},
+            {"id": "s4", "question": final_question, "depends_on": ["s3"], "answer_type": final_type},
+        ]}
+
+    @staticmethod
+    def engine(responses, flags=None):
+        rag = FakeRAG(responses)
+        rag.pcrag_config.evidence_plan_routing = "dependency_depth"
+        return Engine(rag, {"planning"} if flags is None else flags), rag
+
+    def test_high_depth_uses_atomic_relation_prompt_and_preserves_literal_chain(self):
+        engine, rag = self.engine([self.chain()])
+        query = "What year did the campus of the university attended by Work X's writer close?"
+        nodes, reason = engine._plan(query, 4)
+        self.assertIsNone(reason)
+        self.assertEqual(len(nodes), 4)
+        self.assertEqual(nodes[-1]["depends_on"], ["s3"])
+        self.assertEqual(engine._plan_diagnostics[query]["actual_depth"], 4)
+        prompt = str(rag.calls[0])
+        self.assertIn("upper-capacity cue, NOT a required", prompt)
+        self.assertIn("genre, nationality, role, edition", prompt)
+        self.assertIn("original direction", prompt)
+        self.assertNotIn("Where was ${s1.answer} born?", prompt)
+        self.assertNotIn("director of Film A and Film B died earlier", prompt)
+        self.assertNotIn("Who directed Film A?", prompt)
+        self.assertNotIn("gold", prompt)
+        self.assertEqual(len(rag.calls), 1)
+
+    def test_depth_hint_does_not_force_extraneous_nodes(self):
+        payload = {"nodes": [{"id": "s1", "question": "When was Alpha born?",
+                              "depends_on": [], "answer_type": "date"}]}
+        engine, rag = self.engine([payload])
+        nodes, reason = engine._plan("When was Alpha born?", 4)
+        self.assertIsNone(reason)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(rag.calls), 1)
+
+    def test_simple_two_hop_fallback_keeps_original_prompt_and_cache_inputs(self):
+        payload = {"nodes": [{"id": "s1", "question": "When was Alpha born?",
+                              "depends_on": [], "answer_type": "date"}]}
+        original_rag = FakeRAG([payload])
+        engine, rag = self.engine([payload])
+        self.assertEqual(engine._plan("When was Alpha born?", 2),
+                         base.EvidenceRetrieval(original_rag)._plan("When was Alpha born?", 2))
+        self.assertEqual(rag.calls, original_rag.calls)
+
+    def test_parallel_comparison_prompt_is_unchanged_from_existing_structure_routing(self):
+        query = "Which film has the director born earlier, Film A or Film B?"
+        routed, rag = self.engine([comparison_plan()])
+        previous_rag = FakeRAG([comparison_plan()])
+        previous_rag.pcrag_config.evidence_plan_routing = "question_structure"
+        previous = Engine(previous_rag, {"planning"})
+        self.assertEqual(routed._plan(query, 2), previous._plan(query, 2))
+        self.assertEqual(rag.calls, previous_rag.calls)
+
+    def test_date_to_place_swap_requires_repair_and_stops_after_two_attempts(self):
+        query = "What year did the campus of the university attended by Work X's writer close?"
+        bad = self.chain("Where is ${s3.answer} located?", "place")
+        good = self.chain()
+        engine, rag = self.engine([bad, good])
+        self.assertIsNone(engine._plan(query, 4)[1])
+        self.assertEqual(len(rag.calls), 2)
+        self.assertEqual(engine._plan_diagnostics[query]["validation_errors"],
+                         ["terminal_attribute_mismatch_time_to_place"])
+        engine, rag = self.engine([bad, bad])
+        self.assertEqual(engine._plan(query, 4), ([], "terminal_attribute_mismatch_time_to_place"))
+        self.assertEqual(len(rag.calls), 2)
+
+    def test_place_to_date_swap_is_rejected_without_changing_requested_birth_relation(self):
+        query = "Where was the writer of Work X born?"
+        payload = {"nodes": [
+            {"id": "s1", "question": "Who wrote Work X?", "depends_on": [], "answer_type": "person"},
+            {"id": "s2", "question": "When was ${s1.answer} born?", "depends_on": ["s1"], "answer_type": "date"},
+        ]}
+        engine, rag = self.engine([payload, payload])
+        self.assertEqual(engine._plan(query, 2)[1], "terminal_attribute_mismatch_place_to_time")
+        self.assertEqual(len(rag.calls), 2)
+
+    def test_temporal_qualifier_inside_person_question_is_not_terminal_type(self):
+        payload = {"nodes": [{"id": "s1", "question": "Who wrote Work X in 1990?",
+                              "depends_on": [], "answer_type": "person"}]}
+        engine, rag = self.engine([payload])
+        self.assertIsNone(engine._plan("Who wrote Work X in the year when Alpha retired?", 3)[1])
+        self.assertEqual(len(rag.calls), 1)
+
+    def test_correct_interrogative_with_wrong_explicit_answer_type_requires_repair(self):
+        for query, question, answer_type, error in (
+            ("When was Alpha born?", "When was Alpha born?", "place", "terminal_attribute_mismatch_time_to_place"),
+            ("Where was Alpha born?", "Where was Alpha born?", "date", "terminal_attribute_mismatch_place_to_time"),
+        ):
+            with self.subTest(query=query):
+                node = {"id": "s1", "question": question, "depends_on": [], "answer_type": answer_type}
+                self.assertEqual(planning.terminal_attribute_error(query, [node]), error)
+
+
+class DerivedComparisonPruningTests(unittest.TestCase):
+    @staticmethod
+    def identity_plan(answer_type="boolean", question="Are ${s1.answer} and ${s2.answer} the same person?"):
+        return {"nodes": [
+            {"id": "s1", "question": "Who composed Opera A?", "depends_on": [], "answer_type": "person"},
+            {"id": "s2", "question": "Who composed Opera B?", "depends_on": [], "answer_type": "person"},
+            {"id": "s3", "question": question, "depends_on": ["s1", "s2"], "answer_type": answer_type},
+        ]}
+
+    def test_boolean_yesno_sink_prunes_without_request_or_branch_mutation(self):
+        for answer_type in ("boolean", "yesno", "yes/no", "comparison"):
+            with self.subTest(answer_type=answer_type):
+                payload = self.identity_plan(answer_type)
+                original = json.dumps(payload)
+                rag = FakeRAG([payload])
+                rag.pcrag_config.evidence_plan_routing = "question_structure"
+                engine = Engine(rag, {"planning", "plan_prune"})
+                query = "Are Opera A and Opera B composed by the same people?"
+                nodes, reason = engine._plan(query, 2)
+                self.assertIsNone(reason)
+                self.assertEqual([node["id"] for node in nodes], ["s1", "s2"])
+                self.assertEqual([node["question"] for node in nodes],
+                                 [node["question"] for node in payload["nodes"][:2]])
+                self.assertEqual(len(rag.calls), 1)
+                self.assertEqual(json.dumps(payload), original)
+                removed = engine._plan_diagnostics[query]["comparison_pruning"][0]["removed"]
+                self.assertEqual(removed[0]["id"], "s3")
+
+    def test_disabled_flag_preserves_original_boolean_sink_and_same_llm_prompt(self):
+        payload = self.identity_plan()
+        regular_rag, pruned_rag = FakeRAG([payload]), FakeRAG([payload])
+        regular_rag.pcrag_config.evidence_plan_routing = "question_structure"
+        pruned_rag.pcrag_config.evidence_plan_routing = "question_structure"
+        regular, pruned = Engine(regular_rag, {"planning"}), Engine(pruned_rag, {"planning", "plan_prune"})
+        query = "Are Opera A and Opera B composed by the same people?"
+        self.assertEqual(len(regular._plan(query, 2)[0]), 3)
+        self.assertEqual(len(pruned._plan(query, 2)[0]), 2)
+        self.assertEqual(regular_rag.calls, pruned_rag.calls)
+        self.assertNotIn("comparison_pruning", regular._plan_diagnostics[query])
+
+    def test_pruning_is_independent_of_optional_capacity_planning(self):
+        rag = FakeRAG([self.identity_plan()])
+        engine = Engine(rag, {"plan_prune"})
+        nodes, reason = engine._plan("Are the composers identical?", 3)
+        self.assertIsNone(reason)
+        self.assertEqual([node["id"] for node in nodes], ["s1", "s2"])
+        self.assertEqual(len(rag.calls), 1)
+        self.assertNotIn("Maximum total retrieval nodes", str(rag.calls[0]))
+
+    def test_external_relation_and_convergent_fact_lookup_must_remain(self):
+        for question in ("Did ${s1.answer} collaborate with ${s2.answer}?",
+                         "Were ${s1.answer} and ${s2.answer} born in the same country?",
+                         "Who employed both ${s1.answer} and ${s2.answer}?",
+                         "Are ${s1.answer} and ${s2.answer} the same nationality?"):
+            with self.subTest(question=question):
+                payload = self.identity_plan(question=question)
+                nodes, reason = base.validate_plan(payload, 6)
+                self.assertIsNone(reason)
+                if "same nationality" in question:
+                    # Person identity strings do not establish nationalities.
+                    self.assertEqual(planning.prune_derived_comparison_nodes(nodes)[1], [])
+                else:
+                    self.assertEqual(planning.prune_derived_comparison_nodes(nodes), (nodes, []))
+
+    def test_computation_with_downstream_consumers_is_not_a_sink_and_cannot_be_removed(self):
+        payload = self.identity_plan()
+        payload["nodes"].append({"id": "s4", "question": "Which source reported ${s3.answer}?",
+                                 "depends_on": ["s3"], "answer_type": "source"})
+        nodes, reason = base.validate_plan(payload, 6)
+        self.assertIsNone(reason)
+        self.assertEqual(planning.prune_derived_comparison_nodes(nodes), (nodes, []))
+
+    def test_ordering_requires_already_retrieved_numeric_or_temporal_values(self):
+        payload = self.identity_plan("boolean", "Is ${s1.answer} earlier than ${s2.answer}?")
+        nodes, _ = base.validate_plan(payload, 6)
+        self.assertEqual(planning.prune_derived_comparison_nodes(nodes), (nodes, []))
+        for node in payload["nodes"][:2]:
+            node["answer_type"] = "date"
+        nodes, _ = base.validate_plan(payload, 6)
+        self.assertEqual([node["id"] for node in planning.prune_derived_comparison_nodes(nodes)[0]], ["s1", "s2"])
+
+    def test_real_retrieval_capacity_is_enforced_after_optional_sink_removal(self):
+        payload = self.identity_plan()
+        rag = FakeRAG([payload])
+        rag.pcrag_config.evidence_plan_node_budget = 2
+        engine = Engine(rag, {"planning", "plan_prune"})
+        nodes, reason = engine._plan("Compare composers", 2)
+        self.assertIsNone(reason)
+        self.assertEqual(len(nodes), 2)
+        payload["nodes"][2]["question"] = "Did ${s1.answer} collaborate with ${s2.answer}?"
+        rag = FakeRAG([payload, payload])
+        rag.pcrag_config.evidence_plan_node_budget = 2
+        engine = Engine(rag, {"planning", "plan_prune"})
+        self.assertEqual(engine._plan("Compare composers", 2)[1], "invalid_node_count")
+        self.assertEqual(len(rag.calls), 2)
+
+    def test_pruning_occurs_before_depth_check_and_keeps_full_evidence_branches(self):
+        payload = {"nodes": []}
+        for prefix in ("a", "b"):
+            payload["nodes"].append({"id": f"{prefix}1", "question": f"Who wrote Work {prefix.upper()}?",
+                                     "depends_on": [], "answer_type": "person"})
+            payload["nodes"].append({"id": f"{prefix}2", "question": f"When was ${{{prefix}1.answer}} born?",
+                                     "depends_on": [f"{prefix}1"], "answer_type": "date"})
+        payload["nodes"].append({"id": "final", "question": "Is ${a2.answer} earlier than ${b2.answer}?",
+                                 "depends_on": ["a2", "b2"], "answer_type": "yesno"})
+        rag = FakeRAG([payload])
+        rag.pcrag_config.evidence_plan_depth_budget = 2
+        engine = Engine(rag, {"planning", "plan_prune"})
+        nodes, reason = engine._plan("Which writer was born earlier?", 2)
+        self.assertIsNone(reason)
+        self.assertEqual({node["id"] for node in nodes}, {"a1", "a2", "b1", "b2"})
+        self.assertEqual(len(base.plan_layers(nodes)), 2)
+        self.assertEqual(len(rag.calls), 1)
+
+    def test_pruning_does_not_hide_invalid_unknown_reference_or_missing_placeholder(self):
+        for question, deps, expected in (
+            ("Are ${s1.answer} and ${unknown.answer} the same person?", ["s1", "unknown"], "unknown_or_self_dependency"),
+            ("Are ${s1.answer} and another composer the same person?", ["s1", "s2"], "dependency_reference_mismatch"),
+        ):
+            with self.subTest(question=question):
+                payload = self.identity_plan(question=question)
+                payload["nodes"][-1]["depends_on"] = deps
+                rag = FakeRAG([payload, payload])
+                engine = Engine(rag, {"planning", "plan_prune"})
+                self.assertEqual(engine._plan("Compare composers", 2)[1], expected)
+                self.assertEqual(len(rag.calls), 2)
+
+
 class AdaptiveSearchTests(unittest.TestCase):
     def docs(self, engine):
         return engine._verification_documents(list(range(8)))

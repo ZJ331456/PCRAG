@@ -40,6 +40,18 @@ _SHARED_EVENT = re.compile(
 _NAME = re.compile(r"\b[A-Z][A-Za-z0-9'’.-]*(?:\s+[A-Z][A-Za-z0-9'’.-]*)*")
 _QUESTION_WORDS = {"Which", "Who", "What", "When", "Where", "Is", "Are", "Was", "Were",
                    "Do", "Does", "Did", "Has", "Have", "In", "On"}
+_BRIDGE_ENTITY = (
+    r"(?:writer|author|director|composer|performer|singer|actor|actress|maker|manufacturer|"
+    r"creator|founder|owner|spouse|parent|father|mother|birthplace|hometown|city|country|"
+    r"region|company|university|team|league|album|record\s+label)"
+)
+_EXPLICIT_UNKNOWN_DESCRIPTION = re.compile(
+    r"\b(?:the|a|an)\s+" + _BRIDGE_ENTITY + r"\s+(?:of|for|behind|where|whose|that|which|who)\b"
+    r"|\b(?:writer|author|director|composer|performer|maker|manufacturer|creator|owner)"
+    r"\s+(?:of|for)\s+", re.I)
+_POSSESSIVE_BRIDGE = re.compile(
+    r"\b[A-Z][A-Za-z0-9'’.-]*(?:\s+[A-Z][A-Za-z0-9'’.-]*)*['’]s\s+"
+    r"(?:writer|author|director|composer|performer|maker|manufacturer|creator|owner|spouse)\b")
 
 
 def _named_objects(text):
@@ -91,4 +103,25 @@ def route_question_structure(question):
                 result.update(kind="parallel_attribute", expand=True,
                               reason="explicit_multi_object_shared_attribute")
                 return result
+    return result
+
+
+def route_dependency_depth(question, hops):
+    """Extend text-only branch routing with an authorized dependency depth hint.
+
+    The hint permits a different atomic-chain prompt; it is never a minimum
+    number of nodes, and no decomposition or benchmark type is consulted.
+    Simple two-hop questions and ambiguous conjunctions keep their old planner.
+    """
+    question = str(question or "").strip()
+    result = route_question_structure(question)
+    if result["expand"]:
+        return result
+    depth = max(1, int(hops))
+    if depth >= 3:
+        return dict(result, kind="dependency_chain", expand=True,
+                    reason="authorized_dependency_depth_at_least_three", depth_hint=depth)
+    if _EXPLICIT_UNKNOWN_DESCRIPTION.search(question) or _POSSESSIVE_BRIDGE.search(question):
+        return dict(result, kind="nested_bridge", expand=True,
+                    reason="explicit_unknown_entity_description", depth_hint=depth)
     return result

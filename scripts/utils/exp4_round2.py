@@ -35,6 +35,7 @@ class Variant:
     plan_validation: str = 'strict'
     plan_routing: str = 'all'
     support_mode: str = 'tail_only'
+    terminal_mode: str = 'tail_only'
 
 
 BASELINE = Variant('baseline')
@@ -62,6 +63,16 @@ REPRESENTATIVE_VARIANTS = (
     Variant('structure_support', ('planning', 'support'), plan_validation='canonical_refs',
             plan_routing='question_structure', support_mode='bounded_swap'),
 )
+FAILURE_VARIANTS = (
+    Variant('terminal_tail', ('terminal',)),
+    Variant('terminal_prefix', ('terminal',), terminal_mode='prefix'),
+    Variant('plan_prune', ('planning', 'plan_prune'), plan_validation='canonical_refs',
+            plan_routing='question_structure'),
+    Variant('chain_atomic', ('planning', 'plan_prune'), plan_validation='canonical_refs',
+            plan_routing='dependency_depth'),
+    Variant('chain_terminal', ('planning', 'plan_prune', 'terminal'), plan_validation='canonical_refs',
+            plan_routing='dependency_depth', terminal_mode='prefix'),
+)
 
 
 def namespace(run_tag=None):
@@ -76,13 +87,16 @@ def selected_variants(args):
     if requested is None:
         return VARIANTS
     names = [name.strip() for name in requested.split(',') if name.strip()]
-    known = {item.name: item for item in (*VARIANTS, *FOLLOWUP_VARIANTS, *REPRESENTATIVE_VARIANTS)}
+    known = {item.name: item for item in (*VARIANTS, *FOLLOWUP_VARIANTS, *REPRESENTATIVE_VARIANTS, *FAILURE_VARIANTS)}
     if not names or len(names) != len(set(names)) or any(name not in known for name in names):
         raise ValueError('Variants must be unique known profile names')
     return tuple(known[name] for name in names)
 
 
 def smoke_combination(args):
+    if any(item in FAILURE_VARIANTS for item in selected_variants(args)):
+        return Variant('chain_terminal_smoke', ('planning', 'plan_prune', 'terminal'),
+                       plan_validation='canonical_refs', plan_routing='dependency_depth', terminal_mode='prefix')
     if any(item in REPRESENTATIVE_VARIANTS for item in selected_variants(args)):
         return Variant('structure_support_smoke', ('planning', 'support'),
                        plan_validation='canonical_refs', plan_routing='question_structure',
@@ -95,6 +109,30 @@ def smoke_combination(args):
 
 def signature(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def comma_values(value):
+    return tuple(item.strip() for item in value.split(',') if item.strip())
+
+
+def protected_metrics(args):
+    metrics = comma_values(getattr(args, 'protected_metrics', ','.join(METRICS)))
+    if not metrics or len(metrics) != len(set(metrics)) or any(
+            metric not in ('Recall@1', 'Recall@2', 'Recall@5', 'Recall@10', 'Recall@20', 'Recall@200')
+            for metric in metrics):
+        raise ValueError('Protected metrics must be unique exported Recall names')
+    return metrics
+
+
+def exclusion_tags(args):
+    tags = comma_values(getattr(args, 'exclude_run_tags', ''))
+    if len(tags) != len(set(tags)):
+        raise ValueError('Excluded run tags must be unique')
+    for tag in tags:
+        namespace(tag)
+    if getattr(args, 'run_tag', None) in tags:
+        raise ValueError('A run cannot exclude its own namespace')
+    return tags
 
 
 def prior_exclusions(out, run_tag=None):
@@ -117,7 +155,7 @@ def prior_exclusions(out, run_tag=None):
 
 
 def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolute_pp',
-                      max_regression=1.0, allowed_exceptions=2):
+                      max_regression=1.0, allowed_exceptions=2, protected_metrics=METRICS):
     """Assess the requested gain without reducing thresholds at metric ceilings.
 
     Regression limits always use absolute percentage points. The paper target
@@ -128,6 +166,7 @@ def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolut
     details = {}
     reached = 0
     protected = True
+    protection_details = {}
     for dataset in DATASETS:
         details[dataset] = {}
         for metric in METRICS:
@@ -142,13 +181,23 @@ def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolut
             maximum = (1 - old) / denominator * 100 if denominator > 0 else None
             achievable = maximum is not None and maximum >= target_gain - 1e-8
             met = gain is not None and gain >= target_gain - 1e-8
-            protected = protected and delta_pp >= -max_regression - 1e-8
             reached += int(met)
             details[dataset][metric] = {
                 'baseline': old, 'candidate': new, 'delta_pp': delta_pp,
                 'gain': gain, 'gain_unit': gain_unit, 'target_gain': target_gain,
                 'maximum_possible_gain': maximum, 'unreachable': not achievable,
                 'target_met': met, 'regression_limit_met': delta_pp >= -max_regression - 1e-8}
+        protection_details[dataset] = {}
+        for metric in protected_metrics:
+            old = float(baselines[dataset]['retrieval_metrics'][metric])
+            new = float(reports[dataset]['retrieval_metrics'][metric])
+            if not (0 <= old <= 1 and 0 <= new <= 1):
+                raise ValueError('Protected Recall values must be in [0, 1]')
+            delta_pp = (new - old) * 100
+            meets = delta_pp >= -max_regression - 1e-8
+            protection_details[dataset][metric] = {
+                'baseline': old, 'candidate': new, 'delta_pp': delta_pp, 'regression_limit_met': meets}
+            protected = protected and meets
     every_dataset = all(any(row['target_met'] for row in rows.values()) for rows in details.values())
     required = len(DATASETS) * len(METRICS) - allowed_exceptions
     mean5 = sum(details[name]['Recall@5']['delta_pp'] for name in DATASETS) / len(DATASETS)
@@ -160,6 +209,7 @@ def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolut
             'every_dataset_has_target_gain': every_dataset, 'regression_limit_met': protected,
             'mean_gain_r5_pp': mean5, 'mean_gain_r10_pp': mean10,
             'score': .7 * mean5 + .3 * mean10, 'metric_details': details,
+            'protected_metrics': list(protected_metrics), 'protection_metric_details': protection_details,
             'unreachable_metrics': [f'{name}/{metric}' for name in DATASETS for metric in METRICS
                                     if details[name][metric]['unreachable']],
             'exception_metrics': [f'{name}/{metric}' for name in DATASETS for metric in METRICS
@@ -167,27 +217,39 @@ def target_assessment(reports, baselines, *, target_gain=4.0, gain_unit='absolut
 
 
 def assess(args, reports, baselines):
+    original_reports, original_baselines = reports, baselines
     if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
         reports = {dataset: dict(report, retrieval_metrics=report['representative_evaluation']['full_population']['metrics'])
                    for dataset, report in reports.items()}
         baselines = {dataset: dict(report, retrieval_metrics=report['representative_evaluation']['full_population']['metrics'])
                      for dataset, report in baselines.items()}
-    return target_assessment(reports, baselines, target_gain=args.target_gain,
+    assessment = target_assessment(reports, baselines, target_gain=args.target_gain,
                              gain_unit=args.gain_unit, max_regression=args.max_regression,
-                             allowed_exceptions=args.allowed_exceptions)
+                             allowed_exceptions=args.allowed_exceptions, protected_metrics=protected_metrics(args))
+    if getattr(args, 'require_raw_guard', False):
+        raw = target_assessment(original_reports, original_baselines, target_gain=args.target_gain,
+            gain_unit=args.gain_unit, max_regression=args.max_regression,
+            allowed_exceptions=args.allowed_exceptions, protected_metrics=protected_metrics(args))
+        assessment['weighted_regression_limit_met'] = assessment['regression_limit_met']
+        assessment['raw_regression_limit_met'] = raw['regression_limit_met']
+        assessment['regression_limit_met'] = assessment['regression_limit_met'] and raw['regression_limit_met']
+        for key in ('strong_target_met', 'strict_target_met', 'weak_signal'):
+            assessment[key] = assessment[key] and raw['regression_limit_met']
+    return assessment
 
 
 def command(args, context, case, indices, variant):
     base = previous.command(args, context, case, indices, frozenset(variant.flags))
     # The earlier driver knows only its original five flags. Preserve the
-    # explicit profile here so support cannot silently disappear.
+    # explicit profile here so newer opt-in flags cannot silently disappear.
     base[base.index('--evidence_improvements') + 1] = ','.join(variant.flags)
     return base + [
         '--evidence_adaptive_mode', variant.adaptive_mode,
         '--evidence_binding_validation', variant.binding_validation,
         '--evidence_plan_validation', variant.plan_validation,
         '--evidence_plan_routing', variant.plan_routing,
-        '--evidence_support_mode', variant.support_mode]
+        '--evidence_support_mode', variant.support_mode,
+        '--evidence_terminal_mode', variant.terminal_mode]
 
 
 def verify_saved_case(context, case, manifest, variant):
@@ -266,7 +328,8 @@ def run_case(args, context, case, indices, variant, env, *, cleanup=True):
                           ('evidence_binding_validation', variant.binding_validation),
                           ('evidence_plan_validation', variant.plan_validation),
                           ('evidence_plan_routing', variant.plan_routing),
-                          ('evidence_support_mode', variant.support_mode)]:
+                          ('evidence_support_mode', variant.support_mode),
+                          ('evidence_terminal_mode', variant.terminal_mode)]:
         if runtime.get(key) != expected:
             # Do not retain the old helper's marker after a round-specific
             # validation failure; the exported result remains for inspection.
@@ -373,14 +436,20 @@ def evaluate_variant(args, contexts, temp, env, summary, summary_file, phase, in
     if getattr(args, 'sampling_policy', 'hop_support') == 'representative':
         entry['raw_sample_assessment'] = target_assessment(entry['reports'], baselines,
             target_gain=args.target_gain, gain_unit=args.gain_unit, max_regression=args.max_regression,
-            allowed_exceptions=args.allowed_exceptions)
+            allowed_exceptions=args.allowed_exceptions, protected_metrics=protected_metrics(args))
     entry['assessment_estimator'] = ('primary_poststratified_full_population'
         if getattr(args, 'sampling_policy', 'hop_support') == 'representative' else 'raw_sample_macro')
     entry['paired_comparison'] = previous.comparison_score(entry['reports'], baselines)
+    entry['raw_all_gold_deltas_pp'] = {dataset: {
+        metric: (entry['reports'][dataset][metric] - baselines[dataset][metric]) * 100
+        for metric in ('all_gold_top5', 'all_gold_top10')
+        if metric in entry['reports'][dataset] and metric in baselines[dataset]}
+        for dataset in DATASETS}
     write_json(summary_file, summary)
     print(f'[round2-{phase}] {variant.name} target={entry["strong_target_met"]} '
           f'strict6={entry["strict_target_met"]} weak_signal={entry["weak_signal"]} '
           f'R5gain_pp={entry["mean_gain_r5_pp"]:+.3f} R10gain_pp={entry["mean_gain_r10_pp"]:+.3f} '
+          f'guard={entry["regression_limit_met"]} '
           f'unreachable={entry["unreachable_metrics"]}', flush=True)
     return entry
 
@@ -421,7 +490,8 @@ def smoke(args, contexts, temp, env, summary, summary_file):
 def variant_from_config(config):
     return Variant(config['name'], tuple(config['flags']), config['adaptive_mode'],
                    config['binding_validation'], config.get('plan_validation', 'strict'),
-                   config.get('plan_routing', 'all'), config.get('support_mode', 'tail_only'))
+                   config.get('plan_routing', 'all'), config.get('support_mode', 'tail_only'),
+                   config.get('terminal_mode', 'tail_only'))
 
 
 def combined_candidate(screened):
@@ -476,16 +546,68 @@ def screen(args, contexts, temp, env, summary, summary_file):
     write_json(summary_file, summary)
 
 
+def screening_output_signature(temp, entry):
+    """Identify identical evaluated rankings, rather than equal macro scores."""
+    outputs = {}
+    for dataset in DATASETS:
+        report = entry['reports'].get(dataset, {})
+        rows = report.get('per_question')
+        result_path = temp / 'screen' / dataset / entry['config']['name'] / 'result.json'
+        if not rows or not result_path.is_file():
+            return None
+        result = read_json(result_path)
+        rankings = {row['query_index']: row['docs'] for row in result['results']}
+        indices = {row['query_index'] for row in rows}
+        if set(rankings) != indices or len(indices) != len(rows):
+            raise ValueError(f'{dataset}: candidate deduplication rows differ from exported rankings')
+        outputs[dataset] = [{'query_index': row['query_index'], 'metrics': row['metrics'],
+                             'all_gold_top5': row['all_gold_top5'],
+                             'all_gold_top10': row['all_gold_top10'],
+                             'docs': rankings[row['query_index']]}
+                            for row in sorted(rows, key=lambda row: row['query_index'])]
+    return signature(outputs)
+
+
+def unique_confirmation_candidates(ranked, temp, maximum):
+    chosen, seen, equivalents = [], {}, {}
+    for entry in ranked:
+        digest = screening_output_signature(temp, entry)
+        name = entry['config']['name']
+        if digest is not None and digest in seen:
+            equivalents.setdefault(seen[digest], []).append(name)
+            continue
+        if len(chosen) < maximum:
+            chosen.append(entry)
+            if digest is not None:
+                seen[digest] = name
+        # Keep scanning to record all equivalent profiles, but never add a
+        # third distinct candidate. Equal averages alone are not deduplicated.
+    return chosen, equivalents
+
+
 def confirm(args, contexts, temp, env, summary, summary_file):
     if not summary.get('screen', {}).get('complete'):
         raise ValueError('Finish round2 screening before confirmation')
-    entries = summary['screen']['variants'].values()
+    entries = list(summary['screen']['variants'].values())
+    if getattr(args, 'require_raw_guard', False):
+        entries = [item for item in entries if item['regression_limit_met']]
+        if not entries:
+            summary.update(confirmation_candidates=[], confirmation_equivalent_profiles={},
+                confirmed_target_variants=[], confirmed_weak_signal_variants=[],
+                selection_status='small_sample_no_guarded_candidate', automatic_full_run_enabled=False)
+            summary['confirmation'] = {'complete': True, 'skipped': True,
+                'reason': 'Every screening candidate breached the paired raw or weighted regression limit.'}
+            write_json(summary_file, summary)
+            print('[round2-finished-small-only] No candidate passed both regression guards; '
+                  'confirmation and full retrieval are not started.', flush=True)
+            return
     positive = [item for item in entries if item['weak_signal']]
     # Confirm at least the best exploratory candidate, even if the requested
     # large gain is absent. This does not label it effective or meet the target.
     ranked = sorted(positive or list(entries),
                     key=lambda item: (-int(item['strong_target_met']), -item['score'], item['config']['name']))
-    chosen = ranked[:2] if positive else ranked[:1]
+    chosen, equivalents = unique_confirmation_candidates(ranked, temp, 2 if positive else 1)
+    summary['confirmation_equivalent_profiles'] = equivalents
     variants = [variant_from_config(item['config']) for item in chosen]
     plan = json.loads(json.dumps([asdict(variant) for variant in variants]))
     if summary.get('confirmation_candidates') and summary['confirmation_candidates'] != plan:
@@ -523,6 +645,7 @@ def protocol_for(args, contexts):
             for dataset, context in contexts.items()}
     protocol.update(round=2, run_tag=getattr(args, 'run_tag', None),
                     sampling_policy=getattr(args, 'sampling_policy', 'hop_support'),
+                    exclude_run_tags=list(exclusion_tags(args)),
                     target_metric_estimator=('primary_poststratified_full_population'
                         if getattr(args, 'sampling_policy', 'hop_support') == 'representative' else 'raw_sample_macro'),
                     screen_seed=args.screen_seed, confirmation_seed=args.confirm_seed,
@@ -531,6 +654,8 @@ def protocol_for(args, contexts):
                     smoke_combination=asdict(smoke_combination(args)),
                     target={'gain_unit': args.gain_unit, 'gain': args.target_gain,
                             'max_regression_absolute_pp': args.max_regression,
+                            'protected_metrics': list(protected_metrics(args)),
+                            'require_raw_guard': getattr(args, 'require_raw_guard', False),
                             'allowed_exceptions': args.allowed_exceptions, 'reference': args.reference,
                             'every_dataset_needs_target_metric': True})
     return json.loads(json.dumps(protocol))
@@ -587,7 +712,7 @@ def run(args):
     representative = getattr(args, 'sampling_policy', 'hop_support') == 'representative'
     if representative:
         from .representative_sampling import collect_prior_exclusions, make_representative_split
-        exclusions = collect_prior_exclusions(out)
+        exclusions = collect_prior_exclusions(out, additional_run_tags=exclusion_tags(args))
         args.previous_round_exclusions = dict(exclusions, excluded_indices=exclusions['indices'])
         for dataset, context in contexts.items():
             context['representative_sampling'] = make_representative_split(context['data'], dataset,
@@ -660,6 +785,8 @@ def main(argv=None):
     parser.add_argument('--run-tag', help='Independent output namespace using letters, digits or underscores')
     parser.add_argument('--variants', help='Comma-separated subset of named screen profiles; default is the original eight')
     parser.add_argument('--sampling-policy', choices=('hop_support', 'representative'), default='hop_support')
+    parser.add_argument('--exclude-run-tags', default='',
+                        help='Explicit prior round2 namespaces to exclude, in addition to the fixed three rounds')
     parser.add_argument('--screen-size', type=int, default=48)
     parser.add_argument('--confirm-size', type=int, default=24)
     parser.add_argument('--screen-seed', type=int, default=142)
@@ -667,6 +794,10 @@ def main(argv=None):
     parser.add_argument('--gain-unit', choices=('absolute_pp', 'relative_percent', 'error_reduction'), default='absolute_pp')
     parser.add_argument('--target-gain', type=float, default=4.0)
     parser.add_argument('--max-regression', type=float, default=1.0, help='Absolute percentage points')
+    parser.add_argument('--protected-metrics', default=','.join(METRICS),
+                        help='Comma-separated Recall metrics protected by the paired regression limit')
+    parser.add_argument('--require-raw-guard', action='store_true',
+                        help='Require both calibrated and raw sample metrics to meet the regression limit')
     parser.add_argument('--allowed-exceptions', type=int, default=2)
     parser.add_argument('--reference', choices=('matched_exp4',), default='matched_exp4')
     parser.add_argument('--out-root', '--output-root', default=str(previous.DEFAULT_OUT))
@@ -679,10 +810,14 @@ def main(argv=None):
     try:
         namespace(args.run_tag)
         selected_variants(args)
+        exclusion_tags(args)
+        protected_metrics(args)
     except ValueError as error:
         parser.error(str(error))
     if args.sampling_policy == 'representative' and not args.run_tag:
         parser.error('Representative sampling needs an independent run tag')
+    if args.exclude_run_tags and args.sampling_policy != 'representative':
+        parser.error('Additional run exclusions are supported by representative sampling')
     if (args.target_gain <= 0 or args.max_regression < 0 or not 0 <= args.allowed_exceptions <= 5 or
             args.screen_size < 2 or args.confirm_size < 1):
         parser.error('Invalid target, regression limit, exception count or sample size')

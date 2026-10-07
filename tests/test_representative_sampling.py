@@ -140,6 +140,35 @@ class RepresentativeSamplingTests(unittest.TestCase):
                 self.assertEqual(result['indices'][dataset], list(range(216)))
             self.assertTrue(all(len(source['sha256']) == 64 for source in result['sources']))
 
+    def test_explicit_additional_run_is_signed_without_scanning_current_run(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            directories = ('exp4_improvement_selection', 'exp4_round2_selection',
+                           'exp4_round2_selection_relation_plan_fix',
+                           'exp4_round2_selection_structure_representative',
+                           'exp4_round2_selection_failure_focused')
+            for offset, directory in enumerate(directories):
+                start = offset * 72 if offset < 3 else 216 if offset == 3 else 306
+                screen_size = 48 if offset < 3 else 60
+                count = 72 if offset < 3 else 90
+                screen = {d: list(range(start, start + screen_size)) for d in sampling.DATASETS}
+                confirm = {d: list(range(start + screen_size, start + count)) for d in sampling.DATASETS}
+                record = ({'screen': {'screen_indices': screen, 'confirmation_indices': confirm}} if offset == 0
+                          else {'indices': {'screen': screen, 'confirmation': confirm}})
+                path = root / 'metadata' / directory / 'selection.json'
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(record))
+            original = sampling.collect_prior_exclusions(root)
+            self.assertEqual(original['indices']['musique'], list(range(216)))
+            extended = sampling.collect_prior_exclusions(root, ['structure_representative'])
+            self.assertEqual(extended['indices']['musique'], list(range(306)))
+            self.assertEqual(len(extended['sources']), 4)
+            self.assertNotIn('failure_focused', str(extended['sources']))
+            self.assertEqual(extended, sampling.collect_prior_exclusions(root, ['structure_representative']))
+            for tags in (['../outside'], [''], ['structure_representative'] * 2, ['relation_plan_fix']):
+                with self.subTest(tags=tags), self.assertRaises(ValueError):
+                    sampling.collect_prior_exclusions(root, tags)
+
 
 if __name__ == '__main__':
     unittest.main()

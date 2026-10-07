@@ -9,6 +9,7 @@ SPEC = importlib.util.spec_from_file_location("_question_structure_test", PATH)
 module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 route = module.route_question_structure
+route_depth = module.route_dependency_depth
 
 
 class QuestionStructureTests(unittest.TestCase):
@@ -58,6 +59,33 @@ class QuestionStructureTests(unittest.TestCase):
                 raise AssertionError("Question routing attempted to read annotations")
         self.assertTrue(route(TextOnly("Which film was released first, Film A or Film B?"))["expand"])
         self.assertTrue(route("When did the country where Britain and France fought become independent?")["qualifier_risk"])
+
+    def test_authorized_depth_can_route_a_chain_without_forcing_a_node_count(self):
+        question = "What year did the university attended by the founder close?"
+        decision = route_depth(question, 4)
+        self.assertTrue(decision["expand"])
+        self.assertEqual(decision["kind"], "dependency_chain")
+        self.assertEqual(decision["depth_hint"], 4)
+        self.assertNotIn("min_nodes", decision)
+
+    def test_explicit_nested_entity_description_routes_at_two_hops(self):
+        for question in ("When was the writer of Work X born?",
+                         "Who owns the record label of the Another Page performer?",
+                         "Where was Work X's author born?",
+                         "When did the city where Alpha works become a capital?"):
+            with self.subTest(question=question):
+                self.assertEqual(route_depth(question, 2)["kind"], "nested_bridge")
+
+    def test_simple_question_and_ambiguous_title_conjunction_stay_original(self):
+        for question in ("When was Alpha born?", "Who composed Castor et Pollux?",
+                         "Which British driver raced for different teams and won the European Grand Prix?",
+                         "Who scored or orchestrated more films for Studio A?"):
+            with self.subTest(question=question):
+                self.assertFalse(route_depth(question, 2)["expand"])
+
+    def test_depth_routing_keeps_existing_explicit_comparison_decision(self):
+        question = "Are the directors of both films Film A and Film B from the same country?"
+        self.assertEqual(route_depth(question, 2), route(question))
 
 
 if __name__ == "__main__":

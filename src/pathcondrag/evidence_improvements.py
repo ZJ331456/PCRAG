@@ -5,12 +5,14 @@ from .evidence_planning import AdaptiveSearchMixin, PlannerImprovementMixin
 from .evidence_retrieval import EvidenceRetrieval
 from .evidence_selection import SelectionImprovementMixin
 from .evidence_support import AncestorSupportMixin
+from .evidence_terminal import TerminalEvidenceMixin
 
 
 class ImprovedEvidenceRetrieval(
     PlannerImprovementMixin,
     AdaptiveSearchMixin,
     BindingImprovementMixin,
+    TerminalEvidenceMixin,
     AncestorSupportMixin,
     SelectionImprovementMixin,
     EvidenceRetrieval,
