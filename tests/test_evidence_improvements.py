@@ -294,6 +294,55 @@ class ImprovementIntegrationTests(unittest.TestCase):
         self.assertTrue(np.all(np.diff(scores) <= 0))
         self.assertNotIn("forbidden_annotation", str(rag.calls))
 
+    def test_source_and_failure_composition_keeps_healthy_chain_without_extra_calls(self):
+        rag = FakeRAG("planning,plan_prune,dag_package,source_witness,failure_recovery",
+                      [PLAN, ALPHA, ROME])
+        rag.pcrag_config.evidence_plan_routing = "question_structure"
+        rag.pcrag_config.evidence_plan_validation = "canonical_refs"
+        engine = improved.ImprovedEvidenceRetrieval(rag)
+        sample = state()
+        engine.process_window([sample])
+        ids, scores, trace = engine.finalize(sample["query"], *sample["base"], sample)
+        self.assertEqual(trace["bindings"], {"s1": "Alpha", "s2": "Rome"})
+        self.assertEqual(len(rag.calls), 3)
+        self.assertEqual(len(rag.searches), 2)
+        self.assertFalse(trace["improvement_failure_recovery"]["applied"])
+        self.assertEqual(trace["improvement_failure_recovery"]["extra_plan_requests"], 0)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(np.all(np.diff(scores) <= 0))
+
+    def test_rendered_failure_repair_retains_actual_initial_parent_outputs(self):
+        invalid = copy.deepcopy(PLAN)
+        invalid["nodes"][1]["question"] = "Where was the writer born?"
+        repair = {"nodes": [
+            {"id": "r1", "question_template": "Who wrote Work X?", "inputs": {}, "answer_type": "person"},
+            {"id": "r2", "question_template": "Where was {{person}} born?",
+             "inputs": {"person": "r1"}, "answer_type": "place"}]}
+        parent_rag = FakeRAG("planning,plan_prune,dag_package,source_witness", [invalid, invalid])
+        repair_rag = FakeRAG("planning,plan_prune,dag_package,source_witness,failure_recovery",
+                             [invalid, invalid, repair, ALPHA, ROME])
+        parents = []
+        for rag in (parent_rag, repair_rag):
+            rag.pcrag_config.evidence_plan_routing = "question_structure"
+            rag.pcrag_config.evidence_plan_validation = "canonical_refs"
+            engine, sample = improved.ImprovedEvidenceRetrieval(rag), state()
+            engine.process_window([sample])
+            parents.append((engine, sample))
+        before = parents[0][1]["evidence_trace"]
+        engine, sample = parents[1]
+        trace = sample["evidence_trace"]
+        diagnostic = trace["improvement_failure_recovery"]
+        self.assertTrue(diagnostic["applied"])
+        self.assertEqual(diagnostic["extra_plan_requests"], 1)
+        for key, value in diagnostic["original_parent_fields"].items():
+            self.assertEqual(value, before.get(key), key)
+        self.assertEqual(trace["bindings"], {"r1": "Alpha", "r2": "Rome"})
+        self.assertEqual(sample["_evidence_plan"][1]["question"], "Where was ${r1.answer} born?")
+        self.assertEqual(len(repair_rag.calls), 5)
+        ids, scores, _ = engine.finalize(sample["query"], *sample["base"], sample)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(np.all(np.diff(scores) <= 0))
+
 
 if __name__ == "__main__":
     unittest.main()

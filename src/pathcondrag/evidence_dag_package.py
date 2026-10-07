@@ -107,7 +107,7 @@ def _proof_relation(node, question, proof, document, bindings):
     return None, reason or local_reason or "unknown_relation_not_promoted"
 
 
-def _collect_proofs(nodes, bindings, winning, candidates, rank, document, diagnostic):
+def _collect_proofs(nodes, bindings, winning, candidates, rank, document, diagnostic, proof_check=None):
     choices = {nid: [] for nid in nodes}
     for nid, proof in winning.get("proofs", {}).items():
         if nid in choices and isinstance(proof, dict):
@@ -158,7 +158,7 @@ def _collect_proofs(nodes, bindings, winning, candidates, rank, document, diagno
                 reason = "unbound_node_question"
             if not reason:
                 proof = dict(raw, answer=answer, evidence=quote)
-                check, reason = _proof_relation(nodes[nid], question, proof, source, bindings)
+                check, reason = (proof_check or _proof_relation)(nodes[nid], question, proof, source, bindings)
                 if check:
                     # Multi-parent joins need each input literally anchored in
                     # the actual quote; a topic title cannot silently join roots.
@@ -255,7 +255,7 @@ def _optimize_prefix(order, original, size, fixed_count, choices, ancestors, nod
     return final
 
 
-def rerank_dag_packages(order, state, document):
+def rerank_dag_packages(order, state, document, proof_check=None):
     """Optimize Top5 then Top10 with fixed front documents and source closures."""
     original = [int(d) for d in order]
     diagnostic = {"enabled": True, "policy": "finite_ancestor_closed_package_optimization",
@@ -286,7 +286,7 @@ def rerank_dag_packages(order, state, document):
         return original, diagnostic
     nodes = {n["id"]: n for n in plan}
     choices = _collect_proofs(nodes, bindings, winning, state.get("evidence_candidates", {}),
-                             {d: i + 1 for i, d in enumerate(original)}, document, diagnostic)
+                             {d: i + 1 for i, d in enumerate(original)}, document, diagnostic, proof_check)
     diagnostic["eligible_proofs"] = choices
     packages = _package_sets(choices, ancestors, node_order)
     diagnostic["eligible_package_count"] = len(packages)
@@ -322,7 +322,11 @@ class DAGPackageMixin:
         if "dag_package" not in self.improvements or getattr(self, "stage", 4) < 4:
             return result
         original_ids, original_scores, original_trace = result
-        final, diagnostic = rerank_dag_packages(original_ids, state, self._document)
+        proof_check = None
+        if "source_witness" in self.improvements:
+            from .evidence_source_witness import source_witness_check
+            proof_check = source_witness_check
+        final, diagnostic = rerank_dag_packages(original_ids, state, self._document, proof_check)
         trace = dict(original_trace, improvement_dag_package=diagnostic)
         if np.array_equal(np.asarray(final), original_ids):
             return original_ids, original_scores, trace

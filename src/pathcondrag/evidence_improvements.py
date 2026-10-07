@@ -10,9 +10,13 @@ from .evidence_selection import SelectionImprovementMixin
 from .evidence_support import AncestorSupportMixin
 from .evidence_terminal import TerminalEvidenceMixin
 from .evidence_structural_recovery import StructuralRecoveryMixin
+from .evidence_source_witness import SourceWitnessMixin
+from .evidence_failure_recovery import FailureRecoveryMixin
 
 
 class ImprovedEvidenceRetrieval(
+    FailureRecoveryMixin,
+    SourceWitnessMixin,
     StructuralRecoveryMixin,
     BridgeRecoveryMixin,
     PlannerImprovementMixin,
