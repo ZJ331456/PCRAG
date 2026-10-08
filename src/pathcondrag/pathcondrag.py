@@ -579,6 +579,9 @@ class PCRAG(BaseRAG):
         self.get_query_embeddings(queries)
 
         retrieval_results: List[QuerySolution] = []
+        evidence_runtime = getattr(self, "evidence_runtime", None)
+        review_enabled = "support_semantic_veto" in getattr(evidence_runtime, "improvements", ())
+        review_inputs = []
 
         for state in tqdm(self._iter_retrieval_states(queries), total=len(queries), desc="PCRAG Retrieving"):
             q_idx, query = state["query_idx"], state["query"]
@@ -684,6 +687,8 @@ class PCRAG(BaseRAG):
                         "pcqd_conflict_rate": 0.0,
                     }
                 )
+                if review_enabled:
+                    review_inputs.append((retrieval_results[-1], sorted_doc_ids[:num_to_retrieve].copy()))
                 continue
 
             if "base" in state:
@@ -769,6 +774,8 @@ class PCRAG(BaseRAG):
             top_scores = sorted_doc_scores[:num_to_retrieve]
             retrieval_results.append(QuerySolution(question=query, docs=top_docs, doc_scores=top_scores,
                                                     retrieval_trace=trace))
+            if review_enabled:
+                review_inputs.append((retrieval_results[-1], sorted_doc_ids[:num_to_retrieve].copy()))
 
             hops = int(ctx.get("hops", 2))
             self.retrieval_diagnostics["hop_counter"][str(hops)] += 1
@@ -854,6 +861,11 @@ class PCRAG(BaseRAG):
         self.retrieval_diagnostics["pcqd_conflict_rate"] = float(
             float(self.retrieval_diagnostics.get("_pcqd_conflict_sum", 0.0)) / total
         )
+
+        if review_enabled:
+            from .evidence_support_semantic_veto import postprocess_support_semantic_veto
+            self.retrieval_diagnostics["support_semantic_veto"] = postprocess_support_semantic_veto(
+                evidence_runtime, review_inputs)
 
         self.all_retrieval_time += time.time() - retrieve_start_time
         logger.info("[PCRAG] Total Retrieval Time %.2fs", self.all_retrieval_time)

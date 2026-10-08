@@ -36,6 +36,9 @@ class PCRAGConfig(BaseConfig):
     # Split verification expansion from branch retention for controlled tests.
     evidence_adaptive_mode: str = "both"
     evidence_binding_validation: str = "legacy"
+    # CPU token preflight for the optional Qwen3 support/semantic review.
+    evidence_review_tokenizer: str = "/root/models/Qwen3-8B"
+    evidence_review_context_length: int = 8192
 
     # Hop estimation
     use_enhanced_hop_estimation: bool = field(default=True)
@@ -160,7 +163,7 @@ class PCRAGConfig(BaseConfig):
         flags = {f.strip() for f in self.evidence_improvements.split(",") if f.strip()}
         if flags - {"planning", "selection", "binding", "closure", "adaptive", "support", "terminal", "plan_prune",
                     "package", "bridge_recovery", "dag_package", "structural_recovery",
-                    "source_witness", "failure_recovery"}:
+                    "source_witness", "failure_recovery", "support_semantic_veto"}:
             raise ValueError("Unknown evidence_improvements flag")
         if flags and (self.improvement_stage != 4 or self.evidence_ablation_mode != "normal"):
             raise ValueError("Evidence improvements require normal stage-4 retrieval")
