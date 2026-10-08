@@ -1,6 +1,8 @@
 """Compose independently switchable extensions to the online exp4 algorithm."""
 
 from .evidence_binding import BindingImprovementMixin
+from .evidence_anchor_companion import AnchorCompanionMixin
+from .evidence_condition_companion import ConditionCompanionMixin
 from .evidence_bridge import BridgeRecoveryMixin
 from .evidence_dag_package import DAGPackageMixin
 from .evidence_package import EvidencePackageMixin
@@ -22,6 +24,8 @@ class ImprovedEvidenceRetrieval(
     PlannerImprovementMixin,
     AdaptiveSearchMixin,
     BindingImprovementMixin,
+    ConditionCompanionMixin,
+    AnchorCompanionMixin,
     DAGPackageMixin,
     EvidencePackageMixin,
     TerminalEvidenceMixin,
