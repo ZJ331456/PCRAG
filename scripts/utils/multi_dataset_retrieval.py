@@ -75,9 +75,43 @@ def smoke_dataset(out, source, name):
     samples = [data[position] for position in positions]
     corpus = read_json(source / f'{name}_corpus.json')
     by_text = {experiments.passage_text(row): row for row in corpus}
+    destination = out / 'smoke_datasets'
+    dataset_file = destination / f'{name}.json'
+    corpus_file = destination / f'{name}_corpus.json'
+    provenance_file = out / 'metadata' / name / 'smoke_provenance.json'
+    fixtures = (dataset_file, corpus_file, provenance_file)
+    if any(path.exists() for path in fixtures):
+        if not all(path.is_file() for path in fixtures):
+            raise ValueError(f'{name}: incomplete smoke fixtures; inspect before retrying')
+        provenance = read_json(provenance_file)
+        expected = {
+            'original_indices': positions,
+            'original_sample_ids': [sample_id(data[i], i) for i in positions],
+            'source_dataset_sha256': experiments.sha256(source / f'{name}.json'),
+            'source_corpus_sha256': experiments.sha256(source / f'{name}_corpus.json'),
+        }
+        if any(provenance.get(key) != value for key, value in expected.items()):
+            raise ValueError(f'{name}: smoke source provenance changed')
+        saved = read_json(corpus_file)
+        texts = [experiments.passage_text(row) for row in saved]
+        if (read_json(dataset_file) != samples or len(saved) < 20
+                or provenance.get('corpus_docs') != len(saved)
+                or len(set(texts)) != len(texts)
+                or any(row != by_text.get(text) for row, text in zip(saved, texts))):
+            raise ValueError(f'{name}: existing smoke fixtures differ from their original sources')
+        experiments.validated_dataset(dataset_file, corpus_file, dataset_name=name)
+        manifest_file = out / 'metadata' / name / 'manifest.json'
+        if manifest_file.is_file():
+            manifest = read_json(manifest_file)
+            if (experiments.sha256(dataset_file) != manifest['data_sha256']
+                    or experiments.sha256(corpus_file) != manifest['corpus_sha256']):
+                raise ValueError(f'{name}: existing smoke fixture SHA differs from the frozen manifest')
+        # Preserve the exact corpus order and serialized bytes on resume.
+        # A changed process hash seed must never rewrite a frozen fixture.
+        return destination
     selected = {}
     for documents in get_gold_docs(samples, name):
-        for document in documents:
+        for document in sorted(documents):
             selected[document] = by_text[document]
     # Include the historical NV2 OOM passages and a longest intact passage.
     # Short-only fixtures cannot exercise full-length encoder memory peaks.
@@ -101,11 +135,10 @@ def smoke_dataset(out, source, name):
             break
     if len(selected) < 20:
         raise ValueError(f'{name}: smoke needs 20 unique source passages')
-    destination = out / 'smoke_datasets'
     destination.mkdir(parents=True, exist_ok=True)
-    write_json(destination / f'{name}.json', samples)
-    write_json(destination / f'{name}_corpus.json', list(selected.values()))
-    write_json(out / 'metadata' / name / 'smoke_provenance.json', {
+    write_json(dataset_file, samples)
+    write_json(corpus_file, list(selected.values()))
+    write_json(provenance_file, {
         'original_indices': positions,
         'original_sample_ids': [sample_id(data[i], i) for i in positions],
         'source_dataset_sha256': experiments.sha256(source / f'{name}.json'),
