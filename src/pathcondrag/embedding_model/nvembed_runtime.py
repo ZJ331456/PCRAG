@@ -1,8 +1,9 @@
 """Memory-bounded NV-Embed inference shared by both comparison methods.
 
 Only execution/storage changes: keep each encoded batch on CPU, disable the
-unused generation KV cache, and split a batch if CUDA runs out of memory.
+unused generation KV cache, and optionally split a batch after CUDA OOM.
 Text, token limit, instructions, dtype and normalization retain native values.
+Set PATHCONDRAG_NVEMBED_OOM_SPLIT=false to forbid any OOM batch splitting.
 """
 
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from copy import deepcopy
 import gc
 import importlib
 import logging
+import os
 
 import numpy as np
 import torch
@@ -17,10 +19,19 @@ from tqdm import tqdm
 
 
 LOG = logging.getLogger(__name__)
-RUNTIME_VERSION = 'nvembed_cpu_batch_storage_oom_split_v1'
+RUNTIME_VERSION = 'nvembed_cpu_batch_storage_controlled_oom_split_v2'
 
 
-def _encode_cpu(model, texts, params, stats):
+def _oom_split_enabled():
+    value = os.environ.get('PATHCONDRAG_NVEMBED_OOM_SPLIT', 'true').strip().lower()
+    if value in {'1', 'true', 'yes', 'on'}:
+        return True
+    if value in {'0', 'false', 'no', 'off'}:
+        return False
+    raise ValueError('PATHCONDRAG_NVEMBED_OOM_SPLIT must be true or false.')
+
+
+def _encode_cpu(model, texts, params, stats, allow_split):
     """Return a complete batch, or retry smaller batches after releasing OOM."""
     failed = False
     try:
@@ -34,7 +45,8 @@ def _encode_cpu(model, texts, params, stats):
             stats['smallest_successful_microbatch'], len(texts))
         return output
     except torch.cuda.OutOfMemoryError:
-        if len(texts) == 1:
+        stats['cuda_oom_events'] += 1
+        if not allow_split or len(texts) == 1:
             # A single original passage remains a real failure. Do not shorten
             # its token limit or substitute an empty vector to hide the error.
             raise
@@ -48,8 +60,8 @@ def _encode_cpu(model, texts, params, stats):
         LOG.warning('NV embedding CUDA OOM: retrying the same %d texts as %d+%d; '
                     'max_length=%s and instruction unchanged',
                     len(texts), middle, len(texts) - middle, params.get('max_length'))
-        left = _encode_cpu(model, texts[:middle], params, stats)
-        right = _encode_cpu(model, texts[middle:], params, stats)
+        left = _encode_cpu(model, texts[:middle], params, stats, allow_split)
+        right = _encode_cpu(model, texts[middle:], params, stats, allow_split)
         return torch.cat((left, right), dim=0)
 
 
@@ -65,6 +77,7 @@ def memory_bounded_batch_encode(self, texts, **kwargs):
     batch_size = int(params.pop('batch_size', 16))
     if batch_size < 1:
         raise ValueError('NV embedding batch_size must be at least 1.')
+    allow_split = _oom_split_enabled()
     if not texts:
         return np.empty((0, self.embedding_dim), dtype=np.float32)
 
@@ -83,20 +96,30 @@ def memory_bounded_batch_encode(self, texts, **kwargs):
             'version': RUNTIME_VERSION,
             'output_batch_device': 'cpu',
             'encoder_use_cache': False,
+            'oom_split_enabled': allow_split,
+            'oom_split_policies_seen': [allow_split],
+            'requested_batch_sizes': [batch_size],
+            'cuda_oom_events': 0,
             'cuda_oom_splits': 0,
             'successful_microbatches': 0,
             'smallest_successful_microbatch': batch_size,
             'encoded_texts': 0,
         }
-        LOG.info('NV embedding runtime=%s; batch=%d; max_length=%s; '
+        LOG.info('NV embedding runtime=%s; batch=%d; max_length=%s; oom_split=%s; '
                  'CPU batch storage and unused encoder KV cache disabled',
-                 RUNTIME_VERSION, batch_size, params.get('max_length'))
+                 RUNTIME_VERSION, batch_size, params.get('max_length'), allow_split)
+    # Record explicit policy changes if one instance is reused by a caller.
+    stats['oom_split_enabled'] = allow_split
+    if allow_split not in stats['oom_split_policies_seen']:
+        stats['oom_split_policies_seen'].append(allow_split)
+    if batch_size not in stats['requested_batch_sizes']:
+        stats['requested_batch_sizes'].append(batch_size)
     chunks = []
     with torch.no_grad(), tqdm(total=len(texts), desc='Batch Encoding',
                                disable=len(texts) <= batch_size) as progress:
         for start in range(0, len(texts), batch_size):
             current = texts[start:start + batch_size]
-            chunks.append(_encode_cpu(model, current, params, stats))
+            chunks.append(_encode_cpu(model, current, params, stats, allow_split))
             stats['encoded_texts'] += len(current)
             progress.update(len(current))
     results = torch.cat(chunks, dim=0).numpy()

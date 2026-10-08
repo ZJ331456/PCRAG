@@ -1,6 +1,7 @@
 """CPU checks for the OOM retry boundary and unchanged embedding semantics."""
 
 import importlib.util
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -40,11 +41,13 @@ def holder(capacity=100, norm=False):
 class NVEmbedRuntimeTests(unittest.TestCase):
     def test_retry_preserves_all_original_rows_order_and_parameters(self):
         model = holder(capacity=2)
-        with patch.object(runtime.torch.cuda, 'empty_cache') as empty_cache:
+        with patch.dict(os.environ, {'PATHCONDRAG_NVEMBED_OOM_SPLIT': 'true'}), \
+                patch.object(runtime.torch.cuda, 'empty_cache') as empty_cache:
             actual = runtime.memory_bounded_batch_encode(
                 model, ['1', '2', '3', '4', '5'], instruction='Find supporting passages')
         np.testing.assert_array_equal(actual, [[1, 2], [2, 3], [3, 4], [4, 5], [5, 6]])
         self.assertEqual(model._nvembed_execution_stats['cuda_oom_splits'], 1)
+        self.assertTrue(model._nvembed_execution_stats['oom_split_enabled'])
         self.assertEqual(model._nvembed_execution_stats['encoded_texts'], 5)
         empty_cache.assert_called_once()
         self.assertFalse(model.embedding_model.embedding_model.config.use_cache)
@@ -52,6 +55,33 @@ class NVEmbedRuntimeTests(unittest.TestCase):
             self.assertEqual(params['instruction'], 'Instruct: Find supporting passages\nQuery: ')
             self.assertEqual(params['max_length'], 2048)
         self.assertEqual(model.embedding_config.encode_params['instruction'], '')
+
+    def test_disabled_split_raises_on_original_four_text_batch_without_retry(self):
+        model = holder(capacity=2)
+        texts = ['1', '2', '3', '4']
+        with patch.dict(os.environ, {'PATHCONDRAG_NVEMBED_OOM_SPLIT': 'false'}), \
+                patch.object(runtime.torch.cuda, 'empty_cache') as empty_cache:
+            with self.assertRaises(torch.cuda.OutOfMemoryError):
+                runtime.memory_bounded_batch_encode(model, texts, instruction='Find supporting passages')
+        self.assertEqual(len(model.embedding_model.calls), 1)
+        prompts, params = model.embedding_model.calls[0]
+        self.assertEqual(prompts, texts)
+        self.assertEqual(params['max_length'], 2048)
+        self.assertEqual(params['instruction'], 'Instruct: Find supporting passages\nQuery: ')
+        self.assertFalse(model._nvembed_execution_stats['oom_split_enabled'])
+        self.assertEqual(model._nvembed_execution_stats['cuda_oom_splits'], 0)
+        self.assertEqual(model._nvembed_execution_stats['cuda_oom_events'], 1)
+        self.assertEqual(model._nvembed_execution_stats['encoded_texts'], 0)
+        empty_cache.assert_not_called()
+
+    def test_unset_split_policy_defaults_to_true_and_invalid_policy_is_rejected(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(runtime._oom_split_enabled())
+        model = holder()
+        with patch.dict(os.environ, {'PATHCONDRAG_NVEMBED_OOM_SPLIT': 'flase'}):
+            with self.assertRaisesRegex(ValueError, 'must be true or false'):
+                runtime.memory_bounded_batch_encode(model, ['1', '2', '3', '4'])
+        self.assertEqual(model.embedding_model.calls, [])
 
     def test_single_passage_oom_is_a_real_failure_not_empty_or_truncated_output(self):
         model = holder(capacity=0)

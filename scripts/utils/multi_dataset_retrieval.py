@@ -55,6 +55,7 @@ def environment(args):
                PATHCONDRAG_SHARED_KNN_DEVICE='cpu', HIPPORAG_KNN_DEVICE='cpu',
                HIPPO_EMBEDDING_MODEL_NAME=model, HIPPO_EMBEDDING_BASE_URL='',
                HIPPO_ROOT=getattr(args, 'hippo_root', '/root/baseline/HippoRAG'))
+    env['PATHCONDRAG_NVEMBED_OOM_SPLIT'] = env.get('PATHCONDRAG_NVEMBED_OOM_SPLIT', 'false')
     return env
 
 

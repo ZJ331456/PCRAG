@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from copy import copy
 from pathlib import Path
 
@@ -96,6 +97,7 @@ def run(args):
         'datasets': list(base.DATASETS), 'methods': list(METHODS), 'smoke': args.smoke,
         'embedding_model': args.embedding_model, 'embedding_provider': args.embedding_provider,
         'embedding_batch_size': args.embedding_batch_size, 'llm_name': 'qwen3-8b',
+        'nv_embedding_oom_split': parse_bool(os.environ.get('PATHCONDRAG_NVEMBED_OOM_SPLIT', 'false')),
         'llm_base_url': args.llm_base_url, 'llm_workers': 8, 'index_workers': 8,
         'max_new_tokens': 2048, 'thinking': False, 'hop_source': 'benchmark',
         'openie_strict': args.openie_strict, 'openie_prompt_version': args.openie_prompt_version,
