@@ -446,9 +446,17 @@ def validate_fresh_index(out, index, docs, *, strict=True):
     execution = _read(execution_path) if execution_path.is_file() else None
     trace = execution.get("shared_knn_execution", execution) if isinstance(execution, dict) else execution
     if trace is not None:
-        _require(isinstance(trace, dict) and trace.get("device") == "cuda"
+        device = trace.get('device') if isinstance(trace, dict) else None
+        valid_batches = (isinstance(trace, dict) and all(
+            type(trace.get(field)) is int and trace[field] > 0
+            for field in ('query_batch_size', 'key_batch_size')))
+        # CUDA builds use the fixed measured profile. CPU builds retain their
+        # actual native batch settings and export those settings explicitly.
+        if device == 'cuda':
+            valid_batches = valid_batches and trace.get('query_batch_size') == 1000 \
+                and trace.get('key_batch_size') == 16384
+        _require(isinstance(trace, dict) and device in {'cuda', 'cpu'} and valid_batches
                  and trace.get("dtype") == "float32" and trace.get("allow_tf32") is False
-                 and trace.get("query_batch_size") == 1000 and trace.get("key_batch_size") == 16384
                  and trace.get("native_cosine_topk_and_threshold_unchanged") is True
                  and trace.get("complete") is True,
                  "Observed shared KNN execution profile is inconsistent")

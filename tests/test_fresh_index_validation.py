@@ -221,6 +221,21 @@ class FreshIndexValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "KNN execution profile"):
             self.validate()
 
+    def test_cpu_knn_trace_keeps_native_batches_and_rejects_invalid_profile(self):
+        trace = {"device": "cpu", "dtype": "float32", "allow_tf32": False,
+                 "query_batch_size": 1000, "key_batch_size": 10000,
+                 "native_cosine_topk_and_threshold_unchanged": True, "complete": True}
+        self.json(self.model / "shared_build_execution.json", trace)
+        observed = self.validate()['shared_knn_execution']
+        self.assertTrue(observed['observed'])
+        self.assertEqual(observed['trace']['device'], 'cpu')
+        for field, invalid in [('complete', False), ('device', 'automatic'),
+                               ('key_batch_size', 0), ('dtype', 'float16')]:
+            changed = {**trace, field: invalid}
+            self.json(self.model / "shared_build_execution.json", changed)
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'KNN execution profile'):
+                self.validate()
+
     def test_strict_normal_extraction_cannot_bypass_source_audit(self):
         self.profile.update(semantic_scope='all_final_relations',
                             fresh_recovery_semantic_verifier=VERIFIER_VERSION)

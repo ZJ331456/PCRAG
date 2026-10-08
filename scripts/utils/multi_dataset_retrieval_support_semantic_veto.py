@@ -10,6 +10,7 @@ import logging
 import shutil
 import urllib.request
 from dataclasses import asdict
+from copy import copy
 from pathlib import Path
 
 from . import exp4_improvements as previous
@@ -265,14 +266,16 @@ def run(args):
     before_code = previous.code_hashes(Path(args.hippo_root))
     contexts = {dataset: previous.context_for(out, dataset, support) for dataset in previous.DATASETS}
     runtime = next(iter(contexts.values()))['manifest']['runtime']
-    if 'Qwen3-Embedding-8B' not in runtime['embedding_model_name'] or runtime['embedding_batch_size'] != 4:
-        raise ValueError('This experiment requires the existing Qwen3-Embedding-8B indexes with batch=4')
+    if int(runtime['embedding_batch_size']) <= 0:
+        raise ValueError('The frozen index must record a positive embedding batch size')
     selected = {}
     for dataset, context in contexts.items():
         if context['manifest']['runtime'] != runtime:
             raise ValueError(f'{dataset}: dataset embedding runtime differs')
         context['clone_source'] = context['source']
-        indices = list(SMOKE_INDICES[dataset] if args.smoke else context['manifest']['selected_indices'])
+        preferred = SMOKE_INDICES[dataset]
+        indices = list(preferred if args.smoke and max(preferred) < len(context['data'])
+                       else context['manifest']['selected_indices'])
         if len(indices) != len(set(indices)) or any(not 0 <= index < len(context['data']) for index in indices):
             raise ValueError(f'{dataset}: invalid selected question indices')
         if not args.smoke and set(indices) != set(range(len(context['data']))):
@@ -282,7 +285,8 @@ def run(args):
         'case': CASE_NAME, 'variant': dict(asdict(VARIANT), flags=list(VARIANT.flags)),
         'smoke': args.smoke, 'shared_indexes': str(out / 'shared_indexes'),
         'datasets': list(previous.DATASETS), 'embedding_model': runtime['embedding_model_name'],
-        'embedding_provider': runtime.get('embedding_provider'), 'embedding_batch_size': 4,
+        'embedding_provider': runtime.get('embedding_provider'),
+        'embedding_batch_size': runtime['embedding_batch_size'],
         'llm_prefetch_workers': 8, 'openie_max_workers': 8,
         'hop_source': 'benchmark', 'max_new_tokens': 2048, 'thinking': False,
         'result_top_k': 10, 'candidate_output_top_k': 200, 'eval_mode': 'retrieve',
@@ -293,7 +297,14 @@ def run(args):
     if protocol_file.exists() and read_json(protocol_file) != protocol:
         raise ValueError('Existing workflow protocol differs; inspect before retrying')
     write_json(protocol_file, protocol)
-    env = previous.environment(args)
+    if 'NV-Embed' in runtime['embedding_model_name']:
+        from .multi_dataset_retrieval import environment as nv_environment
+        nv_args = copy(args)
+        nv_args.embedding_model = runtime['embedding_model_name']
+        nv_args.embedding_provider = runtime.get('embedding_provider', 'nvembed')
+        env = nv_environment(nv_args)
+    else:
+        env = previous.environment(args)
     env['PYTHONHASHSEED'] = '42'
     reports, statuses = {}, {}
     for dataset, context in contexts.items():

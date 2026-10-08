@@ -20,7 +20,7 @@ from pathcondrag.index.publication_policy import parse_bool
 from . import improvement_experiments as experiments
 from .common import read_json, write_json
 from .new_index_compare import (
-    ALL_ASSETS, CASES, PC_ARGUMENTS, ROOT, code_hashes, environment, execute,
+    ALL_ASSETS, CASES, PC_ARGUMENTS, ROOT, code_hashes, environment as qwen_environment, execute,
 )
 
 DATASETS = ('hotpotqa', '2wikimultihopqa', 'musique')
@@ -28,6 +28,34 @@ DEFAULT_OUT = ROOT / 'outputs/3multi_hop_datasets_results_10_5'
 DEFAULT_RUNTIME = Path('/root/.cache/pathcondrag/runtime_deps_qwen3_tf4513')
 SMOKE_POSITIONS = {'hotpotqa': (140, 901), '2wikimultihopqa': (866, 966), 'musique': (808, 930)}
 LOG = logging.getLogger('multi_dataset_retrieval')
+
+
+def environment(args):
+    """Keep NV-Embed in its own runtime; Qwen embeddings need isolated deps."""
+    model = getattr(args, 'embedding_model', experiments.EMBEDDING_MODEL)
+    provider = getattr(args, 'embedding_provider', experiments.DEFAULT_EMBEDDING_PROVIDER)
+    if provider != 'nvembed' and 'NV-Embed' not in model:
+        return qwen_environment(args)
+    env = os.environ.copy()
+    # Never put Qwen3's transformers/accelerate bundle before the NV runtime.
+    parts = [part for part in env.get('PYTHONPATH', '').split(os.pathsep)
+             if part and 'runtime_deps_qwen3' not in part
+             and Path(part).resolve() != DEFAULT_RUNTIME.resolve()]
+    if parts:
+        env['PYTHONPATH'] = os.pathsep.join(parts)
+    else:
+        env.pop('PYTHONPATH', None)
+    env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1', PYTHONHASHSEED='42',
+               TOKENIZERS_PARALLELISM='false',
+               OPENAI_API_KEY=env.get('OPENAI_API_KEY', 'EMPTY'),
+               PATHCONDRAG_LLM_MAX_IN_FLIGHT='8', HIPPORAG_LLM_MAX_IN_FLIGHT='8',
+               HIPPO_OPENIE_MAX_WORKERS='8', HIPPO_OPENIE_NER_WORKERS='8',
+               HIPPO_OPENIE_TRIPLE_WORKERS='8', HIPPO_OPENIE_NER_MAX_TOKENS='512',
+               HIPPO_OPENIE_TRIPLE_MAX_TOKENS='2048', HIPPO_OPENIE_QUALITY_MAX_RETRIES='2',
+               PATHCONDRAG_SHARED_KNN_DEVICE='cpu', HIPPORAG_KNN_DEVICE='cpu',
+               HIPPO_EMBEDDING_MODEL_NAME=model, HIPPO_EMBEDDING_BASE_URL='',
+               HIPPO_ROOT=getattr(args, 'hippo_root', '/root/baseline/HippoRAG'))
+    return env
 
 
 def sample_id(sample, position):
@@ -51,6 +79,18 @@ def smoke_dataset(out, source, name):
     for documents in get_gold_docs(samples, name):
         for document in documents:
             selected[document] = by_text[document]
+    # Include the historical NV2 OOM passages and a longest intact passage.
+    # Short-only fixtures cannot exercise full-length encoder memory peaks.
+    if 'NV-Embed' in os.environ.get('HIPPO_EMBEDDING_MODEL_NAME', ''):
+        historical = {'hotpotqa': 'Nashville Terminal Subdivision',
+                      '2wikimultihopqa': 'Pattom A. Thanu Pillai'}
+        title = historical.get(name)
+        for row in corpus:
+            text = experiments.passage_text(row)
+            if title and text.partition('\n')[0].strip() == title:
+                selected[text] = row
+        longest = max(corpus, key=lambda row: len(experiments.passage_text(row)))
+        selected[experiments.passage_text(longest)] = longest
     # A bounded smoke still uses complete original passages and original gold.
     for row in sorted(corpus, key=lambda item: (len(experiments.passage_text(item)),
                                                experiments.passage_text(item))):
@@ -93,13 +133,17 @@ def commands(args, metadata, index, datasets, name):
     options = ['--openie_strict', str(args.openie_strict).lower(),
                '--openie_prompt_version', args.openie_prompt_version]
     validation = ['--openie_validation_mode', getattr(args, 'openie_validation_mode', 'structural')]
+    embedding_model = getattr(args, 'embedding_model', experiments.EMBEDDING_MODEL)
+    embedding_provider = getattr(args, 'embedding_provider', experiments.DEFAULT_EMBEDDING_PROVIDER)
+    embedding_batch_size = str(getattr(args, 'embedding_batch_size', experiments.DEFAULT_EMBEDDING_BATCH_SIZE))
     common = ['--dataset', name, '--sample_size', '2' if args.smoke else '0',
               '--sample_seed', '42', '--sample_indices_file', str(metadata / 'selected_indices.json'),
               '--llm_name', 'qwen3-8b', '--llm_base_url', args.llm_base_url,
-              '--embedding_batch_size', '4', '--openie_max_workers', '8', '--llm_prefetch_workers', '8']
+              '--embedding_batch_size', embedding_batch_size,
+              '--openie_max_workers', '8', '--llm_prefetch_workers', '8']
     builder = [args.python, '-B', '-u', str(ROOT / 'scripts/build_shared_index.py')] + common + options + validation + [
         '--datasets_dir', str(datasets), '--rag_type', 'hipporag',
-        '--embedding_name', experiments.EMBEDDING_MODEL, '--embedding_provider', 'transformers',
+        '--embedding_name', embedding_model, '--embedding_provider', embedding_provider,
         '--openie_mode', 'online', '--eval_mode', 'index_only',
         '--force_index_from_scratch', 'true', '--force_openie_from_scratch', 'true',
         '--save_dir_exact', '--save_dir', str(index),
@@ -110,16 +154,19 @@ def commands(args, metadata, index, datasets, name):
     for case_name in CASES:
         case = metadata / 'cases' / case_name
         if case_name == 'hipporag2':
-            command = [args.python, '-B', '-u', str(Path(args.hippo_root) / 'main.py')] + retrieval + [
+            main = (ROOT / 'scripts/nvembed_baseline.py'
+                    if embedding_provider == 'nvembed' or 'NV-Embed' in embedding_model
+                    else Path(args.hippo_root) / 'main.py')
+            command = [args.python, '-B', '-u', str(main)] + retrieval + [
                 '--datasets_dir', str(datasets), '--rag_type', 'hipporag',
-                '--embedding_name', experiments.EMBEDDING_MODEL, '--embedding_provider', 'transformers',
+                '--embedding_name', embedding_model, '--embedding_provider', embedding_provider,
                 '--save_dir_exact']
         else:
             command = [args.python, '-B', '-u', str(ROOT / 'scripts/eval_dataset.py')] + retrieval + PC_ARGUMENTS + options + validation + [
                 '--data_path', str(datasets / f'{name}.json'),
                 '--corpus_path', str(datasets / f'{name}_corpus.json'),
                 '--corpus_mode', 'full', '--qa_top_k', '5', '--max_qa_steps', '1', '--max_new_tokens', '2048',
-                '--embedding_model_name', experiments.EMBEDDING_MODEL,
+                '--embedding_model_name', embedding_model,
                 '--improvement_stage', '0' if case_name == 'pathcondrag_original' else '4',
                 '--stratified_eval', '--stratified_output', str(case / 'stratified.json')]
         cases[case_name] = command + ['--save_dir', str(case / 'index'), '--output', str(case / 'result.json')]
@@ -179,7 +226,11 @@ def initialize_linked_case(metadata, case_name):
 
 
 def frozen_hashes(index):
-    hashes = {name: experiments.sha256(index / experiments.MODEL_DIR / name) for name in ALL_ASSETS}
+    candidates = list(index.glob('*/index_manifest.json'))
+    if len(candidates) != 1:
+        raise ValueError(f'Expected one model-specific index manifest under {index}')
+    directory = candidates[0].parent
+    hashes = {name: experiments.sha256(directory / name) for name in ALL_ASSETS}
     hashes['openie_results_ner_qwen3-8b.json'] = experiments.sha256(index / 'openie_results_ner_qwen3-8b.json')
     return hashes
 
@@ -205,6 +256,9 @@ def publish_summary(out, statuses):
 
 
 def run(args):
+    args.embedding_model = getattr(args, 'embedding_model', experiments.EMBEDDING_MODEL)
+    args.embedding_provider = getattr(args, 'embedding_provider', experiments.DEFAULT_EMBEDDING_PROVIDER)
+    args.embedding_batch_size = getattr(args, 'embedding_batch_size', experiments.DEFAULT_EMBEDDING_BATCH_SIZE)
     out = Path(args.out_root).resolve()
     if not out.is_relative_to(ROOT / 'outputs') or out == ROOT / 'outputs':
         raise ValueError('Output must be a dedicated directory under PathCondRAG/outputs')
@@ -223,12 +277,16 @@ def run(args):
     baseline_code = code_hashes(Path(args.hippo_root))
     env = environment(args)
     env['HIPPO_ALLOW_INDEX_RESUME'] = '1'
+    env['HIPPO_EMBEDDING_MODEL_NAME'] = args.embedding_model
+    env['HIPPO_EMBEDDING_BASE_URL'] = ''
     prepared, statuses = {}, {}
     stage_file = out / 'stage_status.json'
     protocol = {'datasets': list(DATASETS), 'cases': list(CASES), 'smoke': args.smoke,
                 'openie_strict': args.openie_strict, 'openie_prompt_version': args.openie_prompt_version,
                 'openie_validation_mode': getattr(args, 'openie_validation_mode', 'structural'),
-                'embedding_model': experiments.EMBEDDING_MODEL, 'embedding_batch_size': 4,
+                'embedding_model': args.embedding_model,
+                'embedding_provider': args.embedding_provider,
+                'embedding_batch_size': args.embedding_batch_size,
                 'llm_name': 'qwen3-8b', 'llm_workers': 8, 'ner_max_tokens': 512,
                 'triple_max_tokens': 2048, 'enable_thinking': False,
                 'retrieval_top_k': 200, 'result_top_k': 10, 'candidate_output_top_k': 200}
@@ -254,7 +312,10 @@ def run(args):
                 shared_output_root=str(out), dataset=name,
                 data_path=str(datasets / f'{name}.json'), corpus_path=str(datasets / f'{name}_corpus.json'),
                 sample_size=2 if args.smoke else 0, sample_seed=42, sample_indices_file=None,
-                cases=' '.join(CASES), build_shared_index=True)
+                cases=' '.join(CASES), build_shared_index=True,
+                embedding_model=args.embedding_model,
+                embedding_provider=args.embedding_provider,
+                embedding_batch_size=args.embedding_batch_size)
             experiments.prepare(options)
             builder, cases = commands(args, metadata, index, datasets, name)
             if experiments.index_ready(options) != 0:
@@ -279,6 +340,19 @@ def run(args):
         except Exception as error:
             LOG.exception('[failed] %s', stage)
             record(stage, 'failed', error=f'{type(error).__name__}: {error}')
+
+    if getattr(args, 'indexes_only', False):
+        failed = {stage: value for stage, value in statuses.items() if value['state'] != 'ready'}
+        if failed:
+            write_json(out / 'failed_stages.json', failed)
+            return 1
+        write_json(out / 'indexes_completed.ok', {
+            'datasets': list(DATASETS), 'smoke': args.smoke,
+            'embedding_model': args.embedding_model,
+            'embedding_batch_size': args.embedding_batch_size,
+        })
+        LOG.info('[done] all three shared indexes validated: %s', out)
+        return 0
 
     for name in DATASETS:
         if name not in prepared:
@@ -335,6 +409,8 @@ def main(argv=None):
     parser.add_argument('--llm-base-url', default='http://127.0.0.1:8035/v1')
     parser.add_argument('--vllm-log', default=str(DEFAULT_OUT / 'logs/vllm.log'))
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--indexes-only', action='store_true',
+                        help='Build and validate all three indexes; defer retrieval to a later invocation.')
     parser.add_argument('--openie-strict', '--openie_strict', type=parse_bool, default=False)
     parser.add_argument('--openie-prompt-version', '--openie_prompt_version',
                         choices=['origin', 'optimized'], default='optimized')
@@ -342,6 +418,12 @@ def main(argv=None):
                         choices=['structural', 'source_verified'], default='structural',
                         help='Structural checks match the normal HippoRAG extraction cost; '
                              'source_verified adds expensive LLM evidence audits.')
+    parser.add_argument('--embedding-model', '--embedding_model',
+                        default=experiments.EMBEDDING_MODEL)
+    parser.add_argument('--embedding-provider', '--embedding_provider',
+                        default=experiments.DEFAULT_EMBEDDING_PROVIDER)
+    parser.add_argument('--embedding-batch-size', '--embedding_batch_size', type=int,
+                        default=experiments.DEFAULT_EMBEDDING_BATCH_SIZE)
     args = parser.parse_args(argv)
     args.out_root = args.out_root or str(DEFAULT_OUT.with_name(DEFAULT_OUT.name + '_smoke') if args.smoke else DEFAULT_OUT)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')

@@ -42,6 +42,37 @@ class NativeStub:
 
 
 class SharedIndexBuilderTests(unittest.TestCase):
+    def test_cpu_knn_releases_nv_weights_and_exports_actual_execution(self):
+        class NativeKNNStub:
+            def add_synonymy_edges(self, query_node_keys=None):
+                self.native_device = os.environ.get('HIPPORAG_KNN_DEVICE')
+                self.native_weights = self.embedding_model.embedding_model
+                return query_node_keys
+
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter = quality_hipporag_class(NativeKNNStub)
+            instance = adapter.__new__(adapter)
+            instance.working_dir = temporary
+            instance.embedding_model = SimpleNamespace(
+                embedding_model=object(), _nvembed_execution_stats={'encoded_texts': 10})
+            instance.global_config = SimpleNamespace(
+                synonymy_edge_query_batch_size=7, synonymy_edge_key_batch_size=11)
+            with patch.dict(os.environ, {'PATHCONDRAG_SHARED_KNN_DEVICE': 'cpu',
+                                         'HIPPORAG_KNN_DEVICE': 'previous'}):
+                result = instance.add_synonymy_edges(['entity-test'])
+                self.assertEqual(os.environ['HIPPORAG_KNN_DEVICE'], 'previous')
+            self.assertEqual(result, ['entity-test'])
+            self.assertEqual(instance.native_device, 'cpu')
+            self.assertIsNone(instance.native_weights)
+            self.assertEqual(instance.global_config.synonymy_edge_query_batch_size, 7)
+            trace = json.loads((Path(temporary) / 'shared_build_execution.json').read_text())
+            self.assertEqual(trace['device'], 'cpu')
+            self.assertEqual(trace['query_batch_size'], 7)
+            self.assertEqual(trace['key_batch_size'], 11)
+            self.assertEqual(trace['released_embedding_attributes'], ['embedding_model'])
+            self.assertEqual(trace['embedding_execution']['encoded_texts'], 10)
+            self.assertTrue(trace['complete'])
+
     def make_runtime(self, directory):
         runtime_class = quality_hipporag_class(NativeStub)
         runtime = runtime_class.__new__(runtime_class)
@@ -182,25 +213,35 @@ class SharedIndexBuilderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / 'main.py').write_text('# fake baseline entry')
             native_class, native_openie = NativeStub, object()
-            module = SimpleNamespace(HippoRAG=native_class, OpenIE=native_openie)
+            class NativeNVStub:
+                def batch_encode(self, texts):
+                    return texts
+            original_encode = NativeNVStub.batch_encode
+            module = SimpleNamespace(HippoRAG=native_class, OpenIE=native_openie,
+                                     NVEmbedV2EmbeddingModel=NativeNVStub)
             argv_before, path_before = list(sys.argv), list(sys.path)
             bytecode_before = sys.dont_write_bytecode
 
             def run_entry(path, run_name):
                 self.assertEqual(run_name, '__main__')
-                self.assertEqual(sys.argv[1:], ['--eval_mode', 'index_only', '--embedding_batch_size', '4'])
+                self.assertEqual(sys.argv[1:], ['--eval_mode', 'index_only', '--embedding_batch_size', '4',
+                                               '--embedding_provider', 'nvembed'])
                 self.assertIs(module.OpenIE, SharedQualityOpenIE)
                 self.assertTrue(issubclass(module.HippoRAG, native_class))
                 self.assertTrue(sys.dont_write_bytecode)
+                from pathcondrag.embedding_model.nvembed_runtime import memory_bounded_batch_encode
+                self.assertIs(NativeNVStub.batch_encode, memory_bounded_batch_encode)
                 raise SystemExit(0)
 
             with patch('pathcondrag.index.shared_index_builder.importlib.import_module', return_value=module), \
                     patch('pathcondrag.index.shared_index_builder.runpy.run_path', side_effect=run_entry):
                 with self.assertRaises(SystemExit):
                     run_shared_index_cli(['--eval_mode', 'index_only', '--embedding_batch_size', '4',
+                                          '--embedding_provider', 'nvembed',
                                           '--openie_validation_mode', 'source_verified'], hippo_root=tmp)
             self.assertIs(module.OpenIE, native_openie)
             self.assertIs(module.HippoRAG, native_class)
+            self.assertIs(NativeNVStub.batch_encode, original_encode)
             self.assertEqual(sys.argv, argv_before)
             self.assertEqual(sys.path, path_before)
             self.assertEqual(sys.dont_write_bytecode, bytecode_before)

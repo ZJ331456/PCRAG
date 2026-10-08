@@ -7,6 +7,7 @@ this overlay is not a claim that the original v1 prompts were used unchanged.
 """
 
 import argparse
+from contextlib import nullcontext
 import copy
 import gc
 import hashlib
@@ -340,33 +341,44 @@ def quality_hipporag_class(native_class, *, openie_strict=True, prompt_version='
             return rows, pending
 
         def add_synonymy_edges(self, query_node_keys=None):
-            if os.environ.get('PATHCONDRAG_SHARED_KNN_DEVICE', '').strip().lower() != 'cuda':
+            requested_device = os.environ.get('PATHCONDRAG_SHARED_KNN_DEVICE', '').strip().lower()
+            if requested_device not in {'cpu', 'cuda'}:
                 return super().add_synonymy_edges(query_node_keys)
             import torch
-            if not torch.cuda.is_available():
+            if requested_device == 'cuda' and not torch.cuda.is_available():
                 raise RuntimeError('PATHCONDRAG_SHARED_KNN_DEVICE=cuda requires an available CUDA device.')
             # Native index() encodes all chunk/entity/fact vectors before this
             # call. A build-only entry can release the encoder while KNN uses
             # the already stored vectors; no subsequent encoding is performed.
-            if hasattr(self.embedding_model, 'model'):
-                self.embedding_model.model = None
+            released_attributes = []
+            for attribute in ('model', 'embedding_model'):
+                if getattr(self.embedding_model, attribute, None) is not None:
+                    setattr(self.embedding_model, attribute, None)
+                    released_attributes.append(attribute)
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
             config = self.global_config
             previous_batches = (config.synonymy_edge_query_batch_size,
                                 config.synonymy_edge_key_batch_size)
             previous_device = os.environ.get('HIPPORAG_KNN_DEVICE')
             previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-            config.synonymy_edge_query_batch_size = 1000
-            config.synonymy_edge_key_batch_size = 16384
-            os.environ['HIPPORAG_KNN_DEVICE'] = 'cuda'
+            if requested_device == 'cuda':
+                config.synonymy_edge_query_batch_size = 1000
+                config.synonymy_edge_key_batch_size = 16384
+            os.environ['HIPPORAG_KNN_DEVICE'] = requested_device
             torch.backends.cuda.matmul.allow_tf32 = False
             self._shared_knn_execution = {
-                'device': 'cuda', 'dtype': 'float32', 'allow_tf32': False,
-                'query_batch_size': 1000, 'key_batch_size': 16384,
-                'embedding_model_released_after_encoding': True,
+                'device': requested_device, 'dtype': 'float32', 'allow_tf32': False,
+                'query_batch_size': config.synonymy_edge_query_batch_size,
+                'key_batch_size': config.synonymy_edge_key_batch_size,
+                'embedding_model_released_after_encoding': bool(released_attributes),
+                'released_embedding_attributes': released_attributes,
                 'native_cosine_topk_and_threshold_unchanged': True,
             }
+            embedding_execution = getattr(self.embedding_model, '_nvembed_execution_stats', None)
+            if embedding_execution is not None:
+                self._shared_knn_execution['embedding_execution'] = copy.deepcopy(embedding_execution)
             try:
                 result = super().add_synonymy_edges(query_node_keys)
                 self._shared_knn_execution['complete'] = True
@@ -471,6 +483,9 @@ def run_shared_index_cli(argv=None, *, hippo_root=None):
     parser.add_argument('--eval_mode', default='rag_qa')
     parser.add_argument('--openie_mode', default='online')
     parser.add_argument('--rag_type', default='hipporag')
+    parser.add_argument('--embedding_name', default=os.environ.get(
+        'HIPPO_EMBEDDING_MODEL_NAME', 'nvidia/NV-Embed-v2'))
+    parser.add_argument('--embedding_provider', default=None)
     parsed, _ = parser.parse_known_args(argv)
     if '--help' not in argv and '-h' not in argv:
         if parsed.eval_mode != 'index_only' or parsed.openie_mode != 'online' or parsed.rag_type != 'hipporag':
@@ -504,14 +519,21 @@ def run_shared_index_cli(argv=None, *, hippo_root=None):
             prompt_version=path_options.openie_prompt_version,
             validation_mode=path_options.openie_validation_mode)
         sys.argv = [str(main_path), *argv]
-        if not path_options.openie_strict or path_options.openie_validation_mode == 'structural':
-            from .build_report import tolerant_index_build_report
-            entry = runpy.run_path(str(main_path), run_name='__pathcondrag_shared_main__')
-            # The report is owned by the baseline entry, not its imported class.
-            # Replace only this invocation's globals; leave the checkout intact.
-            entry['main'].__globals__['index_build_report'] = tolerant_index_build_report
-            return entry['main']()
-        return runpy.run_path(str(main_path), run_name='__main__')
+        uses_nvembed = (parsed.embedding_provider == 'nvembed' or (
+            parsed.embedding_provider is None and 'NV-Embed-v2' in parsed.embedding_name))
+        embedding_context = nullcontext()
+        if uses_nvembed:
+            from ..embedding_model.nvembed_runtime import baseline_nvembed_runtime
+            embedding_context = baseline_nvembed_runtime()
+        with embedding_context:
+            if not path_options.openie_strict or path_options.openie_validation_mode == 'structural':
+                from .build_report import tolerant_index_build_report
+                entry = runpy.run_path(str(main_path), run_name='__pathcondrag_shared_main__')
+                # The report is owned by the baseline entry, not its imported class.
+                # Replace only this invocation's globals; leave the checkout intact.
+                entry['main'].__globals__['index_build_report'] = tolerant_index_build_report
+                return entry['main']()
+            return runpy.run_path(str(main_path), run_name='__main__')
     finally:
         if module is not None and original_class is not None:
             module.HippoRAG, module.OpenIE = original_class, original_openie

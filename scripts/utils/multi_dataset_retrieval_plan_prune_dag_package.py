@@ -11,6 +11,7 @@ import logging
 import shutil
 import urllib.request
 from dataclasses import asdict
+from copy import copy
 from pathlib import Path
 
 from . import exp4_improvements as previous
@@ -123,23 +124,44 @@ def run(args):
     for context in contexts.values():
         # Link graph/vector assets from the public index, never rebuild them.
         context['clone_source'] = context['source']
+    embedding_runtime = next(iter(contexts.values()))['manifest']['runtime']
+
+    def selected_for(dataset, context):
+        if not args.smoke:
+            return list(context['manifest']['selected_indices'])
+        preferred = SMOKE_INDICES[dataset]
+        # Full-index smoke keeps the historical two-question fixtures; tiny
+        # disposable smoke indexes fall back to the shared-index sample.
+        if max(preferred) < len(context['data']):
+            return preferred
+        return list(context['manifest']['selected_indices'])
+
     protocol = {
         'case': CASE_NAME, 'variant': dict(asdict(VARIANT), flags=list(VARIANT.flags)),
         'smoke': args.smoke,
         'shared_indexes': str(out / 'shared_indexes'), 'datasets': list(previous.DATASETS),
-        'embedding_batch_size': 4, 'llm_prefetch_workers': 8, 'openie_max_workers': 8,
+        'embedding_model': embedding_runtime['embedding_model_name'],
+        'embedding_provider': embedding_runtime.get('embedding_provider'),
+        'embedding_batch_size': embedding_runtime['embedding_batch_size'],
+        'llm_prefetch_workers': 8, 'openie_max_workers': 8,
         'hop_source': 'benchmark', 'max_new_tokens': 2048, 'thinking': False,
         'result_top_k': 10, 'candidate_output_top_k': 200, 'eval_mode': 'retrieve',
         'cache_policy': 'Private original-exp4 warm-cache snapshot, matching the existing full plan_prune runner',
-        'selected_indices': {dataset: SMOKE_INDICES[dataset] if args.smoke else
-                             list(context['manifest']['selected_indices'])
+        'selected_indices': {dataset: selected_for(dataset, context)
                              for dataset, context in contexts.items()},
     }
     protocol_file = work / 'metadata' / f'{CASE_NAME}_protocol.json'
     if protocol_file.exists() and read_json(protocol_file) != protocol:
         raise ValueError('Existing workflow protocol differs; inspect before retrying')
     write_json(protocol_file, protocol)
-    env = previous.environment(args)
+    if 'NV-Embed' in str(embedding_runtime.get('embedding_model_name', '')):
+        from .multi_dataset_retrieval import environment as nv_environment
+        nv_args = copy(args)
+        nv_args.embedding_model = embedding_runtime['embedding_model_name']
+        nv_args.embedding_provider = embedding_runtime.get('embedding_provider', 'nvembed')
+        env = nv_environment(nv_args)
+    else:
+        env = previous.environment(args)
     env['PYTHONHASHSEED'] = '42'
     reports, statuses = {}, {}
     for dataset, context in contexts.items():
@@ -161,6 +183,7 @@ def run(args):
                                  'seconds': report['seconds']}
         except Exception as error:
             LOG.exception('[failed] %s', dataset)
+            (case / 'validated.ok').unlink(missing_ok=True)
             statuses[dataset] = {'state': 'failed', 'error': f'{type(error).__name__}: {error}'}
         write_json(work / 'metadata' / f'{CASE_NAME}_stage_status.json', statuses)
         publish_summary(work, reports, statuses)

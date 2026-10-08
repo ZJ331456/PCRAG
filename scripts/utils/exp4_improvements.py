@@ -219,17 +219,20 @@ def initialize_case(context, case):
 
 def command(args, context, case, indices, flags):
     manifest = context['manifest']
+    runtime = manifest['runtime']
     return [args.python, '-B', '-u', str(ROOT / 'scripts/eval_dataset.py'),
         '--dataset', context['dataset'], '--sample_size', str(len(indices)),
         '--sample_seed', '42', '--sample_indices_file', str(case / 'selected_indices.json'),
         '--llm_name', 'qwen3-8b', '--llm_base_url', args.llm_base_url,
-        '--embedding_batch_size', '4', '--openie_max_workers', '8', '--llm_prefetch_workers', '8',
+        '--embedding_batch_size', str(runtime['embedding_batch_size']),
+        '--openie_max_workers', '8', '--llm_prefetch_workers', '8',
         '--eval_mode', 'retrieve', '--retrieval_top_k', '200', '--result_top_k', '10',
         '--candidate_output_top_k', '200', '--reuse_index',
         *PC_ARGUMENTS,
         '--data_path', manifest['data_path'], '--corpus_path', manifest['corpus_path'],
         '--corpus_mode', 'full', '--qa_top_k', '5', '--max_qa_steps', '1',
-        '--max_new_tokens', '2048', '--embedding_model_name', experiments.EMBEDDING_MODEL,
+        '--max_new_tokens', '2048',
+        '--embedding_model_name', runtime['embedding_model_name'],
         '--openie_strict', 'false', '--openie_prompt_version', 'optimized',
         '--openie_validation_mode', 'structural', '--improvement_stage', '4',
         '--evidence_improvements', ','.join(flag for flag in FLAGS if flag in flags),
