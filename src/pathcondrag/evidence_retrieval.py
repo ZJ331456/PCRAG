@@ -538,6 +538,33 @@ class EvidenceRetrieval:
 
     def finalize(self, query: str, ids: np.ndarray, scores: np.ndarray,
                  ctx: dict, state: dict) -> Tuple[np.ndarray, np.ndarray, dict]:
+        mode = getattr(self.cfg, "evidence_scoring_mode", "legacy")
+        # Default configurations execute the original scoring implementation.
+        # Explicit experiment modes additionally fingerprint their shared inputs.
+        if not hasattr(self.cfg, "evidence_scoring_mode"):
+            return self._finalize_legacy(query, ids, scores, ctx, state)
+        from .evidence_dependency_scoring import dependency_scored_prefix, scoring_input_sha256
+        input_hash = scoring_input_sha256(query, ids, scores, state)
+        legacy_ids, legacy_scores, trace = self._finalize_legacy(query, ids, scores, ctx, state)
+        trace["evidence_scoring_input_sha256"] = input_hash
+        trace["finalizer_input_hash"] = input_hash
+        trace["evidence_scoring_mode"] = mode
+        if mode != "dependency" or self.stage < 3 or not state.get("evidence_candidates"):
+            return legacy_ids, legacy_scores, trace
+        output_ids, output_scores, details, diagnostic = dependency_scored_prefix(
+            query, legacy_ids, legacy_scores, state, self.cfg, self._document,
+            signal_ids=ids, signal_scores=scores)
+        diagnostic["input_sha256"] = input_hash
+        diagnostic["legacy_top10"] = np.asarray(legacy_ids)[:10].tolist()
+        diagnostic["scored_top10"] = np.asarray(output_ids)[:10].tolist()
+        trace["dependency_scoring"] = diagnostic
+        if details:
+            trace["selected_prefix"] = details
+            trace["covered_goals"] = {goal: 1.0 for goal in diagnostic.get("covered_goals", [])}
+        return output_ids, output_scores, trace
+
+    def _finalize_legacy(self, query: str, ids: np.ndarray, scores: np.ndarray,
+                         ctx: dict, state: dict) -> Tuple[np.ndarray, np.ndarray, dict]:
         trace = state.get("evidence_trace", self._trace(self.stage))
         candidates = state.get("evidence_candidates", {})
         if self.stage < 2 or not candidates:

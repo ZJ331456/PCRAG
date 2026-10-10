@@ -177,6 +177,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         evidence_ablation_mode=getattr(args, "evidence_ablation_mode", "normal"),
         evidence_binding_mode=getattr(args, "evidence_binding_mode", "literal"),
         evidence_selection_mode=getattr(args, "evidence_selection_mode", "coverage"),
+        evidence_scoring_mode=getattr(args, "evidence_scoring_mode", "legacy"),
         evidence_ablation_inputs_file=getattr(args, "evidence_ablation_inputs_file", ""),
         evidence_improvements=getattr(args, "evidence_improvements", ""),
         evidence_plan_node_budget=int(getattr(args, "evidence_plan_node_budget", 6)),
@@ -542,6 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence_ablation_mode", choices=["normal", "budget_dag", "budget_qd", "budget_iterative", "fixed_pool", "validation", "selection"], default="normal")
     parser.add_argument("--evidence_binding_mode", choices=["string", "literal", "relation"], default="literal")
     parser.add_argument("--evidence_selection_mode", choices=["coverage", "ancestor", "joint"], default="coverage")
+    parser.add_argument("--evidence_scoring_mode", choices=["legacy", "dependency"], default="legacy",
+                        help="Use dependency-aware evidence scoring within the unchanged legacy Top200 candidate set.")
     parser.add_argument("--evidence_ablation_inputs_file", default="")
     parser.add_argument("--evidence_improvements", default="",
                         help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive,support,terminal,plan_prune,package,bridge_recovery,dag_package,structural_recovery,source_witness,failure_recovery,support_semantic_veto; empty preserves original exp4.")
