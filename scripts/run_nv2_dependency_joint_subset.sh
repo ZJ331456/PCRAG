@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Compare joint dependency selection against the validated legacy NV2 control.
+# Compare joint dependency selection with a fresh paired legacy NV2 control.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_OUT="${ROOT}/outputs/nv2_dependency_joint_subset_10_10"
-DEFAULT_BASELINE="${ROOT}/outputs/nv2_dependency_scoring_subset_10_10"
+# Retained results can contain floating-point drift after a runtime restart.
+# Reuse is opt-in; the runner still requires exact per-query upstream checks.
+DEFAULT_BASELINE=""
 for argument in "$@"; do
   if [[ "${argument}" == "--smoke" ]]; then
     DEFAULT_OUT="${DEFAULT_OUT}_smoke"
