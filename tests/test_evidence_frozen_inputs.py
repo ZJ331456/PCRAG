@@ -4,7 +4,6 @@ from dataclasses import asdict, dataclass
 import importlib
 import json
 from pathlib import Path
-import pickle
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -144,8 +143,7 @@ class FrozenEvidenceTests(unittest.TestCase):
                 pass
             def calculate_metric_scores(self, gold_docs, retrieved_docs, k_list):
                 events.append("metrics")
-                self.assertGold = gold_docs == [["gold-only-for-metric"]]
-                if not self.assertGold:
+                if gold_docs != [["gold-only-for-metric"]]:
                     raise AssertionError("Metric label lost")
                 return {"Recall@5": .25}, []
         _, metric = frozen.replay_retrieve(self.rag, self.directory, [self.raw["query"]],
@@ -212,6 +210,13 @@ class FrozenEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 frozen.EvidenceInputCapture().before_finalize(self.rag.evidence_runtime,
                     self.raw["query"], self.raw["ids"], self.raw["scores"], self.raw["ctx"], state)
+        for field, value in [("selected_prefix", [{"doc_id": 0}]), ("covered_goals", {"a": 1}),
+                             ("finalizer_input_hash", "already finalized")]:
+            state = deepcopy(self.raw["state"])
+            state["evidence_trace"][field] = value
+            with self.assertRaisesRegex(ValueError, "before any"):
+                frozen.EvidenceInputCapture().before_finalize(self.rag.evidence_runtime,
+                    self.raw["query"], self.raw["ids"], self.raw["scores"], self.raw["ctx"], state)
 
     def test_evaluation_hooks_restore_method_resolution_after_failure(self):
         original = improvements.ImprovedEvidenceRetrieval.finalize
@@ -236,13 +241,6 @@ class FrozenEvidenceTests(unittest.TestCase):
             with frozen.frozen_evidence_runtime(replay=self.directory):
                 self.assertIsNot(FakeRag.retrieve, normal_retrieve)
             self.assertIs(FakeRag.retrieve, normal_retrieve)
-        for field, value in [("selected_prefix", [{"doc_id": 0}]), ("covered_goals", {"a": 1}),
-                             ("finalizer_input_hash", "already finalized")]:
-            state = deepcopy(self.raw["state"])
-            state["evidence_trace"][field] = value
-            with self.assertRaisesRegex(ValueError, "before any"):
-                frozen.EvidenceInputCapture().before_finalize(self.rag.evidence_runtime,
-                    self.raw["query"], self.raw["ids"], self.raw["scores"], self.raw["ctx"], state)
 
 
 if __name__ == "__main__":
