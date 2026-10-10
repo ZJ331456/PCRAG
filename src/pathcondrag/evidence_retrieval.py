@@ -549,6 +549,8 @@ class EvidenceRetrieval:
         trace["evidence_scoring_input_sha256"] = input_hash
         trace["finalizer_input_hash"] = input_hash
         trace["evidence_scoring_mode"] = mode
+        # dependency_joint performs one set objective at the existing DAG selector.
+        # It must receive the unchanged legacy ranking, not a second greedy prefix.
         if mode != "dependency" or self.stage < 3 or not state.get("evidence_candidates"):
             return legacy_ids, legacy_scores, trace
         output_ids, output_scores, details, diagnostic = dependency_scored_prefix(

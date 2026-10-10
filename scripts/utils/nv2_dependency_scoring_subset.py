@@ -13,6 +13,7 @@ from copy import copy
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import random
 import re
@@ -35,6 +36,14 @@ STRICT_RETRIEVAL_UPSTREAM = ('fact_filter', 'dense_fallback', 'hops', 'seed_enti
                              'fact_seed_distribution', 'static_sub_questions', 'pcqd_sub_questions',
                              'pcqd_validation', 'path_hints', 'hint_diagnostics', 'selected_path_candidates')
 LOG = logging.getLogger('nv2_dependency_subset')
+
+
+def case_specs(candidate_mode='dependency'):
+    if candidate_mode == 'dependency':
+        return CASES
+    if candidate_mode == 'dependency_joint':
+        return (('baseline', 'legacy'), ('dependency_joint', 'dependency_joint'))
+    raise ValueError(f'Unknown candidate scoring mode: {candidate_mode}')
 
 
 def signature(value):
@@ -159,7 +168,7 @@ def bootstrap_differences(rows, sampling, repetitions=2000, seed=1031):
 
 
 def paired_comparison(baseline_result, candidate_result, baseline_report, candidate_report, sampling,
-                      repetitions=2000, seed=1031):
+                      repetitions=2000, seed=1031, candidate_name='dependency_scoring'):
     old = {row['query_index']: row for row in baseline_result['results']}
     new = {row['query_index']: row for row in candidate_result['results']}
     old_measurements = {row['query_index']: row for row in baseline_report['per_question']}
@@ -167,7 +176,7 @@ def paired_comparison(baseline_result, candidate_result, baseline_report, candid
     indices = sampling['indices']
     if set(old) != set(new) or set(old) != set(indices) or set(old_measurements) != set(indices) or set(new_measurements) != set(indices):
         raise ValueError('Paired question indices differ')
-    rows, candidate_checks, upstream_checks = [], [], []
+    rows, candidate_checks, upstream_checks, inactive_checks = [], [], [], []
     for index in indices:
         a, b = old[index], new[index]
         if a['sample_id'] != b['sample_id'] or a['question'] != b['question']:
@@ -175,20 +184,37 @@ def paired_comparison(baseline_result, candidate_result, baseline_report, candid
         pool_a, pool_b = a['candidate_docs'], b['candidate_docs']
         if len(pool_a) != len(set(pool_a)) or len(pool_b) != len(set(pool_b)) or set(pool_a) != set(pool_b):
             raise ValueError(f'Question {index}: Top200 candidate set differs; scoring isolation is invalid')
+        if candidate_name == 'dependency_joint' and pool_a[:2] != pool_b[:2]:
+            raise ValueError(f'Question {index}: dependency joint selector changed the protected Top2')
         candidate_checks.append({'query_index': index, 'count': len(pool_a),
                                  'sorted_document_set_sha256': signature(sorted(pool_a))})
         trace_a, trace_b = a['retrieval_trace']['evidence'], b['retrieval_trace']['evidence']
         retrieval_a, retrieval_b = a['retrieval_trace'], b['retrieval_trace']
         strict = []
         unavailable = []
+        inactive = {}
         for field in STRICT_UPSTREAM:
             if field not in trace_a or field not in trace_b:
                 unavailable.append(field)
+                if field in trace_a or field in trace_b:
+                    strict.append(field + '.availability')
+                elif field == 'verification_outputs' and all(
+                        trace.get('llm_verification_calls') == 0 for trace in (trace_a, trace_b)):
+                    inactive[field] = 'Both branches made zero verification calls; no outputs exist.'
+            elif trace_a[field] is None or trace_b[field] is None:
+                strict.append(field + '.null')
             elif trace_a[field] != trace_b[field]:
                 strict.append(field)
         for field in STRICT_RETRIEVAL_UPSTREAM:
             if field not in retrieval_a or field not in retrieval_b:
                 unavailable.append('retrieval.' + field)
+                if field in retrieval_a or field in retrieval_b:
+                    strict.append('retrieval.' + field + '.availability')
+                elif field not in ('fact_filter', 'dense_fallback') and all(
+                        trace.get('dense_fallback') is True for trace in (retrieval_a, retrieval_b)):
+                    inactive['retrieval.' + field] = 'Both used dense fallback; graph/QD/path branch did not run.'
+            elif retrieval_a[field] is None or retrieval_b[field] is None:
+                strict.append('retrieval.' + field + '.null')
             elif retrieval_a[field] != retrieval_b[field]:
                 strict.append('retrieval.' + field)
         before_hash, after_hash = trace_a.get('finalizer_input_hash'), trace_b.get('finalizer_input_hash')
@@ -196,6 +222,11 @@ def paired_comparison(baseline_result, candidate_result, baseline_report, candid
             strict.append('finalizer_input_hash')
         if strict:
             raise ValueError(f'Question {index}: cached upstream outputs differ: {strict}')
+        active_missing = [field for field in unavailable if field not in inactive]
+        if active_missing:
+            raise ValueError(f'Question {index}: required upstream audit fields unavailable: {active_missing}')
+        if inactive:
+            inactive_checks.append({'query_index': index, 'inactive_fields': inactive})
         upstream_checks.append({'query_index': index,
                                 'equal_present_fields': [field for field in STRICT_UPSTREAM if field not in unavailable],
                                 'unavailable_fields': unavailable,
@@ -210,7 +241,7 @@ def paired_comparison(baseline_result, candidate_result, baseline_report, candid
                         all_gold_top10=int(measured_b['all_gold_top10']))
         rows.append({'query_index': index, 'sample_id': a['sample_id'], 'question': a['question'],
                      'stratum': sampling['features'][index]['stratum'],
-                     'baseline': values_a, 'dependency_scoring': values_b,
+                     'baseline': values_a, candidate_name: values_b,
                      'delta': {metric: values_b[metric] - values_a[metric] for metric in ALL_METRICS},
                      'ranking_changed': pool_a != pool_b,
                      'baseline_top10_document_sha256': [signature(doc) for doc in pool_a[:10]],
@@ -223,11 +254,187 @@ def paired_comparison(baseline_result, candidate_result, baseline_report, candid
             'raw_recall_regression_limit_0_01_met': guard,
             'calibrated_recall_regression_limit_0_01_met': calibrated_guard,
             'candidate_top200_sets_identical': True, 'candidate_set_checks': candidate_checks,
-            'upstream_outputs': upstream_checks, 'per_question': rows,
+            'upstream_outputs': upstream_checks, 'inactive_upstream_fields': inactive_checks, 'per_question': rows,
             'bootstrap': {'paired': True, 'within_sampling_strata': True, 'repetitions': repetitions, 'seed': seed},
             'timing_comparison_valid': False,
             'cache_policy': 'Candidate inherits baseline committed LLM cache; ranking-dependent finalizer may call LLM anew.',
             'warning': 'Population calibration is descriptive. Bootstrap intervals on small strata are approximate; this is exploratory tuning, not independent test evidence.'}
+
+
+def validate_joint_selection(result):
+    """Prove the joint hook ran and retained its no-request ranking invariants."""
+    totals = Counter()
+    fallback = Counter()
+    per_question = []
+    prefix_metrics = defaultdict(list)
+    for row in result['results']:
+        evidence = row.get('retrieval_trace', {}).get('evidence', {})
+        diagnostic = evidence.get('dependency_joint_selection')
+        if not isinstance(diagnostic, dict):
+            raise ValueError(f'Query {row["query_index"]}: joint selector hook did not export diagnostics')
+        required_true = ('enabled', 'top200_set_preserved', 'document_set_preserved',
+                         'unique_documents', 'top2_preserved')
+        if (diagnostic.get('mode') != 'dependency_joint'
+                or any(diagnostic.get(key) is not True for key in required_true)
+                or diagnostic.get('gold_labels_used') is not False
+                or any(diagnostic.get(key) != 0 for key in
+                       ('extra_requests', 'extra_llm_requests', 'extra_embedding_calls'))):
+            raise ValueError(f'Query {row["query_index"]}: joint selector runtime invariants failed')
+        choices = diagnostic.get('eligible_proofs')
+        prefixes = diagnostic.get('prefix_optimization')
+        old_choices = evidence.get('improvement_dag_package', {}).get('eligible_proofs', {})
+        if not isinstance(choices, dict) or not isinstance(prefixes, list):
+            raise ValueError(f'Query {row["query_index"]}: joint proof/coverage audit is missing')
+        old_pairs = {(nid, proof['doc_id']) for nid, alternatives in old_choices.items() for proof in alternatives}
+        new_pairs = {(nid, proof['doc_id']) for nid, alternatives in choices.items() for proof in alternatives}
+        additions = sorted(new_pairs - old_pairs)
+        totals['hook_validated_questions'] += 1
+        totals['queries_with_eligible_proofs'] += bool(new_pairs)
+        totals['eligible_proof_alternatives'] += len(new_pairs)
+        totals['queries_with_new_proofs'] += bool(additions)
+        totals['new_proof_alternatives'] += len(additions)
+        totals['queries_with_optimization_attempts'] += bool(prefixes)
+        totals['queries_changed_top5'] += any(p['top_k'] == 5 and p['set_changed'] for p in prefixes)
+        totals['queries_changed_top10'] += any(p['top_k'] == 10 and p['set_changed'] for p in prefixes)
+        fallback[str(diagnostic.get('fallback'))] += 1
+        for prefix in prefixes:
+            needed = ('top_k', 'set_changed', 'coverage_before', 'coverage_after',
+                      'complete_terminals_before', 'complete_terminals_after', 'node_coverage_before',
+                      'node_coverage_after', 'terminal_coverage_before', 'terminal_coverage_after',
+                      'added_doc_ids', 'removed_doc_ids')
+            if any(key not in prefix for key in needed):
+                raise ValueError(f'Query {row["query_index"]}: joint prefix coverage audit is incomplete')
+            if not set(prefix['coverage_before']) <= set(prefix['coverage_after']):
+                raise ValueError(f'Query {row["query_index"]}: joint selector lost supported ancestor nodes')
+            if prefix['set_changed'] and len(prefix['complete_terminals_after']) <= len(prefix['complete_terminals_before']):
+                raise ValueError(f'Query {row["query_index"]}: changed prefix lacks strict terminal coverage gain')
+            for metric in ('node_coverage_before', 'node_coverage_after',
+                           'terminal_coverage_before', 'terminal_coverage_after'):
+                prefix_metrics[f'top{prefix["top_k"]}_{metric}'].append(prefix[metric])
+        per_question.append({'query_index': row['query_index'], 'eligible_proof_count': len(new_pairs),
+                             'new_proofs': [{'node': nid, 'doc_id': doc_id} for nid, doc_id in additions],
+                             'fallback': diagnostic.get('fallback'),
+                             'node_denominator': diagnostic.get('node_denominator'),
+                             'terminal_denominator': diagnostic.get('terminal_denominator'),
+                             'prefix_optimization': prefixes})
+    return {'validated': True, 'n_samples': len(result['results']), 'counts': dict(totals),
+            'fallback_counts': dict(fallback),
+            'coverage_means_among_optimization_attempts': {key: sum(values) / len(values)
+                                                          for key, values in prefix_metrics.items()},
+            'per_question': per_question,
+            'warning': 'Proof coverage and passage changes are model-free diagnostics, not gold recall gains.'}
+
+
+def validate_reuse_protocol(saved, current):
+    """Reject reuse across samples, model budgets or changed frozen sources."""
+    keys = ('datasets', 'smoke', 'index_root', 'build_indexes', 'qa', 'embedding_model',
+            'embedding_provider', 'embedding_batch_size', 'nv_embedding_oom_split',
+            'llm_prefetch_workers', 'openie_max_workers', 'max_new_tokens', 'thinking',
+            'hop_source', 'flags', 'vllm_gpu_memory_utilization', 'vllm_max_model_len',
+            'sample_seed', 'sample_size_per_dataset', 'selected_indices', 'source_sha256')
+    changed = [key for key in keys if key not in saved or saved[key] != current[key]]
+    if ('baseline', 'legacy') not in [tuple(case) for case in saved.get('cases', [])]:
+        changed.append('baseline legacy case')
+    if changed:
+        raise ValueError(f'Baseline reuse protocol differs: {changed}')
+
+
+def copy_reused_baseline(source, destination, model_dir):
+    """Copy mutable artifacts; only immutable graph/vector files share inodes.
+
+    SQLite backup includes committed WAL rows and omits live lock files. This
+    prevents the candidate or a resumed run from writing to the old cache.
+    """
+    if source.is_symlink() or destination.exists():
+        raise ValueError(f'Unsafe or existing baseline copy: {destination}')
+    linked = {source / 'index' / model_dir / name for name in previous.experiments.ASSETS}
+
+    def copy_file(original, target):
+        if Path(original).is_symlink():
+            raise ValueError(f'Symlink in retained baseline: {original}')
+        if Path(original) in linked:
+            os.link(original, target)
+            return target
+        return shutil.copy2(original, target)
+
+    shutil.copytree(source, destination, copy_function=copy_file,
+                    ignore=shutil.ignore_patterns('llm_cache', '*.lock', '*-wal', '*-shm'))
+    previous.snapshot_cache(source / 'index/llm_cache', destination / 'index/llm_cache')
+
+
+def reuse_baseline(args, context, case, sampling, protocol):
+    """Validate old measurements and their upstream fingerprints before reuse."""
+    origin = Path(args.baseline_results_dir).resolve()
+    source_case = origin / 'cases' / context['dataset'] / 'baseline'
+    validate_reuse_protocol(read_json(origin / 'protocol.json'), protocol)
+    if not (origin / 'completed.ok').is_file():
+        raise ValueError(f'Baseline experiment is not complete: {origin}')
+    report = previous.verify_trial_report(source_case)
+    manifest = previous.subset_manifest(context['manifest'], context['data'], context['hops'], sampling['indices'])
+    if (read_json(source_case / 'manifest.json') != manifest
+            or read_json(source_case / 'selected_indices.json') != sampling['indices']):
+        raise ValueError(f'{source_case}: saved baseline sample/manifest differs')
+    configuration = {'scoring_mode': 'legacy', 'flags': list(FLAGS), 'sample_seed': args.seed}
+    if read_json(source_case / 'scoring_config.json') != configuration:
+        raise ValueError(f'{source_case}: baseline scoring configuration differs')
+    marker = read_json(source_case / 'validated.ok')
+    if marker.get('scoring_config_sha256') != previous.experiments.sha256(source_case / 'scoring_config.json'):
+        raise ValueError(f'{source_case}: scoring configuration hash changed')
+    if frozen_hashes(source_case / 'index', manifest['model_dir']) != context['frozen_sha256']:
+        raise ValueError(f'{source_case}: retained baseline extraction/index source SHA changed')
+    result = read_json(source_case / 'result.json')
+    required = {'evidence_scoring_mode': 'legacy', 'improvement_stage': 4,
+                'llm_name': 'qwen3-8b', 'llm_base_url': args.llm_base_url,
+                'embedding_model_name': '/root/models/NV-Embed-v2',
+                'embedding_batch_size': 4, 'embedding_max_seq_len': 2048,
+                'llm_prefetch_workers': 8, 'openie_max_workers': 8, 'max_new_tokens': 2048,
+                'evidence_plan_validation': 'canonical_refs', 'evidence_plan_routing': 'question_structure',
+                'temperature': 0, 'retrieval_top_k': 200, 'evidence_selection_top_k': 10}
+    config = result.get('runtime_config', {})
+    if any(config.get(key) != value for key, value in required.items()):
+        raise ValueError(f'{source_case}: baseline runtime contract differs')
+    flags = config.get('evidence_improvements', '')
+    if set(flags.split(',') if isinstance(flags, str) else flags) != set(FLAGS):
+        raise ValueError(f'{source_case}: baseline runtime improvements differ')
+    if (report.get('scoring_mode') != 'legacy' or report.get('llm_request_stats', {}).get('failures') != 0
+            or report.get('llm_request_stats', {}).get('max_in_flight') != 8):
+        raise ValueError(f'{source_case}: baseline request accounting differs')
+    measurements, _ = previous.experiments.validate_result(
+        result, manifest, 'exp4_dependency_binding', context['data'], context['corpus'], expected_stage=4)
+    if measurements != report['per_question']:
+        raise ValueError(f'{source_case}: baseline measurements no longer match the result')
+    # A self-pair validates identity, all required upstream fields and scorer
+    # fingerprints without sampling bootstrap values or calling either model.
+    checked = paired_comparison(result, result, report, report, sampling, 100, args.seed)
+    prior = read_json(origin / 'metadata' / f"{context['dataset']}_paired_comparison.json")
+    if prior.get('validated') is not True or prior.get('baseline_result_sha256') != marker['result_sha256']:
+        raise ValueError(f'{source_case}: original paired baseline audit differs')
+    expected_upstream = {row['query_index']: row for row in prior.get('upstream_outputs', [])}
+    if any(expected_upstream.get(row['query_index']) != row for row in checked['upstream_outputs']):
+        raise ValueError(f'{source_case}: retained upstream hashes no longer match the original audit')
+    cache_source = source_case / 'index/llm_cache'
+    source_cache_sha = previous.experiments.cache_hashes(cache_source)
+    provenance = {'source_experiment': str(origin), 'source_case': str(source_case),
+                  'protocol_sha256': previous.experiments.sha256(origin / 'protocol.json'),
+                  'result_sha256': marker['result_sha256'], 'report_sha256': marker['report_sha256'],
+                  'manifest_sha256': marker['manifest_sha256'], 'source_cache_sha256': source_cache_sha,
+                  'upstream_sha256': signature(checked['upstream_outputs']),
+                  'frozen_sha256': context['frozen_sha256'], 'executed_again': False,
+                  'cache_copy_method': 'independent SQLite backup; graph/vector hardlinks are read-only'}
+    if case.exists():
+        previous.verify_trial_report(case)
+        if read_json(case / 'baseline_reuse.json') != provenance:
+            raise ValueError(f'{case}: reused baseline provenance changed')
+    else:
+        copy_reused_baseline(source_case, case, manifest['model_dir'])
+        write_json(case / 'baseline_reuse.json', provenance)
+    previous.verify_trial_report(case)
+    if previous.experiments.cache_hashes(cache_source) != source_cache_sha:
+        raise ValueError(f'{source_case}: original cache changed during backup')
+    if frozen_hashes(case / 'index', manifest['model_dir']) != context['frozen_sha256']:
+        raise ValueError(f'{case}: cloned reused source assets changed')
+    print(f'[reuse] {context["dataset"]}/baseline n={len(sampling["indices"])} source={source_case}', flush=True)
+    return report
 
 
 def dependencies():
@@ -293,6 +500,10 @@ def run_case(args, context, case, indices, scoring_mode, env):
             raise ValueError(f'{case}: starting upstream cache differs')
         if previous.experiments.asset_hashes(case / 'index', manifest['model_dir']) != manifest['source_asset_sha256']:
             raise ValueError(f'{case}: retained graph/vector assets changed')
+        if scoring_mode == 'dependency_joint':
+            joint = validate_joint_selection(read_json(case / 'result.json'))
+            if read_json(case / 'dependency_joint_selection_validation.json') != joint:
+                raise ValueError(f'{case}: joint selector audit changed')
         return report
     previous.initialize_case(context, case)
     write_json(case / 'selected_indices.json', list(indices))
@@ -316,6 +527,11 @@ def run_case(args, context, case, indices, scoring_mode, env):
         report.update(scoring_mode=scoring_mode, improvements=list(FLAGS),
                       cache_policy='Baseline warm snapshot; candidate inherits this baseline completed cache. Not comparable timings.',
                       support_semantic_veto_validation=finalizer, timing_comparison_valid=False)
+        if scoring_mode == 'dependency_joint':
+            joint = validate_joint_selection(result)
+            write_json(case / 'dependency_joint_selection_validation.json', joint)
+            report['dependency_joint_selection_validation'] = {key: value for key, value in joint.items()
+                                                              if key != 'per_question'}
         write_json(case / 'report.json', report)
         marker = read_json(case / 'validated.ok')
         marker.update(report_sha256=previous.experiments.sha256(case / 'report.json'),
@@ -330,11 +546,11 @@ def run_case(args, context, case, indices, scoring_mode, env):
         raise
 
 
-def publish_summary(work, reports, comparisons, statuses):
+def publish_summary(work, reports, comparisons, statuses, cases=CASES):
     lines = ['| Dataset | Case | R@1 | R@2 | R@5 | R@10 | R@20 | R@200 | All gold@5 | All gold@10 |',
              '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
     for dataset in DATASETS:
-        for name, _ in CASES:
+        for name, _ in cases:
             report = reports.get(dataset, {}).get(name)
             if report:
                 values = [f'{report["retrieval_metrics"][metric]:.4f}' for metric in METRICS]
@@ -342,7 +558,8 @@ def publish_summary(work, reports, comparisons, statuses):
                 lines.append(f'| {dataset} | {name} | ' + ' | '.join(values) + ' |')
         if dataset in comparisons:
             values = [f'{comparisons[dataset]["metrics"][metric]["delta_pp"]:+.2f} pp' for metric in ALL_METRICS]
-            lines.append(f'| {dataset} | dependency − baseline | ' + ' | '.join(values) + ' |')
+            label = 'dependency' if cases == CASES else cases[1][0]
+            lines.append(f'| {dataset} | {label} − baseline | ' + ' | '.join(values) + ' |')
     (work / 'summary.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     compact = {dataset: {name: previous.compact(report) for name, report in cases.items()}
                for dataset, cases in reports.items()}
@@ -365,6 +582,8 @@ def publish_summary(work, reports, comparisons, statuses):
 
 def run(args):
     dependencies()
+    cases = case_specs(args.candidate_mode)
+    candidate_name = cases[1][0]
     outputs = ROOT / 'outputs'
     source = Path(args.index_root).resolve()
     work = Path(args.out_root).resolve()
@@ -374,6 +593,10 @@ def run(args):
         raise ValueError('Output must be a separate dedicated directory under outputs, outside the frozen index experiment')
     if work.is_symlink() or shutil.disk_usage(outputs).free < 3 * 1024 ** 3:
         raise ValueError('Output cannot be a symlink and at least 3 GiB free disk is required')
+    if args.baseline_results_dir:
+        retained = Path(args.baseline_results_dir).resolve()
+        if retained == work or retained.is_relative_to(work) or work.is_relative_to(retained):
+            raise ValueError('Reused baseline must be outside the new output directory')
     (work / 'metadata').mkdir(parents=True, exist_ok=True)
     args.vllm_log = args.vllm_log or locate(args.llm_base_url)
     if not Path(args.vllm_log).is_file():
@@ -392,7 +615,7 @@ def run(args):
     contexts = {dataset: prepare_context(source, work, dataset) for dataset in DATASETS}
     samplings = {dataset: choose_subset(context['data'], context['hops'], args.sample_size, args.seed, smoke=args.smoke)
                  for dataset, context in contexts.items()}
-    protocol = {'datasets': list(DATASETS), 'cases': [list(case) for case in CASES], 'smoke': args.smoke,
+    protocol = {'datasets': list(DATASETS), 'cases': [list(case) for case in cases], 'smoke': args.smoke,
                 'index_root': str(source), 'build_indexes': False, 'qa': False,
                 'embedding_model': '/root/models/NV-Embed-v2', 'embedding_provider': 'nvembed',
                 'embedding_batch_size': 4, 'nv_embedding_oom_split': False,
@@ -404,6 +627,9 @@ def run(args):
                 'cache_policy': 'Baseline completed cache copied into candidate before execution; never copied rankings/results.',
                 'timing_comparison_valid': False,
                 'source_sha256': {dataset: context['frozen_sha256'] for dataset, context in contexts.items()}}
+    if args.baseline_results_dir:
+        protocol['baseline_results_dir'] = str(Path(args.baseline_results_dir).resolve())
+        validate_reuse_protocol(read_json(Path(args.baseline_results_dir) / 'protocol.json'), protocol)
     path = work / 'protocol.json'
     if path.exists() and read_json(path) != protocol:
         raise ValueError('Saved protocol differs; inspect before restarting')
@@ -421,22 +647,26 @@ def run(args):
         indices = sampling['indices']
         reports[dataset] = {}
         try:
-            for name, mode in CASES:
+            for name, mode in cases:
                 case = work / 'cases' / dataset / name
                 current = context
                 if name != 'baseline':
-                    cache = work / 'cache_snapshots' / dataset / 'dependency_scoring'
+                    cache = work / 'cache_snapshots' / dataset / candidate_name
                     if not cache.exists():
                         previous.snapshot_cache(work / 'cases' / dataset / 'baseline' / 'index/llm_cache', cache)
                     current = dict(context, cache=cache, cache_hashes=previous.experiments.cache_hashes(cache))
                 print(f'[start] {dataset}/{name} n={len(indices)} scoring={mode}', flush=True)
-                reports[dataset][name] = run_case(args, current, case, indices, mode, env)
+                if name == 'baseline' and args.baseline_results_dir:
+                    reports[dataset][name] = reuse_baseline(args, current, case, sampling, protocol)
+                else:
+                    reports[dataset][name] = run_case(args, current, case, indices, mode, env)
                 statuses[f'{dataset}/{name}'] = {'state': 'ready', 'n_samples': len(indices)}
-                publish_summary(work, reports, comparisons, statuses)
+                publish_summary(work, reports, comparisons, statuses, cases)
             baseline = work / 'cases' / dataset / 'baseline/result.json'
-            candidate = work / 'cases' / dataset / 'dependency_scoring/result.json'
+            candidate = work / 'cases' / dataset / candidate_name / 'result.json'
             comparison = paired_comparison(read_json(baseline), read_json(candidate), reports[dataset]['baseline'],
-                                           reports[dataset]['dependency_scoring'], sampling, args.bootstrap_repetitions, args.seed)
+                                           reports[dataset][candidate_name], sampling, args.bootstrap_repetitions,
+                                           args.seed, candidate_name=candidate_name)
             comparison.update(baseline_result_sha256=previous.experiments.sha256(baseline),
                               candidate_result_sha256=previous.experiments.sha256(candidate))
             comparisons[dataset] = comparison
@@ -448,7 +678,7 @@ def run(args):
             LOG.exception('[failed] %s', dataset)
             statuses[f'{dataset}/paired_validation'] = {'state': 'failed', 'error': f'{type(error).__name__}: {error}'}
         write_json(work / 'stage_status.json', statuses)
-        publish_summary(work, reports, comparisons, statuses)
+        publish_summary(work, reports, comparisons, statuses, cases)
     if previous.code_hashes(Path(args.hippo_root)) != before_code:
         raise ValueError('Original HippoRAG source changed during the experiment')
     for context in contexts.values():
@@ -473,6 +703,9 @@ def main(argv=None):
     parser.add_argument('--vllm-log')
     parser.add_argument('--sample-size', type=int, default=96)
     parser.add_argument('--seed', type=int, default=1031)
+    parser.add_argument('--candidate-mode', choices=('dependency', 'dependency_joint'), default='dependency')
+    parser.add_argument('--baseline-results-dir',
+                        help='Reuse a completed baseline experiment with identical indices, source hashes and runtime')
     parser.add_argument('--bootstrap-repetitions', type=int, default=2000)
     parser.add_argument('--smoke', action='store_true', help='Run 2 queries per dataset using the complete frozen corpus')
     args = parser.parse_args(argv)

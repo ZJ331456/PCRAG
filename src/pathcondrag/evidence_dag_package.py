@@ -326,8 +326,18 @@ class DAGPackageMixin:
         if "source_witness" in self.improvements:
             from .evidence_source_witness import source_witness_check
             proof_check = source_witness_check
-        final, diagnostic = rerank_dag_packages(original_ids, state, self._document, proof_check)
-        trace = dict(original_trace, improvement_dag_package=diagnostic)
+        if getattr(getattr(self, "cfg", None), "evidence_scoring_mode", "legacy") == "dependency_joint":
+            from .evidence_dependency_joint import rerank_dependency_joint
+            from .evidence_dependency_validation import expanded_proof_relation
+            final, diagnostic, joint_diagnostic = rerank_dependency_joint(
+                query, original_ids, state, self._document,
+                signal_ids=ids, signal_scores=scores, proof_check=expanded_proof_relation,
+                legacy_proof_check=proof_check)
+            trace = dict(original_trace, improvement_dag_package=diagnostic,
+                         dependency_joint_selection=joint_diagnostic)
+        else:
+            final, diagnostic = rerank_dag_packages(original_ids, state, self._document, proof_check)
+            trace = dict(original_trace, improvement_dag_package=diagnostic)
         if np.array_equal(np.asarray(final), original_ids):
             return original_ids, original_scores, trace
         old = {p["doc_id"]: p for p in trace.get("selected_prefix", [])}

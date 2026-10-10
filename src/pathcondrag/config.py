@@ -202,12 +202,14 @@ class PCRAGConfig(BaseConfig):
             raise ValueError("Unknown evidence_binding_mode")
         if self.evidence_selection_mode not in {"coverage", "ancestor", "joint"}:
             raise ValueError("Unknown evidence_selection_mode")
-        if self.evidence_scoring_mode not in {"legacy", "dependency"}:
+        if self.evidence_scoring_mode not in {"legacy", "dependency", "dependency_joint"}:
             raise ValueError("Unknown evidence_scoring_mode")
         if self.evidence_scoring_mode != "legacy" and (
             self.improvement_stage != 4 or self.evidence_ablation_mode != "normal"
         ):
             raise ValueError("Dependency scoring requires normal stage-4 retrieval")
+        if self.evidence_scoring_mode == "dependency_joint" and "dag_package" not in flags:
+            raise ValueError("Joint dependency scoring requires the existing dag_package selector")
         if self.evidence_ablation_mode != "normal" and not self.evidence_ablation_inputs_file:
             raise ValueError("Evidence ablations require their frozen inputs file")
         if self.evidence_ablation_mode != "normal" and self.improvement_stage not in (3, 4):

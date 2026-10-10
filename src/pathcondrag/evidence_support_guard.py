@@ -98,7 +98,15 @@ def support_guard(query, order, state, document, proposal_diagnostic):
             diag["anchor_checks"].append({"doc_id": doc_id, "title": title,
                                           "check": "literal_specific_question_title"})
     dag = _protected(trace, original)
-    protected = sources | anchors | dag | set(original[:FIXED_K])
+    joint = trace.get("dependency_joint_selection")
+    joint_sources = set()
+    if isinstance(joint, dict) and joint.get("enabled") is True and joint.get("mode") == "dependency_joint":
+        retained = joint.get("protected_top5_doc_ids", [])
+        if isinstance(retained, list):
+            joint_sources = {doc_id for doc_id in retained
+                             if type(doc_id) is int and doc_id in selected}
+        diag["protected_joint_doc_ids"] = sorted(joint_sources)
+    protected = sources | anchors | dag | joint_sources | set(original[:FIXED_K])
     diag.update(protected_source_doc_ids=sorted(sources), protected_anchor_doc_ids=sorted(anchors),
                 protected_dag_doc_ids=sorted(dag), protected_doc_ids=sorted(protected))
 
@@ -122,6 +130,8 @@ def support_guard(query, order, state, document, proposal_diagnostic):
         return veto("victim_is_existing_winning_support")
     if victim in anchors:
         return veto("victim_is_original_question_anchor")
+    if victim in joint_sources:
+        return veto("victim_is_closed_dependency_support")
     if victim in protected:
         return veto("victim_is_protected_document")
     diag["allow"] = True

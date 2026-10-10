@@ -543,8 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence_ablation_mode", choices=["normal", "budget_dag", "budget_qd", "budget_iterative", "fixed_pool", "validation", "selection"], default="normal")
     parser.add_argument("--evidence_binding_mode", choices=["string", "literal", "relation"], default="literal")
     parser.add_argument("--evidence_selection_mode", choices=["coverage", "ancestor", "joint"], default="coverage")
-    parser.add_argument("--evidence_scoring_mode", choices=["legacy", "dependency"], default="legacy",
-                        help="Use dependency-aware evidence scoring within the unchanged legacy Top200 candidate set.")
+    parser.add_argument("--evidence_scoring_mode", choices=["legacy", "dependency", "dependency_joint"], default="legacy",
+                        help="Use dependency scoring or unified DAG set selection within the unchanged legacy Top200 candidate set.")
     parser.add_argument("--evidence_ablation_inputs_file", default="")
     parser.add_argument("--evidence_improvements", default="",
                         help="Comma-separated stage-4 extensions: planning,selection,binding,closure,adaptive,support,terminal,plan_prune,package,bridge_recovery,dag_package,structural_recovery,source_witness,failure_recovery,support_semantic_veto; empty preserves original exp4.")

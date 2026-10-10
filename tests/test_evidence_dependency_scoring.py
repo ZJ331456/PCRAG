@@ -86,6 +86,26 @@ class DependencyScoringTests(unittest.TestCase):
             state["query"], ids, scores, {}, copy.deepcopy(state)) for mode in ["legacy", "dependency"]]
         self.assertEqual(outputs[0][2]["finalizer_input_hash"], outputs[1][2]["finalizer_input_hash"])
 
+    def test_joint_mode_waits_for_existing_dag_selector_without_double_scoring(self):
+        state, ids, scores = fixture(), np.arange(205), np.linspace(1., .01, 205)
+        outputs = [base.EvidenceRetrieval(FakeRAG(mode)).finalize(
+            state["query"], ids, scores, {}, copy.deepcopy(state))
+                   for mode in ("legacy", "dependency_joint")]
+        np.testing.assert_array_equal(outputs[0][0], outputs[1][0])
+        np.testing.assert_array_equal(outputs[0][1], outputs[1][1])
+        self.assertEqual(outputs[0][2]["finalizer_input_hash"], outputs[1][2]["finalizer_input_hash"])
+        self.assertNotIn("dependency_scoring", outputs[1][2])
+
+    def test_joint_mode_requires_stage4_and_existing_dag_selector(self):
+        with self.assertRaisesRegex(ValueError, "dag_package"):
+            config_module.PCRAGConfig(improvement_stage=4, evidence_scoring_mode="dependency_joint")
+        with self.assertRaisesRegex(ValueError, "normal stage-4"):
+            config_module.PCRAGConfig(improvement_stage=3, evidence_scoring_mode="dependency_joint",
+                                      evidence_improvements="dag_package")
+        cfg = config_module.PCRAGConfig(improvement_stage=4, evidence_scoring_mode="dependency_joint",
+                                        evidence_improvements="dag_package")
+        self.assertEqual(cfg.evidence_scoring_mode, "dependency_joint")
+
     def test_actual_parent_support_controls_child_coverage(self):
         rag, state = FakeRAG(), fixture()
         ids, scores, details, diag = scorer.dependency_scored_prefix(
