@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build three NV-Embed-v2 indexes and run fifteen retrieval comparisons."""
+"""Run the NV2 workflow or retrieve only legacy_dependency_joint from existing indexes."""
 import sys
 from pathlib import Path
 

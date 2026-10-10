@@ -1,22 +1,36 @@
 #!/usr/bin/env bash
-# Build all three NV2 indexes, then run five retrieval methods per dataset.
+# --methods legacy_dependency_joint: reuse NV2 indexes and retrieve this case only.
+# Without --methods: build indexes, then run the original five methods per dataset.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_OUT="${ROOT}/outputs/3multi_hop_datasets_results_with_nv2_10_8"
+SMOKE=false
+JOINT_ONLY=false
 for argument in "$@"; do
   if [[ "${argument}" == "--smoke" ]]; then
-    DEFAULT_OUT="${DEFAULT_OUT}_smoke"
-    break
+    SMOKE=true
+  elif [[ "${argument}" == "legacy_dependency_joint" || "${argument}" == "--methods=legacy_dependency_joint" ]]; then
+    JOINT_ONLY=true
   fi
 done
+if [[ "${SMOKE}" == true && "${JOINT_ONLY}" == false ]]; then
+  DEFAULT_OUT="${DEFAULT_OUT}_smoke"
+fi
 OUT_ROOT="${OUT_ROOT:-${DEFAULT_OUT}}"
 RAG_PYTHON="${RAG_PYTHON:-/root/anaconda3/envs/rag/bin/python}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-/root/models/NV-Embed-v2}"
 EMBEDDING_PROVIDER="${EMBEDDING_PROVIDER:-nvembed}"
 EMBEDDING_BATCH_SIZE="${EMBEDDING_BATCH_SIZE:-4}"
 LLM_BASE_URL="${LLM_BASE_URL:-http://127.0.0.1:8035/v1}"
-RUN_LOG="${RUN_LOG:-${OUT_ROOT}/logs/run_nv2.log}"
+DEFAULT_LOG="${OUT_ROOT}/logs/run_nv2.log"
+if [[ "${JOINT_ONLY}" == true ]]; then
+  DEFAULT_LOG="${OUT_ROOT}/logs/run_legacy_dependency_joint_full.log"
+  if [[ "${SMOKE}" == true ]]; then
+    DEFAULT_LOG="${OUT_ROOT}/_legacy_dependency_joint_smoke/logs/run.log"
+  fi
+fi
+RUN_LOG="${RUN_LOG:-${DEFAULT_LOG}}"
 
 mkdir -p "${OUT_ROOT}/logs" "$(dirname "${RUN_LOG}")"
 exec 9>"${ROOT}/outputs/.recall_top5_improvements.lock"
@@ -46,5 +60,9 @@ if [[ -n "${VLLM_LOG:-}" ]]; then
   OPTIONS+=(--vllm-log "${VLLM_LOG}")
 fi
 echo "[run] out=${OUT_ROOT} embedding=${EMBEDDING_MODEL} batch=${EMBEDDING_BATCH_SIZE}"
-echo "[run] indexes=3 retrieval_cases=15 llm_workers=8 max_tokens=2048 thinking=false"
+if [[ "${JOINT_ONLY}" == true ]]; then
+  echo "[run] indexes=reuse datasets=3 retrieval_cases=3 method=legacy_dependency_joint llm_workers=8 max_tokens=2048 thinking=false"
+else
+  echo "[run] indexes=3 retrieval_cases=15 llm_workers=8 max_tokens=2048 thinking=false"
+fi
 "${RAG_PYTHON}" -B -u "${ROOT}/scripts/multi_dataset_retrieval_nv2.py" "${OPTIONS[@]}" "$@"

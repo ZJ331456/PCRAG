@@ -3,6 +3,9 @@
 --smoke runs the same stages on two intact questions and twenty intact source
 passages per dataset, in a disposable output directory. Full runs cover every
 question, reuse the frozen dataset index, retain Top10/Top200 and omit QA.
+
+--methods legacy_dependency_joint runs only the new composition against the
+three existing full indexes; it never enters the index-building workflow.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from .exp4_http_audit import locate
 
 DEFAULT_OUT = base.ROOT / 'outputs/3multi_hop_datasets_results_with_nv2_10_8'
 METHODS = (*base.CASES, dag.CASE_NAME, semantic.CASE_NAME)
+JOINT_CASE_NAME = 'legacy_dependency_joint'
 LOG = logging.getLogger('multi_dataset_nv2')
 
 
@@ -81,6 +85,9 @@ def retain_request_logs(out, smoke):
 
 
 def run(args):
+    if getattr(args, 'methods', None) == [JOINT_CASE_NAME]:
+        from .multi_dataset_retrieval_dependency_joint import run as run_joint
+        return run_joint(args)
     out = Path(args.out_root).resolve()
     if not out.is_relative_to(base.ROOT / 'outputs') or out == base.ROOT / 'outputs':
         raise ValueError('Output must be a dedicated directory under PathCondRAG/outputs')
@@ -188,8 +195,16 @@ def main(argv=None):
     parser.add_argument('--openie-validation-mode', '--openie_validation_mode',
                         choices=('structural', 'source_verified'), default='structural')
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--methods', nargs='+', choices=(JOINT_CASE_NAME,),
+                        help='Run only legacy_dependency_joint using the existing shared indexes')
+    parser.add_argument('--smoke-out-root',
+                        help='Separate test output for --methods legacy_dependency_joint --smoke')
     args = parser.parse_args(argv)
+    if args.methods and args.methods != [JOINT_CASE_NAME]:
+        parser.error('Specify legacy_dependency_joint once')
+    if args.smoke_out_root and not (args.smoke and args.methods == [JOINT_CASE_NAME]):
+        parser.error('--smoke-out-root requires --methods legacy_dependency_joint --smoke')
     args.out_root = args.out_root or str(DEFAULT_OUT.with_name(DEFAULT_OUT.name + '_smoke')
-                                        if args.smoke else DEFAULT_OUT)
+                                        if args.smoke and not args.methods else DEFAULT_OUT)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     return run(args)
