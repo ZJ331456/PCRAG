@@ -61,6 +61,34 @@ class SamplingTests(unittest.TestCase):
             runner.choose_subset(samples(), [2] * 120, 2)
 
 
+class FrozenInputCommandTests(unittest.TestCase):
+    def test_baseline_captures_and_candidate_replays_same_directory(self):
+        root = runner.ROOT / 'outputs/example/cases/hotpotqa'
+        command = ['python', '-B', str(runner.ROOT / 'scripts/eval_dataset.py'), '--eval_mode', 'retrieve']
+        baseline = runner.frozen_input_command(command, root / 'baseline', 'legacy')
+        candidate = runner.frozen_input_command(command, root / 'dependency_joint', 'dependency_joint')
+        self.assertEqual(command[2], str(runner.ROOT / 'scripts/eval_dataset.py'))
+        self.assertEqual(baseline[2], str(runner.ROOT / 'scripts/eval_frozen_evidence.py'))
+        self.assertEqual(baseline[-2], '--capture-evidence-inputs')
+        self.assertEqual(candidate[-2], '--replay-evidence-inputs')
+        self.assertEqual(baseline[-1], candidate[-1])
+
+    def test_replay_requires_same_payload_and_passage_namespace(self):
+        baseline = {'results': [1], 'frozen_evidence_inputs': {'mode': 'capture', 'query_count': 1,
+            'payload_sha256': 'a'*64, 'passage_order_sha256': 'b'*64, 'upstream_recomputed': True}}
+        candidate = deepcopy(baseline)
+        candidate['frozen_evidence_inputs'].update(mode='replay', upstream_recomputed=False)
+        runner.validate_frozen_input_metadata(baseline)
+        runner.validate_frozen_input_metadata(candidate, baseline)
+        candidate['frozen_evidence_inputs']['payload_sha256'] = 'c'*64
+        with self.assertRaisesRegex(ValueError, 'different upstream snapshot'):
+            runner.validate_frozen_input_metadata(candidate, baseline)
+
+    def test_missing_capture_metadata_cannot_pass(self):
+        with self.assertRaisesRegex(ValueError, 'provenance'):
+            runner.validate_frozen_input_metadata({'results': [1]})
+
+
 class PairedIsolationTests(unittest.TestCase):
     def test_identical_control_has_exact_zero_delta_and_interval(self):
         result, report, sampling = pair_fixture()

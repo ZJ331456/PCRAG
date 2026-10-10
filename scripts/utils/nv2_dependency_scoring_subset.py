@@ -457,7 +457,7 @@ def frozen_hashes(source, model_dir):
     return result
 
 
-def prepare_context(index_root, work, dataset):
+def prepare_context(index_root, work, dataset, baseline_cache_results_dir=None):
     manifest = read_json(index_root / 'metadata' / dataset / 'manifest.json')
     source = index_root / 'shared_indexes' / dataset
     if Path(manifest['source_index']).resolve() != source.resolve():
@@ -474,6 +474,12 @@ def prepare_context(index_root, work, dataset):
         raise ValueError(f'{dataset}: source data/corpus/index SHA changed')
     data, corpus, hops = previous.experiments.validated_dataset(manifest['data_path'], manifest['corpus_path'], dataset)
     warm = index_root / 'cases' / dataset / 'exp4_dependency_binding' / 'index' / 'llm_cache'
+    if baseline_cache_results_dir:
+        retained = Path(baseline_cache_results_dir) / 'cases' / dataset / 'baseline'
+        previous.verify_trial_report(retained)
+        if previous.experiments.asset_hashes(retained / 'index', manifest['model_dir']) != manifest['source_asset_sha256']:
+            raise ValueError(f'{dataset}: retained response cache belongs to different index assets')
+        warm = retained / 'index' / 'llm_cache'
     if not warm.is_dir():
         warm = source / 'llm_cache'
     if not warm.is_dir():
@@ -488,10 +494,37 @@ def prepare_context(index_root, work, dataset):
             'frozen_sha256': frozen_hashes(source, manifest['model_dir']), 'cache_origin': str(warm)}
 
 
+def frozen_input_command(command, case, scoring_mode):
+    """Capture raw upstream state once; replay the actual candidate finalizer."""
+    command = list(command)
+    command[command.index(str(ROOT / 'scripts/eval_dataset.py'))] = str(ROOT / 'scripts/eval_frozen_evidence.py')
+    snapshot = case.parent / 'baseline/frozen_evidence_inputs'
+    option = '--capture-evidence-inputs' if scoring_mode == 'legacy' else '--replay-evidence-inputs'
+    return command + [option, str(snapshot)]
+
+
+def validate_frozen_input_metadata(result, baseline=None):
+    meta = result.get('frozen_evidence_inputs', {})
+    expected_mode = 'capture' if baseline is None else 'replay'
+    if (meta.get('mode') != expected_mode or meta.get('query_count') != len(result['results'])
+            or meta.get('upstream_recomputed') is not (baseline is None)
+            or any(not isinstance(meta.get(key), str) or not re.fullmatch('[0-9a-f]{64}', meta[key])
+                   for key in ('payload_sha256', 'passage_order_sha256'))):
+        raise ValueError('Frozen input capture/replay provenance is missing or invalid')
+    if baseline is not None:
+        source = baseline.get('frozen_evidence_inputs', {})
+        if any(meta[key] != source.get(key) for key in ('query_count', 'payload_sha256', 'passage_order_sha256')):
+            raise ValueError('Candidate replayed a different upstream snapshot')
+    return meta
+
+
 def run_case(args, context, case, indices, scoring_mode, env):
     manifest = previous.subset_manifest(context['manifest'], context['data'], context['hops'], indices)
     variant = round2.Variant(case.name, FLAGS, plan_validation='canonical_refs', plan_routing='question_structure')
     configuration = {'scoring_mode': scoring_mode, 'flags': list(FLAGS), 'sample_seed': args.seed}
+    frozen = args.candidate_mode == 'dependency_joint'
+    if frozen:
+        configuration['input_policy'] = 'frozen_upstream_finalizer_comparison'
     if (case / 'validated.ok').is_file():
         report = previous.verify_trial_report(case)
         if read_json(case / 'manifest.json') != manifest or read_json(case / 'scoring_config.json') != configuration:
@@ -504,6 +537,9 @@ def run_case(args, context, case, indices, scoring_mode, env):
             joint = validate_joint_selection(read_json(case / 'result.json'))
             if read_json(case / 'dependency_joint_selection_validation.json') != joint:
                 raise ValueError(f'{case}: joint selector audit changed')
+        if frozen:
+            baseline = read_json(case.parent / 'baseline/result.json') if scoring_mode != 'legacy' else None
+            validate_frozen_input_metadata(read_json(case / 'result.json'), baseline)
         return report
     previous.initialize_case(context, case)
     write_json(case / 'selected_indices.json', list(indices))
@@ -512,6 +548,8 @@ def run_case(args, context, case, indices, scoring_mode, env):
     command = round2.command(args, context, case, indices, variant)
     command[command.index('--sample_seed') + 1] = str(args.seed)
     command += ['--evidence_scoring_mode', scoring_mode]
+    if frozen:
+        command = frozen_input_command(command, case, scoring_mode)
     start = Path(args.vllm_log).stat().st_size
     elapsed = previous.execute(command, case / 'run.log', env)
     end = Path(args.vllm_log).stat().st_size
@@ -527,6 +565,13 @@ def run_case(args, context, case, indices, scoring_mode, env):
         report.update(scoring_mode=scoring_mode, improvements=list(FLAGS),
                       cache_policy='Baseline warm snapshot; candidate inherits this baseline completed cache. Not comparable timings.',
                       support_semantic_veto_validation=finalizer, timing_comparison_valid=False)
+        if frozen:
+            baseline = read_json(case.parent / 'baseline/result.json') if scoring_mode != 'legacy' else None
+            frozen_meta = validate_frozen_input_metadata(result, baseline)
+            report['input_policy'] = 'frozen_upstream_finalizer_comparison'
+            report['upstream_retrieval_recomputed'] = scoring_mode == 'legacy'
+            report['ranking_recomputed_from_raw_inputs'] = True
+            report['frozen_evidence_inputs'] = frozen_meta
         if scoring_mode == 'dependency_joint':
             joint = validate_joint_selection(result)
             write_json(case / 'dependency_joint_selection_validation.json', joint)
@@ -594,6 +639,8 @@ def run(args):
     if work.is_symlink() or shutil.disk_usage(outputs).free < 3 * 1024 ** 3:
         raise ValueError('Output cannot be a symlink and at least 3 GiB free disk is required')
     if args.baseline_results_dir:
+        if args.candidate_mode == 'dependency_joint':
+            raise ValueError('Joint comparison requires a newly captured baseline; reuse only response caches via --baseline-cache-results-dir')
         retained = Path(args.baseline_results_dir).resolve()
         if retained == work or retained.is_relative_to(work) or work.is_relative_to(retained):
             raise ValueError('Reused baseline must be outside the new output directory')
@@ -612,7 +659,13 @@ def run(args):
                    {'source': str(service_file), 'source_sha256': previous.experiments.sha256(service_file),
                     'service': service, 'http_log': args.vllm_log,
                     'verification_scope': 'Existing service launch metadata; this runner never starts/reconfigures the service.'})
-    contexts = {dataset: prepare_context(source, work, dataset) for dataset in DATASETS}
+    cache_results = getattr(args, 'baseline_cache_results_dir', None)
+    if cache_results:
+        retained_cache = Path(cache_results).resolve()
+        if (not (retained_cache / 'completed.ok').is_file() or retained_cache == work
+                or retained_cache.is_relative_to(work) or work.is_relative_to(retained_cache)):
+            raise ValueError('Response cache must come from a separate completed baseline experiment')
+    contexts = {dataset: prepare_context(source, work, dataset, cache_results) for dataset in DATASETS}
     samplings = {dataset: choose_subset(context['data'], context['hops'], args.sample_size, args.seed, smoke=args.smoke)
                  for dataset, context in contexts.items()}
     protocol = {'datasets': list(DATASETS), 'cases': [list(case) for case in cases], 'smoke': args.smoke,
@@ -627,6 +680,13 @@ def run(args):
                 'cache_policy': 'Baseline completed cache copied into candidate before execution; never copied rankings/results.',
                 'timing_comparison_valid': False,
                 'source_sha256': {dataset: context['frozen_sha256'] for dataset, context in contexts.items()}}
+    if args.candidate_mode == 'dependency_joint':
+        protocol['input_policy'] = 'frozen_upstream_finalizer_comparison'
+        protocol['candidate_recomputes'] = ['evidence finalization', 'support/semantic veto', 'official evaluation']
+        protocol['candidate_does_not_recompute'] = ['embedding', 'graph search', 'QD/PCQD', 'plan/bindings']
+    if cache_results:
+        protocol['baseline_cache_results_dir'] = str(Path(cache_results).resolve())
+        validate_reuse_protocol(read_json(Path(cache_results) / 'protocol.json'), protocol)
     if args.baseline_results_dir:
         protocol['baseline_results_dir'] = str(Path(args.baseline_results_dir).resolve())
         validate_reuse_protocol(read_json(Path(args.baseline_results_dir) / 'protocol.json'), protocol)
@@ -706,6 +766,8 @@ def main(argv=None):
     parser.add_argument('--candidate-mode', choices=('dependency', 'dependency_joint'), default='dependency')
     parser.add_argument('--baseline-results-dir',
                         help='Reuse a completed baseline experiment with identical indices, source hashes and runtime')
+    parser.add_argument('--baseline-cache-results-dir',
+                        help='Seed only LLM response caches from a completed matched experiment; recompute the baseline rankings')
     parser.add_argument('--bootstrap-repetitions', type=int, default=2000)
     parser.add_argument('--smoke', action='store_true', help='Run 2 queries per dataset using the complete frozen corpus')
     args = parser.parse_args(argv)

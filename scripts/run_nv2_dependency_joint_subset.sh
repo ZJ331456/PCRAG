@@ -7,16 +7,20 @@ DEFAULT_OUT="${ROOT}/outputs/nv2_dependency_joint_subset_10_10"
 # Retained results can contain floating-point drift after a runtime restart.
 # Reuse is opt-in; the runner still requires exact per-query upstream checks.
 DEFAULT_BASELINE=""
+DEFAULT_RESPONSE_CACHE="${ROOT}/outputs/nv2_dependency_scoring_subset_10_10"
+[[ -f "${DEFAULT_RESPONSE_CACHE}/completed.ok" ]] || DEFAULT_RESPONSE_CACHE=""
 for argument in "$@"; do
   if [[ "${argument}" == "--smoke" ]]; then
     DEFAULT_OUT="${DEFAULT_OUT}_smoke"
     DEFAULT_BASELINE=""
+    DEFAULT_RESPONSE_CACHE=""
     break
   fi
 done
 OUT_ROOT="${OUT_ROOT:-${DEFAULT_OUT}}"
 INDEX_ROOT="${INDEX_ROOT:-${ROOT}/outputs/3multi_hop_datasets_results_with_nv2_10_8}"
 BASELINE_RESULTS_DIR="${BASELINE_RESULTS_DIR-${DEFAULT_BASELINE}}"
+BASELINE_CACHE_RESULTS_DIR="${BASELINE_CACHE_RESULTS_DIR-${DEFAULT_RESPONSE_CACHE}}"
 RAG_PYTHON="${RAG_PYTHON:-/root/anaconda3/envs/rag/bin/python}"
 LLM_BASE_URL="${LLM_BASE_URL:-http://127.0.0.1:8035/v1}"
 RUN_LOG="${RUN_LOG:-${OUT_ROOT}/logs/run.log}"
@@ -46,9 +50,13 @@ OPTIONS=(--index-root "${INDEX_ROOT}" --out-root "${OUT_ROOT}"
 if [[ -n "${BASELINE_RESULTS_DIR}" ]]; then
   OPTIONS+=(--baseline-results-dir "${BASELINE_RESULTS_DIR}")
 fi
+if [[ -n "${BASELINE_CACHE_RESULTS_DIR}" ]]; then
+  OPTIONS+=(--baseline-cache-results-dir "${BASELINE_CACHE_RESULTS_DIR}")
+fi
 if [[ -n "${VLLM_LOG:-}" ]]; then
   OPTIONS+=(--vllm-log "${VLLM_LOG}")
 fi
 echo "[run] out=${OUT_ROOT} indexes=${INDEX_ROOT}/shared_indexes baseline_reuse=${BASELINE_RESULTS_DIR:-none}"
 echo "[run] datasets=3 paired_cases=6 candidate=dependency_joint embedding=NV-Embed-v2 batch=4 llm_workers=8 max_tokens=2048 thinking=false"
+echo "[run] exact frozen upstream replay; response_cache=${BASELINE_CACHE_RESULTS_DIR:-original}; timings are not comparable"
 "${RAG_PYTHON}" -B -u "${ROOT}/scripts/nv2_dependency_scoring_subset.py" "${OPTIONS[@]}" "$@"
