@@ -42,6 +42,31 @@ def get_benchmark_hops(samples: List[Dict[str, Any]], dataset_name: str) -> List
                 )
             hops.append(len(decomposition))
         return hops
+    if dataset_name == "fanoutqa":
+        hops = []
+        for idx, sample in enumerate(samples):
+            decomposition = sample.get("question_decomposition")
+            hop_num = sample.get("hop_num")
+            if (
+                not isinstance(decomposition, list)
+                or len(decomposition) < 2
+                or any(
+                    not isinstance(step, dict)
+                    or not isinstance(step.get("question"), str)
+                    or not step["question"].strip()
+                    for step in decomposition
+                )
+            ):
+                raise ValueError(
+                    f"FanOutQA sample index {idx} lacks a valid question_decomposition"
+                )
+            if hop_num is not None and int(hop_num) != len(decomposition):
+                raise ValueError(
+                    f"FanOutQA sample index {idx} hop_num={hop_num} != "
+                    f"len(question_decomposition)={len(decomposition)}"
+                )
+            hops.append(len(decomposition))
+        return hops
     if dataset_name in ("hotpotqa", "2wikimultihopqa"):
         return [2] * len(samples)
     if dataset_name in ("nq", "popqa"):

@@ -103,7 +103,7 @@ def run_eval(dataset: str, args: argparse.Namespace) -> str:
         else None
     )
     if benchmark_hops is not None:
-        if dataset == "musique":
+        if dataset in ("musique", "fanoutqa"):
             hop_provenance = {
                 "kind": "per_question_oracle",
                 "field": "question_decomposition length",
@@ -528,7 +528,7 @@ def _openie_worker_count(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate PCRAG on supported datasets")
-    parser.add_argument("--dataset", required=True, choices=["musique", "hotpotqa", "2wikimultihopqa", "nq", "popqa"])
+    parser.add_argument("--dataset", required=True, choices=["musique", "hotpotqa", "2wikimultihopqa", "nq", "popqa", "fanoutqa"])
     parser.add_argument("--data_path", default="")
     parser.add_argument("--corpus_path", default="")
     parser.add_argument("--hop_source", choices=["estimated", "benchmark"], default="estimated",
